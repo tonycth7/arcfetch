@@ -3,14 +3,14 @@ name        = "arcfetch"
 version     = "0.7.0"
 edition     = "2024"
 description = "Blazing-fast Arch Linux sysinfo — Catppuccin Mocha"
-authors     = ["arcfetch"]
 
 [[bin]]
 name = "arcfetch"
 path = "src/main.rs"
 
 [dependencies]
-libc = "0.2"
+libc  = "0.2"
+rayon = "1.10"
 
 [profile.release]
 opt-level     = 3
