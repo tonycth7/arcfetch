@@ -174,25 +174,48 @@ const LOGO_WAVE: [&str; 19] = [
 
 // E = mc² ─────────────────────────────────────────────────
 const LOGO_EMC2: [&str; 19] = [
-    "                           ",
-    "   \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}          ",
-    "   \u{2502}             \u{2502}          ",
-    "   \u{2502}   E=mc\u{00b2}   \u{2502}          ",
-    "   \u{2502}             \u{2502}          ",
-    "   \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}          ",
-    "                           ",
-    "   E  \u{2192}  energy  (J)      ",
-    "   m  \u{2192}  mass    (kg)     ",
-    "   c  \u{2192}  3\u{00d7}10\u{2078} m/s        ",
-    "                           ",
-    "   \u{0394}E = \u{0394}mc\u{00b2}               ",
-    "                           ",
-    "   \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}   ",
-    "   1 kg \u{2248} 9\u{00d7}10\u{00b9}\u{2076} J       ",
-    "   \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}   ",
-    "                           ",
-    "   Einstein  \u{00b7}  1905       ",
-    "                           ",
+    "   ·  · ✦ ·  · ✦ ·  ·    ",
+    "     ↗γ  ↗γ  ↗γ  ↗         ",
+    "                             ",
+    "  ╔════════════════════╗   ",
+    "  ║                    ║   ",
+    "  ║    E   =   mc²    ║   ",
+    "  ║                    ║   ",
+    "  ╚════════════════════╝   ",
+    "                             ",
+    "     ↘γ  ↘γ  ↘γ  ↘         ",
+    "   ·  · ✦ ·  · ✦ ·  ·    ",
+    "                             ",
+    "  E₀  =  m₀c²   rest mass  ",
+    "  E   =  γm₀c²  total      ",
+    "  γ   =  1∕√(1−v²∕c²)      ",
+    "                             ",
+    "  ───────────────────────────  ",
+    "  Einstein  ·  1905          ",
+    "                             ",
+];
+
+// Spacetime curvature ───────────────────────────────────
+const LOGO_CURVE: [&str; 19] = [
+    "  ·  ─  ─  ─  ─  ─  ─  ─  ·  ",
+    "  │    │    │    │    │    ",
+    "  │  ╲ │  ╲ │  ╱ │  ╱ │  ",
+    "  ─  ─╲─  ─╲┼─  ╱─  ╱─  ",
+    "  ─  ─ ╲─ ─ ╲ ─ ╱ ─╱ ─  ",
+    "  ─  ─ ─╲─ ─ ◉ ─ ─╱─ ─  ",
+    "  ─  ─ ╱─ ─ ╱ ─ ╲ ─╲ ─  ",
+    "  ─  ─╱─  ─╱┼─  ╲─  ╲─  ",
+    "  │  ╱ │  ╱ │  ╲ │  ╲ │  ",
+    "  │    │    │    │    │    ",
+    "  ·  ─  ─  ─  ─  ─  ─  ─  ·  ",
+    "                             ",
+    "  Gμν = 8πG∕c⁴ · Tμν      ",
+    "  ds² = gμν dxᵘ dxᵛ         ",
+    "                             ",
+    "  ───────────────────────────",
+    "  mass warps spacetime       ",
+    "  light follows geodesics    ",
+    "  ───────────────────────────",
 ];
 
 // ── Config ───────────────────────────────────────────────
@@ -529,7 +552,7 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
 }
 
 // ── CLI ──────────────────────────────────────────────────
-enum LogoKind { Arch, Ascii, Tux, Dna, Atom, Wave, Emc2 }
+enum LogoKind { Arch, Ascii, Tux, Dna, Atom, Wave, Emc2, Curve }
 
 struct Args {
     logo:      LogoKind,
@@ -559,6 +582,7 @@ fn parse_args() -> Args {
                     "ascii" => LogoKind::Ascii, "tux"  => LogoKind::Tux,
                     "dna"   => LogoKind::Dna,   "atom" => LogoKind::Atom,
                     "wave"  => LogoKind::Wave,  "emc2" => LogoKind::Emc2,
+                    "curve" => LogoKind::Curve,
                     _       => LogoKind::Arch,
                 };
             },
@@ -594,6 +618,7 @@ fn print_help(cfg: &str) {
     println!("    {b}{g}atom{r}   {s}Bohr atom model (Fe){r}",b=b,g=g,s=s,r=r);
     println!("    {b}{g}wave{r}   {s}Schrodinger wave psi(x){r}",b=b,g=g,s=s,r=r);
     println!("    {b}{g}emc2{r}   {s}E = mc² — Einstein 1905{r}",b=b,g=g,s=s,r=r);
+    println!("    {b}{g}curve{r}  {s}spacetime curvature / GR{r}",b=b,g=g,s=s,r=r);
     println!();
     println!("  {b}{YELLOW}Accent names{r}", b=b, YELLOW=YELLOW, r=r);
     println!("    {RW}rosewater{r}  {FL}flamingo{r}  {PK}pink{r}  {MV}mauve{r}  {RD}red{r}  {MR}maroon{r}",
@@ -735,6 +760,7 @@ fn main() {
         LogoKind::Atom  => &LOGO_ATOM,
         LogoKind::Wave  => &LOGO_WAVE,
         LogoKind::Emc2  => &LOGO_EMC2,
+        LogoKind::Curve => &LOGO_CURVE,
     };
 
     let logo_w = logo.iter().map(|l| l.chars().count()).max().unwrap_or(36);
