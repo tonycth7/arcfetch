@@ -55,6 +55,15 @@ everything else sequential from `/proc` and `/sys`. zero subprocesses.
 
 ## install
 
+
+**via AUR** :
+
+```bash
+paru -S arcfetch
+# or
+yay -S arcfetch
+```
+
 **one liner — no clone needed:**
 
 ```bash
@@ -68,14 +77,6 @@ git clone https://github.com/tonycth7/arcfetch
 cd arcfetch
 chmod +x install.sh
 ./install.sh
-```
-
-**via AUR** :
-
-```bash
-paru -S arcfetch
-# or
-yay -S arcfetch
 ```
 
 add `~/.local/bin` to PATH if needed:
