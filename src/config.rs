@@ -122,69 +122,99 @@ impl Default for Colors {
     }
 }
 
+// ── Header display ───────────────────────────────────────
+
+#[derive(Clone, PartialEq)]
+pub enum Header {
+    Both,        // user@host  (default)
+    UserOnly,    // user
+    HostOnly,    // host
+    None,        // no header line at all
+}
+
+impl Default for Header { fn default() -> Self { Header::Both } }
+
 // ── Show (per-field visibility) ──────────────────────────
 
 pub struct Show {
-    pub os:      bool,
-    pub kernel:  bool,
-    pub uptime:  bool,
-    pub res:     bool,
-    pub pkgs:    bool,
-    pub shell:   bool,
-    pub de_wm:   bool,
-    pub term:    bool,
-    pub cpu:     bool,
-    pub gpu:     bool,
-    pub memory:  bool,
-    pub disk:    bool,
-    pub load:    bool,
-    pub locale:  bool,
-    pub swatches: bool,
+    pub header:       Header,
+    pub os:           bool,
+    pub kernel:       bool,
+    pub uptime:       bool,
+    pub uptime_long:  bool,   // true = "1 day, 2 hours, 30 mins" / false = "1d 2h 30m"
+    pub res:          bool,
+    pub pkgs:         bool,
+    pub shell:        bool,
+    pub de_wm:        bool,
+    pub term:         bool,
+    pub cpu:          bool,
+    pub gpu:          bool,
+    pub gpu_temp:     bool,
+    pub battery:      bool,
+    pub memory:       bool,
+    pub disk:         bool,
+    pub load:         bool,
+    pub locale:       bool,
+    pub ip:           bool,
+    pub ssh:          bool,
+    pub ports:        bool,
+    pub swatches:     bool,
 }
 
 impl Default for Show {
     fn default() -> Self {
         Show {
-            os: true, kernel: true, uptime: true, res: false,
-            pkgs: true, shell: true, de_wm: true, term: true,
-            cpu: true, gpu: true, memory: true, disk: true,
-            load: false, locale: false, swatches: true,
+            header: Header::Both,
+            os: true, kernel: true, uptime: true, uptime_long: false,
+            res: false, pkgs: true, shell: true, de_wm: true, term: true,
+            cpu: true, gpu: true, gpu_temp: false, battery: false,
+            memory: true, disk: true, load: false, locale: false,
+            ip: false, ssh: false, ports: false,
+            swatches: true,
         }
     }
 }
 
 impl Show {
     fn apply_preset(&mut self, preset: &str) {
-        // reset all to false first, then enable the preset fields
         *self = Show {
-            os: false, kernel: false, uptime: false, res: false,
-            pkgs: false, shell: false, de_wm: false, term: false,
-            cpu: false, gpu: false, memory: false, disk: false,
-            load: false, locale: false, swatches: false,
+            header: Header::Both,
+            os: false, kernel: false, uptime: false, uptime_long: false,
+            res: false, pkgs: false, shell: false, de_wm: false, term: false,
+            cpu: false, gpu: false, gpu_temp: false, battery: false,
+            memory: false, disk: false, load: false, locale: false,
+            ip: false, ssh: false, ports: false,
+            swatches: false,
         };
         match preset.trim() {
             "minimal" => {
                 self.os = true; self.kernel = true;
                 self.uptime = true; self.memory = true;
+                self.battery = true;
                 self.swatches = true;
             }
             "hacker" => {
-                self.cpu = true; self.gpu = true; self.memory = true;
-                self.disk = true; self.load = true;
+                self.kernel = true; self.uptime = true;
+                self.cpu = true; self.gpu = true; self.gpu_temp = true;
+                self.memory = true; self.disk = true; self.load = true;
+                self.ip = true; self.ssh = true; self.ports = true;
                 self.swatches = true;
             }
             "science" => {
                 self.os = true; self.kernel = true; self.cpu = true;
-                self.memory = true; self.disk = true;
-                self.swatches = true;
+                self.memory = true; self.disk = true; self.uptime = true;
+                self.swatches = false;
             }
             _ => {
-                // "full" or anything else — show everything
+                // "full" or anything else
                 *self = Show {
-                    os: true, kernel: true, uptime: true, res: true,
-                    pkgs: true, shell: true, de_wm: true, term: true,
-                    cpu: true, gpu: true, memory: true, disk: true,
-                    load: true, locale: true, swatches: true,
+                    header: Header::Both,
+                    os: true, kernel: true, uptime: true, uptime_long: false,
+                    res: true, pkgs: true, shell: true, de_wm: true, term: true,
+                    cpu: true, gpu: true, gpu_temp: false, battery: true,
+                    memory: true, disk: true, load: true, locale: true,
+                    ip: false, ssh: false, ports: false,
+                    swatches: true,
                 };
             }
         }
@@ -192,21 +222,27 @@ impl Show {
 
     fn set_field(&mut self, key: &str, val: bool) {
         match key {
-            "os"       => self.os      = val,
-            "kernel"   => self.kernel  = val,
-            "uptime"   => self.uptime  = val,
-            "res"      => self.res     = val,
-            "pkgs"     => self.pkgs    = val,
-            "shell"    => self.shell   = val,
-            "de_wm"    => self.de_wm   = val,
-            "term"     => self.term    = val,
-            "cpu"      => self.cpu     = val,
-            "gpu"      => self.gpu     = val,
-            "memory"   => self.memory  = val,
-            "disk"     => self.disk    = val,
-            "load"     => self.load    = val,
-            "locale"   => self.locale  = val,
-            "swatches" => self.swatches= val,
+            "os"          => self.os         = val,
+            "kernel"      => self.kernel     = val,
+            "uptime"      => self.uptime     = val,
+            "uptime_long" => self.uptime_long= val,
+            "res"         => self.res        = val,
+            "pkgs"        => self.pkgs       = val,
+            "shell"       => self.shell      = val,
+            "de_wm"       => self.de_wm      = val,
+            "term"        => self.term       = val,
+            "cpu"         => self.cpu        = val,
+            "gpu"         => self.gpu        = val,
+            "gpu_temp"    => self.gpu_temp   = val,
+            "battery"     => self.battery    = val,
+            "memory"      => self.memory     = val,
+            "disk"        => self.disk       = val,
+            "load"        => self.load       = val,
+            "locale"      => self.locale     = val,
+            "ip"          => self.ip         = val,
+            "ssh"         => self.ssh        = val,
+            "ports"       => self.ports      = val,
+            "swatches"    => self.swatches   = val,
             _ => {}
         }
     }
@@ -217,6 +253,7 @@ impl Show {
 pub struct Config {
     pub colors: Colors,
     pub show:   Show,
+    pub preset: Option<String>,
 }
 
 // ── File path ────────────────────────────────────────────
@@ -235,7 +272,7 @@ pub fn config_path() -> String {
 // Handles [section], key = value, # comments.
 // No arrays, no multiline — exactly what we need, zero deps.
 
-pub fn load(cli_accent: Option<&str>) -> Config {
+pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
     let mut colors = Colors::default();
     let mut show   = Show::default();
     let mut preset: Option<String> = None;
@@ -284,8 +321,17 @@ pub fn load(cli_accent: Option<&str>) -> Config {
                     }
                 }
                 "show" => {
-                    let enabled = matches!(val, "true" | "yes" | "1" | "on");
-                    show.set_field(key, enabled);
+                    if key == "header" {
+                        show.header = match val {
+                            "user"     | "username" => Header::UserOnly,
+                            "host"     | "hostname" => Header::HostOnly,
+                            "none"     | "false"    => Header::None,
+                            _                       => Header::Both,
+                        };
+                    } else {
+                        let enabled = matches!(val, "true" | "yes" | "1" | "on");
+                        show.set_field(key, enabled);
+                    }
                 }
                 "template" => {
                     if key == "preset" { preset = Some(val.to_string()); }
@@ -295,8 +341,11 @@ pub fn load(cli_accent: Option<&str>) -> Config {
         }
     }
 
+    // CLI preset overrides file preset
+    if let Some(p) = cli_preset { preset = Some(p.to_string()); }
+
     // apply preset (overrides [show] if set)
-    if let Some(p) = preset { show.apply_preset(&p); }
+    if let Some(p) = &preset { show.apply_preset(p); }
 
     // CLI / env accent wins over file
     if let Some(a) = accent_override {
@@ -305,5 +354,5 @@ pub fn load(cli_accent: Option<&str>) -> Config {
         colors.hostname = ansi;
     }
 
-    Config { colors, show }
+    Config { colors, show, preset }
 }

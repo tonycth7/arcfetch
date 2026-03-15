@@ -49,58 +49,122 @@ fn strip_ansi(s: &str) -> String {
 }
 
 /// Build the info column as a Vec<String> respecting show/hide config.
-fn build_info(si: &info::SysInfo, cfg: &Config) -> Vec<String> {
-    let c  = &cfg.colors;
-    let sh = &cfg.show;
-    let mut lines: Vec<String> = Vec::with_capacity(19);
+fn science_quote() -> &'static str {
+    // deterministic-ish: pick by uptime seconds mod pool size
+    let secs = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let n: usize = secs.split('.').next()
+        .and_then(|v| v.parse().ok()).unwrap_or(0);
+    const QUOTES: &[&str] = &[
+        "\"imagination is more important than knowledge\" — Einstein",
+        "\"if you can't explain it simply, you don't understand it\" — Feynman",
+        "\"we are made of star stuff\" — Sagan",
+        "\"the universe is under no obligation to make sense to you\" — Tyson",
+        "\"an expert is a person who has made all the mistakes\" — Bohr",
+        "\"what we know is a drop, what we don't know is an ocean\" — Newton",
+        "\"the important thing is not to stop questioning\" — Einstein",
+        "\"science is magic that works\" — Vonnegut",
+        "\"nature uses only the longest threads to weave her patterns\" — Feynman",
+        "\"the cosmos is within us. we are a way for the universe to know itself\" — Sagan",
+        "\"not only is the universe stranger than we think, it is stranger than we can think\" — Heisenberg",
+        "\"in physics, you don't have to go around making trouble for yourself — nature does it for you\" — Feynman",
+    ];
+    QUOTES[n % QUOTES.len()]
+}
 
-    // header — always shown
+fn science_logo() -> &'static str {
+    let secs = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let n: usize = secs.split('.').next()
+        .and_then(|v| v.parse().ok()).unwrap_or(0);
+    // science logos: dna atom wave emc2 pi
+    ["dna", "atom", "wave", "emc2", "pi"][n % 5]
+}
+
+fn build_info(si: &info::SysInfo, cfg: &Config) -> (Vec<String>, bool) {
+    let c      = &cfg.colors;
+    let sh     = &cfg.show;
+    let is_sci = matches!(cfg.preset.as_deref(), Some("science"));
+    let mut lines: Vec<String> = Vec::with_capacity(22);
+
+    // ── header ────────────────────────────────────────────
+    use config::Header;
     let username = env::var("USER").or_else(|_| env::var("LOGNAME")).unwrap_or_else(|_| "user".into());
     let hostname = std::fs::read_to_string("/etc/hostname")
         .unwrap_or_default().trim().to_string();
-    let pw       = username.len() + 1 + hostname.len();
 
-    lines.push(format!("{B}{uc}{u}{OVL}@{R}{B}{hc}{h}{R}",
-        B=BOLD, uc=&c.username, u=username,
-        OVL=OVERLAY0, R=RESET, hc=&c.hostname, h=hostname));
-    lines.push(format!("{sc}{l}{R}", sc=&c.sep, l="\u{2500}".repeat(pw), R=RESET));
+    match &sh.header {
+        Header::Both => {
+            let pw = username.len() + 1 + hostname.len();
+            lines.push(format!("{B}{uc}{u}{OVL}@{R}{B}{hc}{h}{R}",
+                B=BOLD, uc=&c.username, u=&username,
+                OVL=OVERLAY0, R=RESET, hc=&c.hostname, h=&hostname));
+            lines.push(format!("{sc}{l}{R}", sc=&c.sep,
+                l="\u{2500}".repeat(pw), R=RESET));
+        }
+        Header::UserOnly => {
+            lines.push(format!("{B}{uc}{u}{R}", B=BOLD, uc=&c.username, u=&username, R=RESET));
+            lines.push(format!("{sc}{l}{R}", sc=&c.sep,
+                l="\u{2500}".repeat(username.len()), R=RESET));
+        }
+        Header::HostOnly => {
+            lines.push(format!("{B}{hc}{h}{R}", B=BOLD, hc=&c.hostname, h=&hostname, R=RESET));
+            lines.push(format!("{sc}{l}{R}", sc=&c.sep,
+                l="\u{2500}".repeat(hostname.len()), R=RESET));
+        }
+        Header::None => {}
+    }
 
-    // macro avoids borrow conflict — closure would hold &mut lines + &mut li
-    // simultaneously with the memory block below
     macro_rules! field {
-        ($show:expr, $key:expr, $val:expr) => {
+        ($li:expr, $lines:expr, $c:expr, $show:expr, $key:expr, $val:expr) => {
             if $show {
-                lines.push(row(c.label(li), $key, $val, &c.values));
-                li += 1;
+                $lines.push(row($c.label($li), $key, $val, &$c.values));
+                $li += 1;
             }
         };
     }
 
+    #[allow(unused_assignments)]
     let mut li = 0usize;
 
-    field!(sh.os,     "os",     &si.os);
-    field!(sh.kernel, "kernel", &si.kernel);
-    field!(sh.uptime, "uptime", &si.uptime);
-    field!(sh.res,    "res",    &si.res);
-    field!(sh.pkgs,   "pkgs",   &si.pkgs);
-    field!(sh.shell,  "shell",  &si.shell);
-    field!(sh.de_wm,  "de/wm",  &si.de_wm);
-    field!(sh.term,   "term",   &si.term);
-    field!(sh.cpu,    "cpu",    &si.cpu);
-    field!(sh.gpu,    "gpu",    &si.gpu);
+    field!(li, lines, c, sh.os,     "os",     &si.os);
+    field!(li, lines, c, sh.kernel, "kernel", &si.kernel);
 
-    // memory — special: includes bar
+    // uptime — short or long format based on config
+    if sh.uptime {
+        let upt_str = if sh.uptime_long {
+            let s = si.uptime_secs;
+            let (d, h, m) = (s/86400, (s%86400)/3600, (s%3600)/60);
+            match (d, h, m) {
+                (0, 0, m) => format!("{} min{}", m, if m==1 {""} else {"s"}),
+                (0, h, m) => format!("{} hr{}, {} min{}", h, if h==1 {""} else {"s"}, m, if m==1 {""} else {"s"}),
+                (d, h, m) => format!("{} day{}, {} hr{}, {} min{}", d, if d==1 {""} else {"s"}, h, if h==1 {""} else {"s"}, m, if m==1 {""} else {"s"}),
+            }
+        } else {
+            si.uptime.clone()
+        };
+        lines.push(row(c.label(li), "uptime", &upt_str, &c.values));
+        li += 1;
+    }
+
+    field!(li, lines, c, sh.res,    "res",    &si.res);
+    field!(li, lines, c, sh.pkgs,   "pkgs",   &si.pkgs);
+    field!(li, lines, c, sh.shell,  "shell",  &si.shell);
+    field!(li, lines, c, sh.de_wm,  "de/wm",  &si.de_wm);
+    field!(li, lines, c, sh.term,   "term",   &si.term);
+    field!(li, lines, c, sh.cpu,    "cpu",    &si.cpu);
+    field!(li, lines, c, sh.gpu,    "gpu",    &si.gpu);
+    field!(li, lines, c, sh.gpu_temp, "gpu °C", &si.gpu_temp);
+    field!(li, lines, c, sh.battery,  "battery", &si.battery);
+
+    // memory bar
     if sh.memory {
         let bar     = mem_bar(si.mem_used, si.mem_total, 14, &c.bar);
         let mem_str = if si.mem_total >= 1024 {
             format!("{bar}{TEXT}  {u:.1}G / {t:.1}G{R}",
-                bar=bar, TEXT=TEXT,
-                u=si.mem_used as f64/1024.0,
+                bar=bar, TEXT=TEXT, u=si.mem_used as f64/1024.0,
                 t=si.mem_total as f64/1024.0, R=RESET)
         } else {
             format!("{bar}{TEXT}  {u}M / {t}M{R}",
-                bar=bar, TEXT=TEXT,
-                u=si.mem_used, t=si.mem_total, R=RESET)
+                bar=bar, TEXT=TEXT, u=si.mem_used, t=si.mem_total, R=RESET)
         };
         let mut s = String::with_capacity(140);
         s.push_str(BOLD); s.push_str(c.label(li));
@@ -110,11 +174,16 @@ fn build_info(si: &info::SysInfo, cfg: &Config) -> Vec<String> {
         li += 1;
     }
 
-    field!(sh.disk,   "disk",   &si.disk);
-    field!(sh.load,   "load",   &si.load);
-    field!(sh.locale, "locale", &si.locale);
+    field!(li, lines, c, sh.disk,   "disk",   &si.disk);
+    field!(li, lines, c, sh.load,   "load",   &si.load);
+    field!(li, lines, c, sh.locale, "locale", &si.locale);
 
-    // blank line + swatches
+    // hacker fields
+    field!(li, lines, c, sh.ip,    "ip",    &si.ip);
+    field!(li, lines, c, sh.ssh,   "ssh",   &si.ssh);
+    field!(li, lines, c, sh.ports, "ports", &si.ports);
+
+    // swatches
     if sh.swatches {
         lines.push(String::new());
         lines.push(format!(
@@ -126,7 +195,13 @@ fn build_info(si: &info::SysInfo, cfg: &Config) -> Vec<String> {
         ));
     }
 
-    lines
+    // science quote — always last if science preset
+    if is_sci {
+        lines.push(String::new());
+        lines.push(format!("{OVL}{q}{R}", OVL=OVERLAY0, q=science_quote(), R=RESET));
+    }
+
+    (lines, is_sci)
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -237,6 +312,7 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
 struct Args {
     logo:      String,
     accent:    Option<String>,
+    preset:    Option<String>,
     no_color:  bool,
     blackhole: bool,
     duration:  Option<u64>,
@@ -247,7 +323,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut a = Args {
-        logo: "arch".into(), accent: None,
+        logo: "arch".into(), accent: None, preset: None,
         no_color: false, blackhole: false,
         duration: None, help: false, version: false, show_cfg: false,
     };
@@ -259,10 +335,11 @@ fn parse_args() -> Args {
             "--blackhole"      => a.blackhole  = true,
             "--no-color"       => a.no_color   = true,
             "--config"         => a.show_cfg   = true,
-            "--logo"    => { a.logo     = it.next().unwrap_or_else(|| "arch".into()); }
-            "--accent"  => { a.accent   = it.next(); }
-            "--t"       => { a.duration = it.next().and_then(|v| v.parse().ok()); }
-            _           => {}
+            "--logo"   => { a.logo   = it.next().unwrap_or_else(|| "arch".into()); }
+            "--accent" => { a.accent = it.next(); }
+            "--preset" => { a.preset = it.next(); }
+            "--t"      => { a.duration = it.next().and_then(|v| v.parse().ok()); }
+            _          => {}
         }
     }
     a
@@ -332,6 +409,96 @@ fn print_config_help(cfg_path: &str) {
     println!();
 }
 
+fn write_sample_config(cfg_path: &str) {
+    use std::fs;
+    use std::path::Path;
+
+    let path = Path::new(cfg_path);
+
+    // don't overwrite existing config
+    if path.exists() {
+        println!("  {OVL}config already exists — not overwritten{R}",
+            OVL=OVERLAY0, R=RESET);
+        println!("  {S}{p}{R}", S=SUBTEXT1, p=cfg_path, R=RESET);
+        println!();
+        return;
+    }
+
+    // create parent dirs
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            println!("  {RED}could not create dir: {e}{R}", RED=RED, e=e, R=RESET);
+            return;
+        }
+    }
+
+    let sample = r#"# arcfetch config — ~/.config/arcfetch/config.toml
+# all values are optional — delete lines to use defaults
+
+[colors]
+accent   = blue
+username = mauve
+hostname = blue
+c1 = blue
+c2 = sapphire
+c3 = sky
+c4 = teal
+c5 = green
+c6 = yellow
+c7 = peach
+values = subtext1
+sep    = overlay0
+bar    = blue
+
+[show]
+# header: both | user | host | none
+header      = both
+
+os          = true
+kernel      = true
+uptime      = true
+uptime_long = false   # true = "1 day, 2 hours, 30 mins"
+res         = false
+pkgs        = true
+shell       = true
+de_wm       = true
+term        = true
+cpu         = true
+gpu         = true
+gpu_temp    = false   # GPU temperature — reads /sys/class/drm hwmon
+battery     = false   # battery % + status — N/A on desktop
+memory      = true
+disk        = true
+load        = false
+locale      = false
+
+# hacker fields (hidden by default)
+ip          = false
+ssh         = false
+ports       = false
+
+swatches    = true
+
+[template]
+# preset overrides [show] entirely
+# options: full | minimal | hacker | science
+# preset = full
+"#;
+
+    match fs::write(path, sample) {
+        Ok(_) => {
+            println!("  {GREEN}created{R}  {S}{p}{R}",
+                GREEN=GREEN, R=RESET, S=SUBTEXT1, p=cfg_path);
+            println!("  {OVL}edit it to customise — all fields are optional{R}",
+                OVL=OVERLAY0, R=RESET);
+        }
+        Err(e) => {
+            println!("  {RED}error writing config: {e}{R}", RED=RED, e=e, R=RESET);
+        }
+    }
+    println!();
+}
+
 fn print_help(cfg_path: &str) {
     let (b, r, s, g) = (BOLD, RESET, SUBTEXT1, GREEN);
     println!();
@@ -342,10 +509,11 @@ fn print_help(cfg_path: &str) {
     println!("  {b}{SAPPHIRE}flags{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
     println!("    {b}{g}-h, --help{r}                 this screen", b=b, g=g, r=r);
     println!("    {b}{g}-V, --version{r}              version + E=mc² joke", b=b, g=g, r=r);
-    println!("    {b}{g}--config{r}                   show full config reference", b=b, g=g, r=r);
+    println!("    {b}{g}--config{r}                   show config ref + write sample file", b=b, g=g, r=r);
     println!("    {b}{g}--blackhole{r}                {MAUVE}animated M87 accretion disk{r}", b=b, g=g, r=r, MAUVE=MAUVE);
     println!("    {b}{g}--t <secs>{r}                 {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo <name>{r}              switch logo", b=b, g=g, r=r);
+    println!("    {b}{g}--preset <n>{r}               {s}full|minimal|hacker|science{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--accent <color>{r}           hex or catppuccin name", b=b, g=g, r=r);
     println!("    {b}{g}--no-color{r}                 plain text (pipe-friendly)", b=b, g=g, r=r);
     println!();
@@ -359,9 +527,11 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}emc2{r}   {s}E = mc²{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}pi{r}     {s}π — irrational & beautiful{r}", b=b, g=g, r=r, s=s);
     println!();
-    println!("  {b}{YELLOW}templates{r}  {s}(set in config or just use --accent){r}", b=b, YELLOW=YELLOW, r=r, s=s);
-    println!("    {g}full{r}     everything  {g}minimal{r}  os kernel uptime memory", g=g, r=r);
-    println!("    {g}hacker{r}   cpu gpu mem disk load  {g}science{r}  os kernel cpu mem disk", g=g, r=r);
+    println!("  {b}{YELLOW}presets{r}", b=b, YELLOW=YELLOW, r=r);
+    println!("    {g}full{r}      everything", g=g, r=r);
+    println!("    {g}minimal{r}   os kernel uptime memory", g=g, r=r);
+    println!("    {g}hacker{r}    cpu gpu mem disk load ip ssh ports", g=g, r=r);
+    println!("    {g}science{r}   os kernel cpu mem + random science logo + physicist quote", g=g, r=r);
     println!();
     println!("  {b}{PEACH}config{r}  {s}{cfg_path}{r}", b=b, PEACH=PEACH, r=r, s=s, cfg_path=cfg_path);
     println!("    run {b}{g}arcfetch --config{r} for full config reference", b=b, g=g, r=r);
@@ -391,15 +561,17 @@ fn main() {
 
     if args.version  { print_version();               return; }
     if args.help     { print_help(&cfg_path);          return; }
-    if args.show_cfg { print_config_help(&cfg_path);   return; }
+    if args.show_cfg { print_config_help(&cfg_path); write_sample_config(&cfg_path); return; }
 
-    let cfg = config::load(args.accent.as_deref());
+    let cfg = config::load(args.accent.as_deref(), args.preset.as_deref());
 
-    // collect all sysinfo in parallel (rayon)
-    let si = info::collect_all();
+    // collect all sysinfo — only read network for hacker preset
+    let need_net = cfg.preset.as_deref() == Some("hacker")
+        || cfg.show.ip || cfg.show.ssh || cfg.show.ports;
+    let si = info::collect_all(need_net);
 
     // build info column
-    let mut info_lines = build_info(&si, &cfg);
+    let (mut info_lines, is_science) = build_info(&si, &cfg);
 
     // optionally strip colour
     let out_lines: Vec<String> = if args.no_color {
@@ -410,7 +582,14 @@ fn main() {
 
     if args.blackhole { run_blackhole(&out_lines, args.duration); return; }
 
-    let logo   = logos::from_name(&args.logo);
+    // science preset: random science logo unless user pinned one explicitly
+    let logo_name = if is_science && args.logo == "arch" {
+        science_logo().to_string()
+    } else {
+        args.logo.clone()
+    };
+
+    let logo   = logos::from_name(&logo_name);
     let logo_w = logo.iter().map(|l| l.chars().count()).max().unwrap_or(36);
 
     let out     = stdout();
