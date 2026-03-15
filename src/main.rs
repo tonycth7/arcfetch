@@ -310,20 +310,22 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
 // ═══════════════════════════════════════════════════════════
 
 struct Args {
-    logo:      String,
-    accent:    Option<String>,
-    preset:    Option<String>,
-    no_color:  bool,
-    blackhole: bool,
-    duration:  Option<u64>,
-    help:      bool,
-    version:   bool,
-    show_cfg:  bool,
+    logo:       String,
+    logo_file:  Option<String>,
+    accent:     Option<String>,
+    preset:     Option<String>,
+    no_color:   bool,
+    blackhole:  bool,
+    duration:   Option<u64>,
+    help:       bool,
+    version:    bool,
+    show_cfg:   bool,
 }
 
 fn parse_args() -> Args {
     let mut a = Args {
-        logo: "arch".into(), accent: None, preset: None,
+        logo: "arch".into(), logo_file: None,
+        accent: None, preset: None,
         no_color: false, blackhole: false,
         duration: None, help: false, version: false, show_cfg: false,
     };
@@ -335,11 +337,12 @@ fn parse_args() -> Args {
             "--blackhole"      => a.blackhole  = true,
             "--no-color"       => a.no_color   = true,
             "--config"         => a.show_cfg   = true,
-            "--logo"   => { a.logo   = it.next().unwrap_or_else(|| "arch".into()); }
-            "--accent" => { a.accent = it.next(); }
-            "--preset" => { a.preset = it.next(); }
-            "--t"      => { a.duration = it.next().and_then(|v| v.parse().ok()); }
-            _          => {}
+            "--logo"      => { a.logo      = it.next().unwrap_or_else(|| "arch".into()); }
+            "--logo-file" => { a.logo_file  = it.next(); }
+            "--accent"    => { a.accent     = it.next(); }
+            "--preset"    => { a.preset     = it.next(); }
+            "--t"         => { a.duration   = it.next().and_then(|v| v.parse().ok()); }
+            _             => {}
         }
     }
     a
@@ -513,12 +516,13 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}--blackhole{r}                {MAUVE}animated M87 accretion disk{r}", b=b, g=g, r=r, MAUVE=MAUVE);
     println!("    {b}{g}--t <secs>{r}                 {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo <name>{r}              switch logo", b=b, g=g, r=r);
+    println!("    {b}{g}--logo-file <path>{r}         {s}custom ASCII art file{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--preset <n>{r}               {s}full|minimal|hacker|science{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--accent <color>{r}           hex or catppuccin name", b=b, g=g, r=r);
     println!("    {b}{g}--no-color{r}                 plain text (pipe-friendly)", b=b, g=g, r=r);
     println!();
     println!("  {b}{TEAL}logos{r}", b=b, TEAL=TEAL, r=r);
-    println!("    {b}{g}arch{r}   block {s}▟███▙{r} (default)", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}arch{r}    block {s}▟███▙{r} (default)", b=b, g=g, r=r, s=s);
     println!("    {b}{g}ascii{r}  dotty Arch ASCII", b=b, g=g, r=r);
     println!("    {b}{g}tux{r}    Linux penguin", b=b, g=g, r=r);
     println!("    {b}{g}dna{r}    DNA double helix", b=b, g=g, r=r);
@@ -526,6 +530,7 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}wave{r}   {s}Schrödinger ψ(x,t){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}emc2{r}   {s}E = mc²{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}pi{r}     {s}π — irrational & beautiful{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}custom{r}  {s}~/.config/arcfetch/logo.txt{r}", b=b, g=g, r=r, s=s);
     println!();
     println!("  {b}{YELLOW}presets{r}", b=b, YELLOW=YELLOW, r=r);
     println!("    {g}full{r}      everything", g=g, r=r);
@@ -582,36 +587,95 @@ fn main() {
 
     if args.blackhole { run_blackhole(&out_lines, args.duration); return; }
 
-    // science preset: random science logo unless user pinned one explicitly
-    let logo_name = if is_science && args.logo == "arch" {
+    // ── resolve logo ─────────────────────────────────────
+    // priority: --logo-file  >  --logo custom  >  science random  >  named logo
+
+    // default custom logo path: ~/.config/arcfetch/logo.txt
+    let default_custom = {
+        let cfg_dir = config::config_path()
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_else(|| "~/.config/arcfetch".into());
+        format!("{}/logo.txt", cfg_dir)
+    };
+
+    // load lines from a file — any number of lines, any width
+    let load_file = |path: &str| -> Option<Vec<String>> {
+        let expanded = if path.starts_with('~') {
+            env::var("HOME").ok()
+                .map(|h| path.replacen('~', &h, 1))
+                .unwrap_or_else(|| path.to_string())
+        } else {
+            path.to_string()
+        };
+        std::fs::read_to_string(&expanded).ok().map(|raw| {
+            raw.lines().map(String::from).collect()
+        })
+    };
+
+    // figure out which logo to use
+    let custom_lines: Option<Vec<String>> = if let Some(ref path) = args.logo_file {
+        // explicit --logo-file path
+        load_file(path).or_else(|| {
+            eprintln!("arcfetch: could not read logo file: {}", path);
+            None
+        })
+    } else if args.logo == "custom" {
+        // --logo custom → try default path
+        load_file(&default_custom).or_else(|| {
+            eprintln!("arcfetch: no logo file found at {}", default_custom);
+            eprintln!("  create it or use --logo-file <path>");
+            None
+        })
+    } else {
+        None
+    };
+
+    let logo_name = if custom_lines.is_none() && is_science && args.logo == "arch" {
         science_logo().to_string()
     } else {
         args.logo.clone()
     };
 
-    let logo   = logos::from_name(&logo_name);
-    let logo_w = logo.iter().map(|l| l.chars().count()).max().unwrap_or(36);
-
+    // build owned Vec<String> for custom, borrow &[&str] for builtins
     let out     = stdout();
     let mut buf = BufWriter::new(out.lock());
     writeln!(buf).ok();
 
-    let max_rows = logo.len().max(out_lines.len());
-    for i in 0..max_rows {
-        let ll  = logo.get(i).copied().unwrap_or("");
-        let pad = logo_w.saturating_sub(ll.chars().count());
-        let inf = out_lines.get(i).map(String::as_str).unwrap_or("");
-
-        if args.no_color {
-            writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
-        } else {
-            writeln!(buf, "  {acc}{ll}{pad}{R}  {inf}",
-                acc = &cfg.colors.accent,
-                ll  = ll,
-                pad = " ".repeat(pad),
-                R   = RESET,
-                inf = inf).ok();
+    if let Some(ref lines) = custom_lines {
+        // custom file logo — lines are owned Strings
+        let logo_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let max_rows = lines.len().max(out_lines.len());
+        for i in 0..max_rows {
+            let ll  = lines.get(i).map(String::as_str).unwrap_or("");
+            let pad = logo_w.saturating_sub(ll.chars().count());
+            let inf = out_lines.get(i).map(String::as_str).unwrap_or("");
+            if args.no_color {
+                writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
+            } else {
+                writeln!(buf, "  {acc}{ll}{pad}{R}  {inf}",
+                    acc = &cfg.colors.accent, ll = ll,
+                    pad = " ".repeat(pad), R = RESET, inf = inf).ok();
+            }
+        }
+    } else {
+        // built-in logo
+        let logo   = logos::from_name(&logo_name);
+        let logo_w = logo.iter().map(|l| l.chars().count()).max().unwrap_or(36);
+        let max_rows = logo.len().max(out_lines.len());
+        for i in 0..max_rows {
+            let ll  = logo.get(i).copied().unwrap_or("");
+            let pad = logo_w.saturating_sub(ll.chars().count());
+            let inf = out_lines.get(i).map(String::as_str).unwrap_or("");
+            if args.no_color {
+                writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
+            } else {
+                writeln!(buf, "  {acc}{ll}{pad}{R}  {inf}",
+                    acc = &cfg.colors.accent, ll = ll,
+                    pad = " ".repeat(pad), R = RESET, inf = inf).ok();
+            }
         }
     }
+
     writeln!(buf).ok();
 }
