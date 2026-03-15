@@ -1,0 +1,20 @@
+[package]
+name        = "arcfetch"
+version     = "0.7.0"
+edition     = "2024"
+description = "Blazing-fast Arch Linux sysinfo — Catppuccin Mocha"
+authors     = ["arcfetch"]
+
+[[bin]]
+name = "arcfetch"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true
+panic         = "abort"
