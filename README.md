@@ -70,7 +70,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-**via AUR** (In future):
+**via AUR** :
 
 ```bash
 paru -S arcfetch
