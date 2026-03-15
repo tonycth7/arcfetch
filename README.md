@@ -2,8 +2,9 @@
 
 > **this is not for you if you don't use arch btw**
 
-a blazing fast system info tool written in rust. no subprocesses, no python, no waiting.
-just your machine's stats, catppuccin mocha colors, and a black hole if you're feeling dramatic.
+blazing fast system info written in rust. catppuccin mocha. 8 logos.
+a black hole. a π symbol made of its own digits. physicist quotes.
+and yes, it's faster than that C tool you're comparing it to.
 
 ---
 
@@ -33,69 +34,74 @@ just your machine's stats, catppuccin mocha colors, and a black hole if you're f
 
 ---
 
-## why does this exist
+## speed
 
-because neofetch is dead, fastfetch is written in C like it's 1992, and i wanted something that:
+first run after boot is slower (~0.020s) — kernel cold-caches `/proc` and
+`/var/lib/pacman`. every subsequent run hits warm cache:
 
-- starts faster than your brain processes the command
-- looks good with catppuccin mocha
-- has a black hole mode (you'll understand when you see it)
-- is written in rust because of course it is
+| run            | time      |
+|----------------|-----------|
+| arcfetch       | ~0.007s   |
+| fastfetch      | ~0.031s   |
+| neofetch       | ~0.300s   |
 
-**speed comparison:**
+on bare metal arch the warm cache number drops to ~0.003s.
+hacker preset is ~0.010-0.012s due to `/proc/net/tcp` reads — expected and worth it.
 
-| tool      | time    |
-|-----------|---------|
-| arcfetch  | ~0.009s |
-| fastfetch | ~0.031s |
-| neofetch  | ~0.3s   |
-| screenfetch | lol   |
+how: two threads for slow real-FS reads (`/var/lib/pacman`, GPU detection),
+everything else sequential from `/proc` and `/sys`. zero subprocesses.
 
 ---
 
 ## install
 
-you need rust. if you don't have rust yet:
+**one liner — no clone needed:**
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo install --git https://github.com/tonycth7/arcfetch --locked
 ```
 
-then:
+or clone and build manually:
 
 ```bash
-git clone https://github.com/yourname/arcfetch
+git clone https://github.com/tonycth7/arcfetch
 cd arcfetch
 chmod +x install.sh
 ./install.sh
 ```
 
-or manually if you don't trust install scripts (fair):
+**via AUR** (once submitted):
 
 ```bash
-cargo build --release
-cp target/release/arcfetch ~/.local/bin/arcfetch
+paru -S arcfetch
+# or
+yay -S arcfetch
 ```
 
-make sure `~/.local/bin` is in your PATH:
+add `~/.local/bin` to PATH if needed:
 
 ```bash
-# add this to your .zshrc / .bashrc / config.fish
-export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+```
+
+need rust?
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 ---
 
 ## auto-run on terminal open
 
-the whole point is to see this every time you open a terminal. add one line to your shell config:
+add one line to your shell config:
 
 **zsh** (`~/.zshrc`):
 ```bash
 arcfetch
-# or with a specific logo you like:
-arcfetch --logo wave
-arcfetch --logo dna --accent mauve
+# or pin a specific look:
+arcfetch --logo pi --accent mauve
+arcfetch --preset science
 ```
 
 **bash** (`~/.bashrc`):
@@ -105,151 +111,151 @@ arcfetch --logo ascii
 
 **fish** (`~/.config/fish/config.fish`):
 ```fish
-arcfetch --logo atom --accent sapphire
+arcfetch --logo atom --accent teal
 ```
-
-pick a logo, set an accent, forget about it. every new terminal will greet you with your stats.
 
 ---
 
 ## logos
 
-six to choose from:
+8 to choose from:
 
 ```bash
-arcfetch                    # default block arch logo ▟███▙
+arcfetch                    # default — block arch  ▟███▙
 arcfetch --logo ascii       # classic dotty arch ascii
 arcfetch --logo tux         # linux tux penguin
-arcfetch --logo dna         # DNA double helix (A═T, G═C base pairs)
-arcfetch --logo atom        # bohr atom diagram (iron, Fe)
-arcfetch --logo wave        # schrödinger wave ψ(x,t) = Ae^i(kx−ωt)
+arcfetch --logo dna         # DNA double helix  A═T  G═C  base pairs
+arcfetch --logo atom        # bohr atom (Fe) — 26p 30n 26e — 3d⁶4s²
+arcfetch --logo wave        # schrödinger  ψ(x,t) = Ae^i(kx−ωt)
+arcfetch --logo emc2        # E = mc²  with mass-energy conversion table
+arcfetch --logo pi          # π — digits spiralling around the symbol itself
 ```
 
-if you're putting it in your shell config, pick the one that doesn't get old. `wave` and `dna` are the most aesthetic imo but you do you.
+the `science` preset automatically picks a random science logo every session
+(cycles dna / atom / wave / emc2 / pi by uptime — different every terminal open).
 
 ---
 
-## colors / accent
+## presets
 
-your logo renders in whatever accent color you set. default is catppuccin mocha blue.
-
-**quick change (inline):**
 ```bash
-arcfetch --accent mauve
-arcfetch --accent '#CBA6F7'
-arcfetch --accent teal
+arcfetch --preset full      # everything — all fields visible
+arcfetch --preset minimal   # os kernel uptime memory battery
+arcfetch --preset hacker    # kernel uptime cpu gpu gpu_temp mem disk load ip ssh ports
+arcfetch --preset science   # random science logo + physicist quote at the bottom
 ```
 
-**permanent (config file) — recommended:**
-```bash
-mkdir -p ~/.config/arcfetch
-echo "mauve" > ~/.config/arcfetch/accent
-# or a hex color:
-echo "#CBA6F7" > ~/.config/arcfetch/accent
+set permanently in config:
+
+```toml
+[template]
+preset = science
 ```
 
-**or via env var (useful for testing):**
+---
+
+## config
+
 ```bash
-ARCFETCH_ACCENT=pink arcfetch
+arcfetch --config
 ```
 
-**all catppuccin mocha accent names:**
+prints the full reference **and** writes a sample `~/.config/arcfetch/config.toml`
+on first run. won't overwrite an existing file.
 
-| name       | vibe              |
-|------------|-------------------|
-| rosewater  | warm pink-white   |
-| flamingo   | soft pink         |
-| pink       | hot pink          |
-| mauve      | purple (popular)  |
-| red        | bright red        |
-| maroon     | dark red          |
-| peach      | warm orange       |
-| yellow     | golden            |
-| green      | mint green        |
-| teal       | cyan-green        |
-| sky        | light blue        |
-| sapphire   | deep blue         |
-| blue       | mocha blue (default) |
-| lavender   | soft purple       |
+### header
+
+```toml
+[show]
+header = both    # user@host  (default)
+header = user    # just the username
+header = host    # just the hostname
+header = none    # no header at all — pure info
+```
+
+### show / hide any field
+
+```toml
+[show]
+os          = true
+kernel      = true
+uptime      = true
+uptime_long = false   # "1 day, 2 hours, 30 mins" vs "1d 2h 30m"
+res         = false
+pkgs        = true
+shell       = true
+de_wm       = true
+term        = true
+cpu         = true
+gpu         = true
+gpu_temp    = false   # GPU temperature °C — reads /sys/class/drm hwmon
+battery     = false   # 85% ↓ / 92% ↑ / 100% ✓ — N/A on desktop
+memory      = true
+disk        = true
+load        = false
+locale      = false
+ip          = false   # local IP — reads /proc/net/fib_trie
+ssh         = false   # SSH running/not — reads /proc/net/tcp
+ports       = false   # open TCP ports — reads /proc/net/tcp
+swatches    = true
+```
+
+### colors
+
+7 cycling label colors + accent + bar + sep. all catppuccin mocha names or hex:
+
+```toml
+[colors]
+accent   = blue        # logo + hostname
+username = mauve       # user part of user@host
+c1       = blue        # label slot 1
+c2       = sapphire    # label slot 2
+c3       = sky         # ... cycles through visible fields
+c4       = teal
+c5       = green
+c6       = yellow
+c7       = peach
+values   = subtext1    # all field values
+sep      = overlay0    # separator line
+bar      = blue        # memory bar fill
+```
+
+named accents: `rosewater` `flamingo` `pink` `mauve` `red` `maroon` `peach` `yellow`
+`green` `teal` `sky` `sapphire` `blue` *(default)* `lavender`
+
+or raw hex: `accent = #CBA6F7`
 
 ---
 
 ## --blackhole
 
-the reason arcfetch exists honestly.
+animated M87-style accretion disk renders alongside your sysinfo.
 
 ```bash
-arcfetch --blackhole              # runs for ~3 seconds
-arcfetch --blackhole --t 0        # infinite loop. your terminal is now a screensaver
-arcfetch --blackhole --t 20       # runs for exactly 20 seconds
-arcfetch --blackhole --t 60       # one minute. tell people you're busy
+arcfetch --blackhole              # runs ~3 seconds
+arcfetch --blackhole --t 0        # infinite — your terminal is a screensaver
+arcfetch --blackhole --t 30       # exactly 30 seconds
 ```
 
-it renders a real M87-style accretion disk simulation:
-- event horizon in the center (pure void)
-- photon sphere glowing faint cyan
-- accretion disk with actual doppler brightening — approaching side is yellow/warm, receding side is red/cool
-- corona wisps in mauve and lavender
-
-for `--t 0`, hit **Ctrl+C** to exit. cursor always comes back, no broken terminal.
-
-if you have a dual monitor setup, put `arcfetch --blackhole --t 0` in a tmux pane and leave it running. you're welcome.
+physics: real doppler brightening — approaching side glows yellow/warm,
+receding side goes red/dark. photon sphere in cyan. corona wisps in mauve.
+Ctrl+C always restores cursor cleanly.
 
 ---
 
 ## all flags
 
 ```
--h, --help                  usage + config file path on your system
--V, --version               version info (with a physics joke)
---blackhole                 animated M87 black hole
-  --t <secs>                0 = infinite, N = N seconds
---logo <name>               arch / ascii / tux / dna / atom / wave
---accent <color>            hex (#RRGGBB) or catppuccin name
---no-color                  plain text, no ANSI — good for piping
+-h,  --help               usage screen
+-V,  --version            version + E=mc² joke
+     --config             config reference + write sample file
+     --preset <n>         full | minimal | hacker | science
+     --blackhole          animated M87 accretion disk
+     --t <secs>           0 = infinite, N = N seconds
+     --logo <n>           arch | ascii | tux | dna | atom | wave | emc2 | pi
+     --accent <color>     hex (#RRGGBB) or catppuccin name
+     --no-color           strip all ANSI — pipe-friendly
 ```
-
----
-
-## pipe-friendly
-
-```bash
-# save your sysinfo to a file
-arcfetch --no-color > sysinfo.txt
-
-# share it or grep it
-arcfetch --no-color | grep cpu
-```
-
----
-
-## version
-
-```bash
-arcfetch -V
-```
-
-prints version, theme info, and `E = mc²  where E = startup time ≈ 0`. because why not.
-
----
-
-## how is it this fast
-
-- reads everything from `/proc`, `/sys`, and env vars directly — zero subprocess spawns
-- all 14 system readers run in parallel via `thread::scope`
-- entire output written in one `BufWriter` flush
-- release build: `lto=thin`, `strip=true`, `codegen-units=1`, `panic=abort`
-
-the binary ends up around 200KB stripped. your bash history file is probably bigger.
-
----
-
-## requirements
-
-- arch linux (or close enough — it reads `/var/lib/pacman/local` for package count)
-- rust 1.63+ for `thread::scope`
-- a terminal with true-color support (basically everything made after 2015)
-- a nerd font recommended but not required
 
 ---
 
@@ -262,4 +268,13 @@ the binary ends up around 200KB stripped. your bash history file is probably big
 
 ---
 
-*built for arch, written in rust, themed in catppuccin. what more do you want.*
+## requirements
+
+- arch linux (reads `/var/lib/pacman/local` for package count — shows `unknown` elsewhere)
+- rust 1.63+ for `thread::scope` support (`rustup update`)
+- true-color terminal (anything made after 2015)
+
+---
+
+*built for arch. written in rust. themed in catppuccin.*
+*feynman said nature uses the longest threads. this binary uses two.*
