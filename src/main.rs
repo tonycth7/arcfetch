@@ -350,10 +350,7 @@ fn parse_args() -> Args {
 
 fn print_version() {
     println!();
-    println!("  {B}{MAUVE}arcfetch{R}", B=BOLD, MAUVE=MAUVE, R=RESET);
-    println!("  {OVL}{sep}{R}", OVL=OVERLAY0, sep="\u{2500}".repeat(13), R=RESET);
-    println!("  {S}version  {B}{BLUE}0.7.0{R}", S=SUBTEXT1, B=BOLD, BLUE=BLUE, R=RESET);
-    println!("  {S}theme    {MAUVE}Catppuccin Mocha{R}", S=SUBTEXT1, MAUVE=MAUVE, R=RESET);
+    println!("  {S}version  {B}{BLUE}0.7.3{R}", S=SUBTEXT1, B=BOLD, BLUE=BLUE, R=RESET);
     println!();
     // E = mc²: energy of startup ≈ 0
     println!("  {Y}E{R} = {G}m{R}{S}c{R}\u{00b2}   {OVL}where E = startup time \u{2248} 0{R}",
