@@ -1,16 +1,36 @@
 // src/info.rs — arcfetch: zero-copy, ASM CPUID, DRM+mmap GPU, direct-read memory
 //
-// Key techniques:
-//   CPU    : cpuid inline ASM (x86_64) — no /proc/cpuinfo read for brand string
-//   GPU    : /sys/class/drm scan → vendor+device IDs → mmap(pci.ids) substring match
-//   Memory : O_RDONLY + read() into stack buffer → parse MemTotal / MemAvailable
-//   Pkgs   : pacman dir-count | nix mmap manifest | flatpak dir-count | snap dir-count
-//   Output : single BufWriter flush (caller's responsibility)
+// KEY OPTIMISATION: CollectNeeds drives every branch — only the fields
+// actually visible in the current preset/show config are collected.
+// Minimal preset: OS + kernel + uptime + memory → ~0 real I/O, no threads.
+// Full / hacker preset: threads for GPU + packages run in parallel.
 
 use std::{env, fs, ptr};
 use std::ffi::CStr;
-
 use std::thread;
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  What the caller actually needs — drives all conditional collection
+// ──────────────────────────────────────────────────────────────────────────────
+
+pub struct CollectNeeds {
+    pub os:       bool,
+    pub kernel:   bool,
+    pub uptime:   bool,
+    pub res:      bool,
+    pub pkgs:     bool,
+    pub shell:    bool,
+    pub de_wm:    bool,
+    pub term:     bool,
+    pub cpu:      bool,
+    pub gpu:      bool,   // also covers gpu_temp
+    pub battery:  bool,
+    pub memory:   bool,
+    pub disk:     bool,
+    pub load:     bool,
+    pub locale:   bool,
+    pub network:  bool,   // ip + ssh + ports
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  Public SysInfo struct
@@ -44,7 +64,7 @@ pub struct SysInfo {
 //  Low-level helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Read a small /proc or /sys file into a stack buffer via a single read(2).
+/// Single read(2) into a stack buffer — one syscall, no heap.
 macro_rules! read_proc {
     ($path:expr, $buf:expr) => {{
         let path = concat!($path, "\0");
@@ -65,31 +85,27 @@ macro_rules! read_proc {
 }
 
 /// mmap a file read-only.  Returns (ptr, len) or (MAP_FAILED, 0).
-unsafe fn mmap_file(path: &str) -> (*const u8, usize) { unsafe {
+unsafe fn mmap_file(path: &str) -> (*const u8, usize) {
     let cpath = format!("{}\0", path);
     let fd = libc::open(cpath.as_ptr() as *const libc::c_char, libc::O_RDONLY);
     if fd < 0 { return (libc::MAP_FAILED as *const u8, 0); }
-
     let mut st: libc::stat = std::mem::zeroed();
     if libc::fstat(fd, &mut st) < 0 { libc::close(fd); return (libc::MAP_FAILED as *const u8, 0); }
     let len = st.st_size as usize;
     if len == 0 { libc::close(fd); return (libc::MAP_FAILED as *const u8, 0); }
-
     let p = libc::mmap(ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, fd, 0);
     libc::close(fd);
     if p == libc::MAP_FAILED { (libc::MAP_FAILED as *const u8, 0) }
     else { (p as *const u8, len) }
-}}
+}
 
-/// Fast substring search — returns index of first occurrence.
 #[inline]
-fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+fn memmem_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() { return Some(0); }
     if haystack.len() < needle.len() { return None; }
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Count non-overlapping occurrences of needle in haystack.
 #[inline]
 fn memcount(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || haystack.len() < needle.len() { return 0; }
@@ -97,12 +113,8 @@ fn memcount(haystack: &[u8], needle: &[u8]) -> usize {
     let mut i = 0usize;
     let end = haystack.len() - needle.len();
     while i <= end {
-        if haystack[i..i + needle.len()] == *needle {
-            count += 1;
-            i += needle.len();
-        } else {
-            i += 1;
-        }
+        if haystack[i..i + needle.len()] == *needle { count += 1; i += needle.len(); }
+        else { i += 1; }
     }
     count
 }
@@ -118,7 +130,7 @@ fn cpu_brand_string() -> String {
         for (i, leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004].iter().enumerate() {
             let (eax, ebx, ecx, edx): (u32, u32, u32, u32);
             unsafe {
-                // rbx is reserved by LLVM for position-independent code; save/restore it.
+                // rbx is reserved by LLVM; save/restore around cpuid
                 std::arch::asm!(
                     "push rbx",
                     "cpuid",
@@ -142,10 +154,20 @@ fn cpu_brand_string() -> String {
             .unwrap_or_else(|_| {
                 String::from_utf8_lossy(&brand).trim_end_matches('\0').to_string()
             });
-        return s.split_ascii_whitespace()
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        // Strip redundant tokens (matches bfetch's brand cleanup)
+        let skip_tokens: &[&str] = &[
+            "six-core", "eight-core", "quad-core", "twelve-core", "sixteen-core",
+            "24-core", "32-core", "64-core", "-core", "processor", "with radeon graphics",
+        ];
+        let cleaned: Vec<&str> = s.split_ascii_whitespace()
+            .filter(|tok| {
+                let low = tok.to_lowercase();
+                // stop at frequency marker
+                if *tok == "@" { return false; }
+                !skip_tokens.iter().any(|s| low.contains(s))
+            })
+            .collect();
+        return cleaned.join(" ");
     }
 
     #[cfg(not(target_arch = "x86_64"))]
@@ -154,14 +176,13 @@ fn cpu_brand_string() -> String {
         let n = read_proc!("/proc/cpuinfo", buf);
         let raw = std::str::from_utf8(&buf[..n]).unwrap_or("");
         raw.lines()
-            .find(|l| l.starts_with("model name") || l.starts_with("Model name"))
+            .find(|l| l.starts_with("model name") || l.starts_with("Hardware"))
             .and_then(|l| l.split(':').nth(1))
             .map(|s| s.split_ascii_whitespace().collect::<Vec<_>>().join(" "))
             .unwrap_or_else(|| "Unknown".into())
     }
 }
 
-/// Read CPU logical core count from /sys/devices/system/cpu/present.
 fn cpu_core_count() -> usize {
     let mut buf = [0u8; 64];
     let n = read_proc!("/sys/devices/system/cpu/present", buf);
@@ -170,17 +191,32 @@ fn cpu_core_count() -> usize {
     s.split(',').fold(0usize, |acc, part| {
         let part = part.trim();
         if let Some((lo, hi)) = part.split_once('-') {
-            let lo: usize = lo.parse().unwrap_or(0);
-            let hi: usize = hi.parse().unwrap_or(lo);
-            acc + (hi - lo + 1)
-        } else {
-            acc + 1
-        }
+            acc + (hi.parse::<usize>().unwrap_or(0)
+                     .saturating_sub(lo.parse::<usize>().unwrap_or(0)) + 1)
+        } else { acc + 1 }
     })
 }
 
+/// Max CPU frequency from cpufreq sysfs (returns GHz or empty string).
+fn cpu_max_ghz() -> String {
+    let mut buf = [0u8; 32];
+    let n = read_proc!("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", buf);
+    if n == 0 { return String::new(); }
+    let khz: u64 = std::str::from_utf8(&buf[..n]).unwrap_or("").trim()
+        .parse().unwrap_or(0);
+    if khz < 100_000 { return String::new(); }
+    format!(" @ {:.2} GHz", khz as f64 / 1_000_000.0)
+}
+
+fn collect_cpu() -> String {
+    let brand = cpu_brand_string();
+    let cores = cpu_core_count();
+    let freq  = cpu_max_ghz();
+    format!("{} ({}){}", brand, cores, freq)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
-//  GPU — DRM sysfs + mmap(pci.ids)
+//  GPU — DRM sysfs scan + mmap(pci.ids) + mmap(amdgpu.ids)
 // ──────────────────────────────────────────────────────────────────────────────
 
 const PCI_IDS_PATHS: &[&str] = &[
@@ -190,58 +226,85 @@ const PCI_IDS_PATHS: &[&str] = &[
     "/usr/local/share/hwdata/pci.ids",
 ];
 
-/// Look up vendor+device in pci.ids using mmap + substring search.
-/// vid and did are lowercase 4-hex strings (no "0x" prefix).
 fn lookup_pci_name(vid: &str, did: &str) -> Option<String> {
     for &path in PCI_IDS_PATHS {
         let (ptr, len) = unsafe { mmap_file(path) };
         if ptr == libc::MAP_FAILED as *const u8 { continue; }
         let data = unsafe { std::slice::from_raw_parts(ptr, len) };
-
         let vendor_pat = format!("\n{}  ", vid.to_lowercase());
         let device_pat = format!("\n\t{}  ", did.to_lowercase());
-
         let result = (|| -> Option<String> {
-            let vpos = memmem(data, vendor_pat.as_bytes())?;
-            let vendor_section = &data[vpos + vendor_pat.len()..];
-            // vendor section ends at next non-indented line
-            let section_end = vendor_section.windows(2)
+            let vpos = memmem_bytes(data, vendor_pat.as_bytes())?;
+            let vsec = &data[vpos + vendor_pat.len()..];
+            let send = vsec.windows(2)
                 .enumerate()
                 .find(|(_, w)| w[0] == b'\n' && w[1] != b'\t' && w[1] != b'#' && w[1] != b'\n')
                 .map(|(i, _)| i + 1)
-                .unwrap_or(vendor_section.len());
-            let vendor_body = &vendor_section[..section_end];
-
-            let dpos = memmem(vendor_body, device_pat.as_bytes())?;
-            let after = &vendor_body[dpos + device_pat.len()..];
-            let name_end = after.iter().position(|&b| b == b'\n').unwrap_or(after.len());
-            let name = std::str::from_utf8(&after[..name_end]).ok()?.trim();
+                .unwrap_or(vsec.len());
+            let vbody = &vsec[..send];
+            let dpos = memmem_bytes(vbody, device_pat.as_bytes())?;
+            let after = &vbody[dpos + device_pat.len()..];
+            // prefer bracket model name "[RTX 4070]" style
+            let name = if let Some(lb) = after.iter().position(|&b| b == b'[') {
+                let rb = after[lb..].iter().position(|&b| b == b']').map(|r| lb + r);
+                if let Some(rb) = rb {
+                    std::str::from_utf8(&after[lb+1..rb]).ok()?.trim()
+                } else {
+                    let end = after.iter().position(|&b| b == b'\n').unwrap_or(after.len());
+                    std::str::from_utf8(&after[..end]).ok()?.trim()
+                }
+            } else {
+                let end = after.iter().position(|&b| b == b'\n').unwrap_or(after.len());
+                std::str::from_utf8(&after[..end]).ok()?.trim()
+            };
             if name.is_empty() { return None; }
             Some(name.to_string())
         })();
-
         unsafe { libc::munmap(ptr as *mut libc::c_void, len); }
         if result.is_some() { return result; }
     }
     None
 }
 
-fn detect_gpu() -> String {
+/// For AMD GPUs: try amdgpu.ids with device+revision for marketing name.
+fn lookup_amd_marketing(did_raw: u32, rev_raw: u32) -> Option<String> {
+    let (ptr, len) = unsafe { mmap_file("/usr/share/libdrm/amdgpu.ids") };
+    if ptr == libc::MAP_FAILED as *const u8 { return None; }
+    let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+    // Try "DDDD,\tRR," and "DDDD, RR," variants
+    for sep in &[format!("{:04X},\t{:02X},", did_raw, rev_raw),
+                 format!("{:04X}, {:02X},", did_raw, rev_raw)] {
+        if let Some(pos) = memmem_bytes(data, sep.as_bytes()) {
+            let after = &data[pos + sep.len()..];
+            let skip = after.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(0);
+            let after = &after[skip..];
+            let end = after.iter().position(|&b| b == b'\n').unwrap_or(after.len());
+            let name = std::str::from_utf8(&after[..end]).ok()?.trim();
+            if !name.is_empty() {
+                unsafe { libc::munmap(ptr as *mut libc::c_void, len); }
+                return Some(name.to_string());
+            }
+        }
+    }
+    unsafe { libc::munmap(ptr as *mut libc::c_void, len); }
+    None
+}
+
+fn detect_gpu() -> (String, String) {
     // 1. NVIDIA proprietary
     if let Ok(dir) = fs::read_dir("/proc/driver/nvidia/gpus") {
         for e in dir.flatten() {
             if let Ok(info) = fs::read_to_string(e.path().join("information")) {
                 if let Some(l) = info.lines().find(|l| l.starts_with("Model:")) {
-                    return l[6..].trim().to_string();
+                    return (l[6..].trim().to_string(), String::new());
                 }
             }
         }
     }
 
-    // 2. DRM sysfs: vendor+device IDs → mmap pci.ids
-    for i in 0..4u8 {
+    // 2. DRM sysfs: vendor+device IDs → pci.ids / amdgpu.ids
+    for i in 0..8u8 {
         let base = format!("/sys/class/drm/card{}/device", i);
-
         // Only display controllers (class 0x03xxxx)
         let class = fs::read_to_string(format!("{}/class", base)).unwrap_or_default();
         let class = class.trim();
@@ -253,35 +316,64 @@ fn detect_gpu() -> String {
         let device = device_raw.trim();
         if vendor.is_empty() || device.is_empty() { continue; }
 
-        let vid = vendor.strip_prefix("0x").unwrap_or(vendor).to_lowercase();
-        let did = device.strip_prefix("0x").unwrap_or(device).to_lowercase();
+        let vendor_id = u32::from_str_radix(vendor.trim_start_matches("0x"), 16).unwrap_or(0);
+        let device_id = u32::from_str_radix(device.trim_start_matches("0x"), 16).unwrap_or(0);
+        let vid = format!("{:04x}", vendor_id);
+        let did = format!("{:04x}", device_id);
 
-        if let Some(name) = lookup_pci_name(&vid, &did) {
-            return name;
+        // AMD: try amdgpu.ids first for marketing name
+        if vendor_id == 0x1002 {
+            let rev_raw = fs::read_to_string(format!("{}/revision", base)).unwrap_or_default();
+            let rev = u32::from_str_radix(rev_raw.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+            if let Some(name) = lookup_amd_marketing(device_id, rev) {
+                let temp = collect_gpu_temp(i);
+                return (name, temp);
+            }
         }
 
-        let vendor_name = match vendor {
-            "0x1002" => "AMD",
-            "0x10de" => "NVIDIA",
-            "0x8086" => "Intel",
-            "0x1414" => "Microsoft",
-            _        => "GPU",
+        if let Some(name) = lookup_pci_name(&vid, &did) {
+            let temp = collect_gpu_temp(i);
+            return (name, temp);
+        }
+
+        // Fallback: vendor-prefixed device ID
+        let vname = match vendor_id {
+            0x1002 => "AMD",
+            0x10de => "NVIDIA",
+            0x8086 => "Intel",
+            0x1414 => "Microsoft",
+            _      => "GPU",
         };
-        return format!("{} [{}]", vendor_name, did.to_uppercase());
+        let temp = collect_gpu_temp(i);
+        return (format!("{} [{:04X}]", vname, device_id), temp);
     }
 
-    // 3. product_name / label sysfs fallback
+    // 3. Fallback: driver name from uevent
     for i in 0..4u8 {
-        let base = format!("/sys/class/drm/card{}/device", i);
-        for attr in &["product_name", "label"] {
-            if let Ok(v) = fs::read_to_string(format!("{}/{}", base, attr)) {
-                let v = v.trim().to_string();
-                if !v.is_empty() { return v; }
+        let path = format!("/sys/class/drm/card{}/device/uevent", i);
+        if let Ok(uevent) = fs::read_to_string(&path) {
+            if let Some(p) = uevent.lines().find(|l| l.starts_with("DRIVER=")) {
+                let driver = p.trim_start_matches("DRIVER=");
+                if !driver.is_empty() { return (driver.to_string(), String::new()); }
             }
         }
     }
 
-    "Unknown".into()
+    ("Unknown".into(), String::new())
+}
+
+fn collect_gpu_temp(card: u8) -> String {
+    let base = format!("/sys/class/drm/card{}/device/hwmon", card);
+    if let Ok(hwmons) = fs::read_dir(&base) {
+        for hw in hwmons.flatten() {
+            if let Ok(raw) = fs::read_to_string(hw.path().join("temp1_input")) {
+                if let Ok(mc) = raw.trim().parse::<u32>() {
+                    return format!("{}°C", mc / 1000);
+                }
+            }
+        }
+    }
+    "N/A".into()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -307,7 +399,7 @@ fn read_memory() -> (u64, u64) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-//  Package counting
+//  Package counting — only runs if needs.pkgs
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn count_nix() -> Option<usize> {
@@ -337,51 +429,62 @@ fn count_pacman() -> Option<usize> {
 
 fn count_flatpak() -> Option<usize> {
     let home = env::var("HOME").unwrap_or_default();
-    let dirs = [
-        "/var/lib/flatpak/app".to_string(),
-        format!("{}/.local/share/flatpak/app", home),
-    ];
-    let mut total = 0usize;
-    let mut found = false;
-    for dir in &dirs {
+    let mut total = 0usize; let mut found = false;
+    for dir in &["/var/lib/flatpak/app".to_string(),
+                 format!("{}/.local/share/flatpak/app", home)] {
         if let Ok(d) = fs::read_dir(dir) { total += d.count(); found = true; }
     }
     if found && total > 0 { Some(total) } else { None }
 }
 
 fn count_snap() -> Option<usize> {
-    let d = fs::read_dir("/snap").ok()?;
-    let n = d.flatten()
-        .filter(|e| {
-            let name = e.file_name();
-            let s = name.to_string_lossy();
-            s != "bin" && !s.starts_with('.')
-        })
-        .count();
+    // /var/lib/snapd/snaps counts .snap files (matches bfetch)
+    let d = fs::read_dir("/var/lib/snapd/snaps").ok()?;
+    let n = d.flatten().filter(|e| {
+        e.file_name().to_string_lossy().ends_with(".snap")
+    }).count();
+    if n > 0 { Some(n) } else { None }
+}
+
+fn count_dpkg() -> Option<usize> {
+    let d = fs::read_dir("/var/lib/dpkg/info").ok()?;
+    let n = d.flatten().filter(|e| {
+        e.file_name().to_string_lossy().ends_with(".list")
+    }).count();
     if n > 0 { Some(n) } else { None }
 }
 
 fn collect_packages() -> String {
-    let mut parts: Vec<String> = Vec::with_capacity(4);
-    if let Some(n) = count_pacman()  { parts.push(format!("{} (pacman)", n)); }
-    if let Some(n) = count_nix()     { parts.push(format!("{} (nix)",    n)); }
-    if let Some(n) = count_flatpak() { parts.push(format!("{} (flatpak)",n)); }
-    if let Some(n) = count_snap()    { parts.push(format!("{} (snap)",   n)); }
+    let mut parts: Vec<String> = Vec::with_capacity(5);
+    if let Some(n) = count_pacman() { parts.push(format!("{} (pacman)", n)); }
+    if let Some(n) = count_dpkg()   { parts.push(format!("{} (dpkg)",   n)); }
+    if let Some(n) = count_nix()    { parts.push(format!("{} (nix)",    n)); }
+    if let Some(n) = count_flatpak(){ parts.push(format!("{} (flatpak)",n)); }
+    if let Some(n) = count_snap()   { parts.push(format!("{} (snap)",   n)); }
     if parts.is_empty() { "unknown".into() } else { parts.join(", ") }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-//  Other collectors
+//  Other collectors — only called when needed
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[inline]
-fn slurp(p: &str) -> String { fs::read_to_string(p).unwrap_or_default() }
 
 fn read_uptime() -> (u64, String) {
-    let mut buf = [0u8; 32];
-    let n = read_proc!("/proc/uptime", buf);
-    let s = std::str::from_utf8(&buf[..n]).unwrap_or("0");
-    let secs: u64 = s.split('.').next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // clock_gettime(CLOCK_BOOTTIME) is a vDSO call — no file I/O, no syscall overhead.
+    // CLOCK_BOOTTIME = 7 (includes time suspended, matches /proc/uptime semantics).
+    let secs: u64 = {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } == 0 {
+            ts.tv_sec as u64
+        } else {
+            // Fallback: /proc/uptime
+            let mut buf = [0u8; 32];
+            let n = read_proc!("/proc/uptime", buf);
+            std::str::from_utf8(&buf[..n]).unwrap_or("0")
+                .split('.').next().and_then(|v| v.parse().ok()).unwrap_or(0)
+        }
+    };
     let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
     let short = match (d, h, m) {
         (0, 0, m) => format!("{}m", m),
@@ -391,43 +494,67 @@ fn read_uptime() -> (u64, String) {
     (secs, short)
 }
 
-fn read_os_kernel() -> (String, String) {
-    let os_raw = slurp("/etc/os-release");
-    let os = os_raw.lines()
-        .find(|l| l.starts_with("PRETTY_NAME="))
-        .map(|l| l[12..].trim_matches('"').to_string())
-        .unwrap_or_else(|| "Linux".into());
-    let mut buf = [0u8; 256];
-    let n = read_proc!("/proc/version", buf);
-    let kver = std::str::from_utf8(&buf[..n]).unwrap_or("")
-        .split_whitespace().nth(2).unwrap_or("unknown").to_string();
-    (os, kver)
+fn read_os_kernel(need_os: bool, need_kernel: bool) -> (String, String) {
+    // Kernel: uname() is a vDSO call on Linux — no syscall overhead, ~50ns.
+    // Replaces 3 syscalls (open+read+close of /proc/version).
+    let kernel = if need_kernel {
+        let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut u) } == 0 {
+            let ptr = u.release.as_ptr() as *const libc::c_char;
+            unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        } else { "unknown".into() }
+    } else { String::new() };
+
+    // OS name: fast-path for common distros via a single access(2) / stat(2)
+    // before falling back to the NTFS-bridged /etc/os-release on WSL2.
+    let os = if need_os {
+        // Arch Linux — /etc/arch-release exists, no read needed
+        if unsafe { libc::access(b"/etc/arch-release\0".as_ptr() as *const libc::c_char,
+                                 libc::F_OK) } == 0 {
+            "Arch Linux".into()
+        // Debian/Ubuntu — check /etc/debian_version
+        } else if unsafe { libc::access(b"/etc/debian_version\0".as_ptr() as *const libc::c_char,
+                                        libc::F_OK) } == 0 {
+            let mut buf = [0u8; 256];
+            let n = read_proc!("/etc/debian_version", buf);
+            let ver = std::str::from_utf8(&buf[..n]).unwrap_or("").trim();
+            // Check /etc/os-release for PRETTY_NAME to distinguish Ubuntu vs Debian
+            let mut osbuf = [0u8; 2048];
+            let on = read_proc!("/etc/os-release", osbuf);
+            let ostext = std::str::from_utf8(&osbuf[..on]).unwrap_or("");
+            ostext.lines()
+                .find(|l| l.starts_with("PRETTY_NAME="))
+                .map(|l| l[12..].trim_matches('"').to_string())
+                .unwrap_or_else(|| format!("Debian {}", ver))
+        // Fedora
+        } else if unsafe { libc::access(b"/etc/fedora-release\0".as_ptr() as *const libc::c_char,
+                                        libc::F_OK) } == 0 {
+            let mut buf = [0u8; 256];
+            let n = read_proc!("/etc/fedora-release", buf);
+            std::str::from_utf8(&buf[..n]).unwrap_or("Fedora").trim()
+                .lines().next().unwrap_or("Fedora").to_string()
+        // Generic fallback: read /etc/os-release
+        } else {
+            let mut buf = [0u8; 2048];
+            let n = read_proc!("/etc/os-release", buf);
+            let text = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            text.lines()
+                .find(|l| l.starts_with("PRETTY_NAME="))
+                .map(|l| l[12..].trim_matches('"').to_string())
+                .unwrap_or_else(|| "Linux".into())
+        }
+    } else { String::new() };
+
+    (os, kernel)
 }
 
 fn read_resolution() -> String {
     if let Ok(dir) = fs::read_dir("/sys/class/drm") {
         for e in dir.flatten() {
-            let n = e.file_name();
-            let ns = n.to_string_lossy();
+            let n = e.file_name(); let ns = n.to_string_lossy();
             if ns.starts_with("card") && ns.contains('-') {
                 if let Ok(m) = fs::read_to_string(e.path().join("modes")) {
                     if let Some(line) = m.lines().next() { return line.to_string(); }
-                }
-            }
-        }
-    }
-    "N/A".into()
-}
-
-fn read_gpu_temp() -> String {
-    for i in 0..4u8 {
-        let base = format!("/sys/class/drm/card{}/device/hwmon", i);
-        if let Ok(hwmons) = fs::read_dir(&base) {
-            for hw in hwmons.flatten() {
-                if let Ok(raw) = fs::read_to_string(hw.path().join("temp1_input")) {
-                    if let Ok(mc) = raw.trim().parse::<u32>() {
-                        return format!("{}°C", mc / 1000);
-                    }
                 }
             }
         }
@@ -455,10 +582,10 @@ fn read_battery() -> String {
 fn read_disk() -> String {
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(b"/\0".as_ptr().cast::<libc::c_char>(), &mut st) } == 0 {
-        let blk   = st.f_frsize as u64;
+        let blk = st.f_frsize as u64;
         let total = st.f_blocks as u64 * blk;
         let avail = st.f_bavail as u64 * blk;
-        let gb    = 1_073_741_824.0f64;
+        let gb = 1_073_741_824.0f64;
         format!("{:.1}G / {:.1}G", total.saturating_sub(avail) as f64 / gb, total as f64 / gb)
     } else { "unknown".into() }
 }
@@ -468,6 +595,16 @@ fn read_load() -> String {
     let n = read_proc!("/proc/loadavg", buf);
     std::str::from_utf8(&buf[..n]).unwrap_or("")
         .split_ascii_whitespace().take(3).collect::<Vec<_>>().join("  ")
+}
+
+fn read_de_wm() -> String {
+         if let Ok(v) = env::var("XDG_CURRENT_DESKTOP")     { v }
+    else if let Ok(v) = env::var("DESKTOP_SESSION")         { v }
+    else if env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() { "Hyprland".into() }
+    else if env::var("SWAYSOCK").is_ok()                    { "Sway".into()     }
+    else if env::var("WAYLAND_DISPLAY").is_ok()             { "Wayland".into()  }
+    else if env::var("DISPLAY").is_ok()                     { "X11".into()      }
+    else                                                     { "TTY".into()      }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -484,12 +621,10 @@ fn collect_network() -> (String, String, String) {
                 if t.ends_with("LOCAL") { local = true; continue; }
                 if local && t.starts_with("32 host") { local = false; continue; }
                 if local {
-                    if let Some(ip_part) = t.strip_prefix("|-- ").or_else(|| t.strip_prefix("+-- ")) {
-                        let ip_str = ip_part.trim();
-                        if ip_str != "127.0.0.1" && !ip_str.starts_with("127.")
-                            && ip_str != "0.0.0.0" && ip_str.contains('.') {
-                            found = ip_str.to_string();
-                            break;
+                    if let Some(p) = t.strip_prefix("|-- ").or_else(|| t.strip_prefix("+-- ")) {
+                        let s = p.trim();
+                        if s != "127.0.0.1" && !s.starts_with("127.") && s != "0.0.0.0" && s.contains('.') {
+                            found = s.to_string(); break;
                         }
                     }
                 }
@@ -517,8 +652,8 @@ fn collect_network() -> (String, String, String) {
                     if cols.get(3).map(|s| *s == "0A").unwrap_or(false) {
                         if let Some(local) = cols.get(1) {
                             if let Some(hex) = local.split(':').nth(1) {
-                                if let Ok(port) = u16::from_str_radix(hex, 16) {
-                                    if !open.contains(&port) { open.push(port); }
+                                if let Ok(p) = u16::from_str_radix(hex, 16) {
+                                    if !open.contains(&p) { open.push(p); }
                                 }
                             }
                         }
@@ -526,8 +661,7 @@ fn collect_network() -> (String, String, String) {
                 }
             }
         }
-        open.sort_unstable();
-        open.truncate(8);
+        open.sort_unstable(); open.truncate(8);
         if open.is_empty() { "none".into() }
         else { open.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ") }
     };
@@ -536,52 +670,55 @@ fn collect_network() -> (String, String, String) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-//  Main entry point
+//  Main entry point — needs-driven collection
 // ──────────────────────────────────────────────────────────────────────────────
 
-pub fn collect_all(need_network: bool) -> SysInfo {
-    // Slow real-FS collectors run in parallel threads
-    let t_pkgs = thread::spawn(collect_packages);
-    let t_gpu  = thread::spawn(detect_gpu);
+pub fn collect_all(needs: &CollectNeeds) -> SysInfo {
+    // ── Spawn threads ONLY for genuinely slow real-FS collectors ──────────
+    // Packages: may scan hundreds of /var/lib/pacman/local entries
+    let t_pkgs = if needs.pkgs {
+        Some(thread::spawn(collect_packages))
+    } else { None };
 
-    // Fast virtual-FS + syscall reads on main thread
-    let (os, kernel)            = read_os_kernel();
-    let (uptime_secs, uptime)   = read_uptime();
-    let (mem_used, mem_total)   = read_memory();
+    // GPU: DRM scan + pci.ids mmap (fast, but keep parallel for pipelining)
+    let t_gpu = if needs.gpu {
+        Some(thread::spawn(detect_gpu))
+    } else { None };
 
-    let cpu = {
-        let brand = cpu_brand_string();
-        let cores = cpu_core_count();
-        format!("{} ({}x)", brand, cores)
-    };
+    // ── Fast single-syscall reads on the main thread ───────────────────────
+    let (os, kernel)          = read_os_kernel(needs.os, needs.kernel);
+    let (uptime_secs, uptime) = if needs.uptime { read_uptime() } else { (0, String::new()) };
+    let (mem_used, mem_total) = if needs.memory { read_memory() } else { (0, 0) };
 
-    let disk     = read_disk();
-    let load     = read_load();
-    let res      = read_resolution();
-    let gpu_temp = read_gpu_temp();
-    let battery  = read_battery();
+    let cpu     = if needs.cpu     { collect_cpu()       } else { String::new() };
+    let disk    = if needs.disk    { read_disk()         } else { String::new() };
+    let load    = if needs.load    { read_load()         } else { String::new() };
+    let res     = if needs.res     { read_resolution()   } else { String::new() };
+    let battery = if needs.battery { read_battery()      } else { String::new() };
 
-    let shell  = env::var("SHELL").unwrap_or_default()
-        .rsplit('/').next().unwrap_or("sh").to_string();
-    let term   = env::var("TERM_PROGRAM")
-        .or_else(|_| env::var("TERM"))
-        .unwrap_or_else(|_| "unknown".into());
-    let locale = env::var("LANG").unwrap_or_else(|_| "C".into());
-    let de_wm  = {
-             if let Ok(v) = env::var("XDG_CURRENT_DESKTOP")     { v }
-        else if let Ok(v) = env::var("DESKTOP_SESSION")         { v }
-        else if env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() { "Hyprland".into() }
-        else if env::var("SWAYSOCK").is_ok()                    { "Sway".into()     }
-        else if env::var("WAYLAND_DISPLAY").is_ok()             { "Wayland".into()  }
-        else if env::var("DISPLAY").is_ok()                     { "X11".into()      }
-        else                                                     { "TTY".into()      }
-    };
+    // Zero-I/O: environment variables
+    let shell  = if needs.shell  {
+        env::var("SHELL").unwrap_or_default()
+            .rsplit('/').next().unwrap_or("sh").to_string()
+    } else { String::new() };
+    let term   = if needs.term   {
+        env::var("TERM_PROGRAM").or_else(|_| env::var("TERM")).unwrap_or_else(|_| "unknown".into())
+    } else { String::new() };
+    let locale = if needs.locale {
+        env::var("LANG").unwrap_or_else(|_| "C".into())
+    } else { String::new() };
+    let de_wm  = if needs.de_wm  { read_de_wm() } else { String::new() };
 
-    let (ip, ssh, ports) = if need_network { collect_network() }
+    let (ip, ssh, ports) = if needs.network { collect_network() }
                            else { (String::new(), String::new(), String::new()) };
 
-    let pkgs = t_pkgs.join().unwrap_or_else(|_| "unknown".into());
-    let gpu  = t_gpu.join().unwrap_or_else(|_| "Unknown".into());
+    // ── Join threads ────────────────────────────────────────────────────────
+    let pkgs = t_pkgs.map(|t| t.join().unwrap_or_else(|_| "unknown".into()))
+                     .unwrap_or_default();
+
+    let (gpu, gpu_temp) = t_gpu
+        .map(|t| t.join().unwrap_or_else(|_| ("Unknown".into(), String::new())))
+        .unwrap_or_default();
 
     SysInfo {
         os, kernel, uptime_secs, uptime, res, pkgs, shell, de_wm, term,

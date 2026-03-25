@@ -184,30 +184,39 @@ pub const LOGO_PI: [&str; 19] = [
     "                           ",
 ];
 
-pub const LOGO_MINIARCH: [&str; 12] = [
-    "       /\\       ",
-    "      /  \\      ",
-    "     /    \\     ",
-    "    /      \\    ",
-    "   /   ,,   \\   ",
-    "  /   |  |   \\  ",
-    " /   /    \\   \\ ",
-    "/    \\    /    \\",
-    "\\____/    \\____/",
-    "                ",
-    "       ARCH    ",
-    "                ",
+// ── Arch Minimal — compact triangle, auto-selected for --preset minimal ──
+pub const LOGO_ARCHMIN: [&str; 19] = [
+    "",
+    "",
+    "      /\\",
+    "     /  \\",
+    "    / /\\ \\",
+    "   / /  \\ \\",
+    "  /_/ /\\ \\_\\",
+    " /_/_/  \\_\\_\\",
+    "",
+    "   \u{00b7} arch \u{00b7}",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
 ];
+
 pub fn from_name(name: &str) -> &'static [&'static str] {
     match name {
-        "ascii" => &LOGO_ASCII,
-        "tux"   => &LOGO_TUX,
-        "dna"   => &LOGO_DNA,
-        "atom"  => &LOGO_ATOM,
-        "wave"  => &LOGO_WAVE,
-        "emc2"  => &LOGO_EMC2,
-        "pi"    => &LOGO_PI,
-        "mini"  => &LOGO_MINIARCH,
-        _       => &LOGO_ARCH,
+        "ascii"    => &LOGO_ASCII,
+        "tux"      => &LOGO_TUX,
+        "dna"      => &LOGO_DNA,
+        "atom"     => &LOGO_ATOM,
+        "wave"     => &LOGO_WAVE,
+        "emc2"     => &LOGO_EMC2,
+        "pi"       => &LOGO_PI,
+        "archmin"  => &LOGO_ARCHMIN,
+        _          => &LOGO_ARCH,
     }
 }

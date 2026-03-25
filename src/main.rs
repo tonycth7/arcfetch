@@ -113,7 +113,8 @@ fn build_info(si: &info::SysInfo, cfg: &Config) -> (Vec<String>, bool) {
         Header::None => {}
     }
 
-    macro_rules! field {
+    
+macro_rules! field {
     ($li:expr, $lines:expr, $c:expr, $show:expr, $key:expr, $val:expr) => {
         if $show {
             $lines.push(row($c.label($li), $key, $val, &$c.values));
@@ -124,6 +125,7 @@ fn build_info(si: &info::SysInfo, cfg: &Config) -> (Vec<String>, bool) {
         }
     };
 }
+
 
     #[allow(unused_assignments)]
     let mut li = 0usize;
@@ -523,6 +525,7 @@ fn print_help(cfg_path: &str) {
     println!();
     println!("  {b}{TEAL}logos{r}", b=b, TEAL=TEAL, r=r);
     println!("    {b}{g}arch{r}    block {s}▟███▙{r} (default)", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}archmin{r}  compact arch {s}(auto w/ --preset minimal){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}ascii{r}  dotty Arch ASCII", b=b, g=g, r=r);
     println!("    {b}{g}tux{r}    Linux penguin", b=b, g=g, r=r);
     println!("    {b}{g}dna{r}    DNA double helix", b=b, g=g, r=r);
@@ -570,10 +573,31 @@ fn main() {
 
     let cfg = config::load(args.accent.as_deref(), args.preset.as_deref());
 
-    // collect all sysinfo — only read network for hacker preset
-    let need_net = cfg.preset.as_deref() == Some("hacker")
-        || cfg.show.ip || cfg.show.ssh || cfg.show.ports;
-    let si = info::collect_all(need_net);
+    // Derive CollectNeeds from show flags: only fetch what's actually visible.
+    // Minimal preset = os+kernel+uptime+memory → ~0 real I/O, no threads.
+    let si = {
+        let sh = &cfg.show;
+        let needs = info::CollectNeeds {
+            os:      sh.os,
+            kernel:  sh.kernel,
+            uptime:  sh.uptime,
+            res:     sh.res,
+            pkgs:    sh.pkgs,
+            shell:   sh.shell,
+            de_wm:   sh.de_wm,
+            term:    sh.term,
+            cpu:     sh.cpu,
+            gpu:     sh.gpu || sh.gpu_temp,
+            battery: sh.battery,
+            memory:  sh.memory,
+            disk:    sh.disk,
+            load:    sh.load,
+            locale:  sh.locale,
+            network: sh.ip || sh.ssh || sh.ports
+                     || cfg.preset.as_deref() == Some("hacker"),
+        };
+        info::collect_all(&needs)
+    };
 
     // build info column
     let (mut info_lines, is_science) = build_info(&si, &cfg);
@@ -633,49 +657,85 @@ fn main() {
 
     let logo_name = if custom_lines.is_none() && is_science && args.logo == "arch" {
         science_logo().to_string()
+    } else if custom_lines.is_none()
+        && args.logo == "arch"
+        && cfg.preset.as_deref() == Some("minimal")
+    {
+        // Minimal preset auto-selects the compact arch logo
+        "archmin".to_string()
     } else {
         args.logo.clone()
     };
 
-    // build owned Vec<String> for custom, borrow &[&str] for builtins
+    // Pre-sized buffer: 8 KB covers the full output in one allocation.
+    // The BufWriter accumulates all writes; a single write(2) happens on flush.
     let out     = stdout();
-    let mut buf = BufWriter::new(out.lock());
+    let mut buf = BufWriter::with_capacity(8192, out.lock());
     writeln!(buf).ok();
 
-    if let Some(ref lines) = custom_lines {
-        // custom file logo — lines are owned Strings
-        let logo_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-        let max_rows = lines.len().max(out_lines.len());
-        for i in 0..max_rows {
-            let ll  = lines.get(i).map(String::as_str).unwrap_or("");
-            let pad = logo_w.saturating_sub(ll.chars().count());
-            let inf = out_lines.get(i).map(String::as_str).unwrap_or("");
-            if args.no_color {
-                writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
+    // Shared render helper: emit one row of [logo  info].
+    // Key fix: only wrap the logo glyph in accent color — never the padding
+    // spaces. Wrapping spaces in a color escape makes blank lines appear as
+    // a solid colored rectangle in terminals that fill background per-cell.
+    let render_row = |buf: &mut BufWriter<_>,
+                      ll: &str,
+                      logo_w: usize,
+                      inf: &str| {
+        // Trim trailing spaces so the visual width is the printable content.
+        let ll = ll.trim_end();
+        // Pad with plain spaces (no color) to keep the info column aligned.
+        let vis_w  = ll.chars().count();
+        let pad_n  = logo_w.saturating_sub(vis_w);
+        let spaces = " ".repeat(pad_n);
+
+        if args.no_color || ll.is_empty() {
+            // No color, or nothing to color — emit plain spaces + info.
+            if inf.is_empty() {
+                writeln!(buf, "  {}{}", ll, spaces).ok();
             } else {
-                writeln!(buf, "  {acc}{ll}{pad}{R}  {inf}",
-                    acc = &cfg.colors.accent, ll = ll,
-                    pad = " ".repeat(pad), R = RESET, inf = inf).ok();
+                writeln!(buf, "  {}{}  {}", ll, spaces, inf).ok();
+            }
+        } else {
+            // Apply accent only around the actual glyph characters.
+            if inf.is_empty() {
+                writeln!(buf, "  {acc}{ll}{R}{spaces}",
+                    acc=&cfg.colors.accent, ll=ll, R=RESET, spaces=spaces).ok();
+            } else {
+                writeln!(buf, "  {acc}{ll}{R}{spaces}  {inf}",
+                    acc=&cfg.colors.accent, ll=ll, R=RESET, spaces=spaces, inf=inf).ok();
             }
         }
-    } else {
-        // built-in logo
-        let logo   = logos::from_name(&logo_name);
-        let logo_w = logo.iter().map(|l| l.chars().count()).max().unwrap_or(36);
-        let max_rows = logo.len().max(out_lines.len());
+    };
+
+    if let Some(ref lines) = custom_lines {
+        let logo_w = lines.iter().map(|l| l.trim_end().chars().count()).max().unwrap_or(0);
+        // last row that has logo content OR an info line — never print trailing blanks
+        let last_logo = lines.iter().rposition(|l| !l.trim().is_empty())
+            .map(|i| i + 1).unwrap_or(0);
+        let max_rows = last_logo.max(out_lines.len());
         for i in 0..max_rows {
-            let ll  = logo.get(i).copied().unwrap_or("");
-            let pad = logo_w.saturating_sub(ll.chars().count());
-            let inf = out_lines.get(i).map(String::as_str).unwrap_or("");
-            if args.no_color {
-                writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
-            } else {
-                writeln!(buf, "  {acc}{ll}{pad}{R}  {inf}",
-                    acc = &cfg.colors.accent, ll = ll,
-                    pad = " ".repeat(pad), R = RESET, inf = inf).ok();
-            }
+            render_row(&mut buf,
+                lines.get(i).map(String::as_str).unwrap_or(""),
+                logo_w,
+                out_lines.get(i).map(String::as_str).unwrap_or(""));
+        }
+    } else {
+        let logo    = logos::from_name(&logo_name);
+        let logo_w  = logo.iter().map(|l| l.trim_end().chars().count()).max().unwrap_or(14);
+        // last row that has logo content OR an info line — never print trailing blanks
+        let last_logo = logo.iter().rposition(|l| !l.trim().is_empty())
+            .map(|i| i + 1).unwrap_or(0);
+        let max_rows = last_logo.max(out_lines.len());
+        for i in 0..max_rows {
+            render_row(&mut buf,
+                logo.get(i).copied().unwrap_or(""),
+                logo_w,
+                out_lines.get(i).map(String::as_str).unwrap_or(""));
         }
     }
 
     writeln!(buf).ok();
+    // Single write() syscall — BufWriter flushes here automatically on drop,
+    // but explicit flush guarantees it happens before the process exits.
+    buf.flush().ok();
 }
