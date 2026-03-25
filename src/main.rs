@@ -114,13 +114,16 @@ fn build_info(si: &info::SysInfo, cfg: &Config) -> (Vec<String>, bool) {
     }
 
     macro_rules! field {
-        ($li:expr, $lines:expr, $c:expr, $show:expr, $key:expr, $val:expr) => {
-            if $show {
-                $lines.push(row($c.label($li), $key, $val, &$c.values));
+    ($li:expr, $lines:expr, $c:expr, $show:expr, $key:expr, $val:expr) => {
+        if $show {
+            $lines.push(row($c.label($li), $key, $val, &$c.values));
+            #[allow(unused_assignments)]
+            {
                 $li += 1;
             }
-        };
-    }
+        }
+    };
+}
 
     #[allow(unused_assignments)]
     let mut li = 0usize;

@@ -184,6 +184,20 @@ pub const LOGO_PI: [&str; 19] = [
     "                           ",
 ];
 
+pub const LOGO_MINIARCH: [&str; 12] = [
+    "       /\\       ",
+    "      /  \\      ",
+    "     /    \\     ",
+    "    /      \\    ",
+    "   /   ,,   \\   ",
+    "  /   |  |   \\  ",
+    " /   /    \\   \\ ",
+    "/    \\    /    \\",
+    "\\____/    \\____/",
+    "                ",
+    "       ARCH    ",
+    "                ",
+];
 pub fn from_name(name: &str) -> &'static [&'static str] {
     match name {
         "ascii" => &LOGO_ASCII,
@@ -193,6 +207,7 @@ pub fn from_name(name: &str) -> &'static [&'static str] {
         "wave"  => &LOGO_WAVE,
         "emc2"  => &LOGO_EMC2,
         "pi"    => &LOGO_PI,
+        "mini"  => &LOGO_MINIARCH,
         _       => &LOGO_ARCH,
     }
 }
