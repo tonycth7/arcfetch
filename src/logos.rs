@@ -127,6 +127,7 @@ pub const LOGO_MINI: [&str; 7] = [
 ];
 
 // ── Arch Minimal — compact triangle, auto-selected for --preset minimal ──
+#[allow(dead_code)]
 pub const LOGO_ARCHMIN: [&str; 19] = [
     "",
     "",

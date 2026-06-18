@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::{env, fs, ptr};
 use std::ffi::CStr;
 

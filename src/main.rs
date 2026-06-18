@@ -293,6 +293,7 @@ extern "C" fn sigint_handler(_: libc::c_int) {
 }
 
 // ── deterministic starfield seeded from cell position ──────
+#[allow(dead_code)]
 fn bh_star(c: usize, r: usize, frame: u64) -> Option<(&'static str, char)> {
     let h = (c.wrapping_mul(97) ^ r.wrapping_mul(191) ^ 0xdead_beefu64 as usize)
         .wrapping_mul(0x9e37_79b9);
@@ -405,7 +406,7 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
         write!(buf, "\x1b[H").ok();
 
         // ── header with pulsing dot ─────────────────────────
-        let pulse = ((frame as f64 * 0.12).sin() * 0.3 + 0.7);
+        let pulse = (frame as f64 * 0.12).sin() * 0.3 + 0.7;
         write!(buf, "\x1b[K").ok();
         writeln!(buf).ok();
         write!(buf, "\x1b[K").ok();
