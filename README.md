@@ -4,8 +4,6 @@
 
 arch linux sysinfo that's so fast it's almost rude — ~1.2ms in release, one `libc::write` and done. catppuccin mocha. 6 logos. zero overthinking. only dep is `libc`.
 
----
-
 ## what it looks like
 
 ```
@@ -47,37 +45,61 @@ or with the mini logo (auto-selected by `--preset minimal`):
                  memory   ██████░░░░░░░░  6.9G / 15.0G
 ```
 
----
-
 ## blackhole — the main feature
-
-this isn't just 'neofetch but rust.' this is a **simulated M87 accretion disk** rendered in real time with actual physics math — gravitational lensing, doppler beaming (the approaching side of the disk is brighter), photon ring glow, and a rotating shadow. it runs for ~3 seconds by default, then exits cleanly back to your prompt.
+ **simulated M87 accretion disk** 
 
 ```
-arcfetch --blackhole          # 3s animation — M87* accretion disk
+  ●  arcfetch  ···  SINGULARITY MODE  [∞  (Ctrl+C)]
+  ──────────────────────────────────────────────────────────────
+     ··········           ░             ······    tony@arch
+    ······       ·        ░              ······   ─────────
+   ···     ·              ░               ·····   os        Arch Linux
+  ··                      ░             · ······  kernel    7.0.11-arch1-1
+     ·                    ░                ·····  uptime    3h 17m
+        ······ ·      ······░        ······ ····  pkgs      1227 (pacman)
+      ············ ········░░░░░ ···············  shell     zsh
+      ················░░░░░░░░░░░···············  de/wm     niri
+     ········░░░░·····░     ···░░░░░░░·········   term      alacritty
+     ····░░░░░░░░·····       ·····░░░░░░░░····    cpu       AMD Ryzen 5 5625U (12x) @ 2.30 GHz
+    ····░░░░·░░▒▒······     ░░░░░░▒▒░░░░░·░··     gpu       AMD GPU (0x15e7)
+   ····░░░░░░▒▒▒▒▒······░░░░░░░░░▒▒▒▒▒░░░░░░·     memory   ██████░░░░░░░░  6.9G / 15.0G
+   ···░░░░░░▒▒▒▒▒▓▓··░░░░░░░░░░░▓▓▒▒▒▒▒░░░░░░     disk      97.2G / 455.9G
+   ····░░░░░▒▒▒▒▓▓▓▓▓█░░░░░░░█▓▓▓▓▓▒▒▒▒░░░░░
+   ·····░░░░▒▒▒▒▒▓▓▓▓▓███████▓▓▓▓▓▒▒▒▒▒░░░░    ·
+   ······░░░▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒░░·     ·
+    ·····  ░░▒▒▒▒▒▒▓▓▓▓▓▓▓▓▓▓▓▓▓▒▒▒▒▒▒░░     ···
+    ······   ·▒▒▒▒▒▒▒▒▓▓▓▓▓▓▓▒▒▒▒▒▒▒▒░   ······
+     ······    ░▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒░··········
+```
+
+the disk rotates, the starfield twinkles, and shooting stars streak across — all deterministic, all zero-dependency.
+
+```bash
+arcfetch --blackhole          # 3s animation
 arcfetch --blackhole --t 0    # infinite loop (Ctrl+C to stop)
 arcfetch --blackhole --t 10   # 10 seconds
 ```
 
 it pulls your system info alongside the disk, so it's still functional — you get the flex *and* the data. and because it's pure rust with zero dependencies (libc doesn't count), there's no ffmpeg, no opengl, no bullet hell of missing libraries. the terminal is the gpu.
 
----
-
 ## speed
 
-| run                | time   |
-|--------------------|--------|
-| arcfetch           | ~1.2ms |
-| fastfetch          | ~31ms  |
-| neofetch           | ~300ms |
+| run          | time    |
+|--------------|---------|
+| arcfetch     | ~1.2ms  |
+| fastfetch    | ~31ms   |
+| neofetch     | ~300ms  |
 
 no threads, no subprocesses, no waiting. cpuid for the cpu (zero i/o). `libc::sysinfo` + `libc::uname` for uptime and kernel — one syscall each. two-tier cache (`/dev/shm` + `~/.cache`) means the second run is even faster than the first.
 
 only 10 fields by default: os, kernel, uptime, pkgs, shell, de/wm, term, cpu, gpu, memory. no disk, no swatches, no load. just what you actually look at.
 
----
-
 ## install
+
+**nix:**
+```bash
+nix run github:tonycth7/arcfetch
+```
 
 **aur:**
 ```bash
@@ -99,8 +121,6 @@ cargo build --release
 cp target/release/arcfetch ~/.local/bin/
 ```
 
----
-
 ## quick start
 
 ```bash
@@ -112,24 +132,17 @@ arcfetch --preset science         # random logo + physicist quote
 arcfetch --full                   # most fields
 arcfetch --no-color               # plain text, pipe-friendly
 ```
-
----
-
-## logos
-
-```
+```bash
 arcfetch                          # block arch  ▟███▙ (default)
 arcfetch --logo mini              # compact 7-line ascii arch
-arcfetch --logo ascii             # dotty arch
+arcfetch --logo ascii             # dotty arch (neofetch-style)
 arcfetch --logo tux               # linux penguin
 arcfetch --logo nix               # nixOS snowflake
 arcfetch --logo gentoo            # gentoo G
 arcfetch --logo auto              # detect from /etc/os-release
 arcfetch --logo custom            # ~/.config/arcfetch/logo.txt
-arcfetch --logo-file <path>       # any ascii art
+arcfetch --logo-file <path>       # any ascii art or image (kitty protocol)
 ```
-
----
 
 ## display modes
 
@@ -142,8 +155,6 @@ arcfetch --cosmic                 # starfield + moon phase
 ```
 
 mutually exclusive. pick one.
-
----
 
 ## config
 
@@ -190,11 +201,13 @@ ssh         = false
 ports       = false
 swatches    = false
 
+[logo]
+# name = arch         # arch | ascii | tux | nix | gentoo | mini | auto
+# file = <path>       # custom ascii file (overrides name)
+
 [template]
 preset = full
 ```
-
----
 
 ## all flags
 
@@ -215,8 +228,6 @@ preset = full
      --t <secs>           0=forever, n=n secs (blackhole & cosmic)
 ```
 
----
-
 ## files
 
 everything in `src/`:
@@ -231,16 +242,13 @@ everything in `src/`:
 | `logos.rs` | 6 logos + auto-detect + custom loader |
 | `mandelbrot.rs` | mandelbrot set in rust |
 | `cosmic.rs` | starfield + moon phase |
-
----
+| `flake.nix` | nix flake for reproducible builds |
 
 ## requirements
 
-- any linux — package count is the only arch-specific thing
-- rust 1.85+ (edition 2024)
-- true-color terminal (anything from 2015 onwards)
-- curiosity about what a terminal can do
-
----
++ any linux — package count is the only arch-specific thing
++ rust 1.85+ (edition 2024)
++ true-color terminal (anything from 2015 onwards)
++ curiosity about what a terminal can do
 
 *built for arch. runs on anything. written in rust. themed in catppuccin. zero bloat.*
