@@ -1,4 +1,4 @@
-// arcfetch v0.7.0 — sub-ms Arch Linux sysinfo · Catppuccin Mocha
+// arcfetch v0.7.0 — sub-ms Arch Linux sysinfo 
 // arcfetch [-h] [-V] [--blackhole [--t N]] [--logo NAME] [--accent COLOR]
 //          [--no-color] [--config]
 mod cache;
