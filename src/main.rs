@@ -292,60 +292,100 @@ extern "C" fn sigint_handler(_: libc::c_int) {
     RUNNING.store(false, Ordering::Relaxed);
 }
 
-fn bh_cell(col: usize, row_idx: usize, cx: f64, cy: f64, rot: f64) -> (&'static str, char) {
+// ── deterministic starfield seeded from cell position ──────
+fn bh_star(c: usize, r: usize, frame: u64) -> Option<(&'static str, char)> {
+    let h = (c.wrapping_mul(97) ^ r.wrapping_mul(191) ^ 0xdead_beefu64 as usize)
+        .wrapping_mul(0x9e37_79b9);
+    let star = (h >> 16) & 0xff;
+    let twinkle = (((h >> 8) as u64).wrapping_add(frame / 2)) & 0x1f;
+    if star > 230 { return None; }
+    let ch = if (h & 0x100) != 0 { '\u{2219}' } else { '\u{00b7}' };
+    let colors = [OVERLAY0, LAVENDER, MAUVE, TEXT, SKY, BLUE];
+    let ci = (h.wrapping_add(frame as usize)) % colors.len();
+    let bright = if twinkle < 4 { colors[(ci + 1) % colors.len()] } else { colors[ci] };
+    Some((bright, ch))
+}
+
+fn bh_cell(col: usize, row: usize, cx: f64, cy: f64, rot: f64) -> (&'static str, char) {
     let dx   = (col as f64 - cx) * 0.52;
-    let dy   = row_idx as f64 - cy;
+    let dy   = row as f64 - cy;
     let dist = (dx*dx + dy*dy).sqrt();
+    let ra   = ((dy.atan2(dx) + rot) % (2.0*PI) + 2.0*PI) % (2.0*PI);
 
-    if dist < 3.6 { return (RESET, ' '); }
+    if dist < 1.8 { return (RESET, ' '); }
 
-    let ra = ((dy.atan2(dx) + rot) % (2.0*PI) + 2.0*PI) % (2.0*PI);
-
-    if dist < 4.9 {
-        let b = (ra * 1.3).sin() * 0.4 + 0.35;
-        return (SKY, if b > 0.45 { '\u{2591}' } else { '\u{00b7}' });
+    // ── photon ring — intense blueshift inner edge ──────────
+    if dist < 2.8 {
+        let b = (ra * 1.7).sin() * 0.5 + 0.5;
+        return (BLUE, if b > 0.5 { '\u{2591}' } else { '\u{00b7}' });
     }
+    // ── inner accretion — blue → white → gold ───────────────
+    if dist < 4.5 {
+        let b = ((ra * 1.3).sin() * 0.4 + 0.35).clamp(0.0, 1.0);
+        let t = (dist - 2.8) / 1.7;
+        let col = if t < 0.33 { if b > 0.5 { SAPPHIRE } else { BLUE } }
+                  else if t < 0.66 { if b > 0.5 { SKY } else { SAPPHIRE } }
+                  else { if b > 0.5 { TEAL } else { SKY } };
+        return (col, if b > 0.45 { '\u{2591}' } else { '\u{00b7}' });
+    }
+    // ── main disk — hottest in, cooler out ──────────────────
     if dist < 10.4 {
-        let b = ((ra.sin() * 0.5 + 0.5) * (1.0 - (dist - 4.9) / 5.5 * 0.38)).clamp(0.0, 1.0);
-        let ch: char = match (b * 4.8) as u8 {
-            4|5 => '\u{2588}', 3 => '\u{2593}', 2 => '\u{2592}',
-            1   => '\u{2591}', _ => '\u{00b7}',
+        let bright = ((ra.sin() * 0.5 + 0.5)
+            * (1.0 - (dist - 4.5) / 5.9 * 0.42)).clamp(0.0, 1.0);
+        let ch: char = match (bright * 5.5) as u8 {
+            5 => '\u{2588}', 4 => '\u{2593}', 3 => '\u{2592}',
+            2 => '\u{2591}', 1 => '\u{00b7}', _ => ' ',
         };
-        let col: &'static str = match (b * 4.0) as u8 {
-            3|4           => YELLOW, 2 => PEACH, 1 => RED,
-            _ if b > 0.06 => MAROON, _ => OVERLAY0,
+        let t = (dist - 4.5) / 4.0;
+        let col: &'static str = match (bright * 5.0) as u8 {
+            5|4 if t < 0.5 => YELLOW,
+            5|4           => PEACH,
+            3             => PEACH,
+            2             => RED,
+            1 if bright > 0.1 => MAROON,
+            _ => OVERLAY0,
         };
         return (col, ch);
     }
-    if dist < 13.2 {
+    // ── outer halo ──────────────────────────────────────────
+    if dist < 13.8 {
         let w = ((ra * 4.0 + dist * 0.85 + rot * 0.25).sin() + 1.0) * 0.5;
-        if w > 0.74 { return (MAUVE,    '\u{00b7}'); }
-        if w > 0.60 { return (LAVENDER, '\u{00b7}'); }
+        if w > 0.76 { return (MAUVE,    '\u{00b7}'); }
+        if w > 0.62 { return (LAVENDER, '\u{00b7}'); }
     }
     (RESET, ' ')
 }
 
 fn run_blackhole(info: &[String], duration: Option<u64>) {
-    const FRAME_MS: u64  = 62;
+    const FRAME_MS: u64  = 54;
     const BH_ROWS:  usize = 19;
     const BH_COLS:  usize = 46;
     const CX:       f64   = 23.0;
     const CY:       f64   = 9.0;
 
+
     RUNNING.store(true, Ordering::Relaxed);
     unsafe { libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t); }
 
     let max_frames: Option<u64> = match duration {
-        None    => Some(48), Some(0) => None, Some(n) => Some(n * 1000 / FRAME_MS),
+        None    => Some(56), Some(0) => None, Some(n) => Some(n * 1000 / FRAME_MS),
     };
     let lbl = match duration {
         None    => "~3s".into(), Some(0) => "\u{221e}  (Ctrl+C)".into(),
         Some(n) => format!("{}s", n),
     };
-
     let out     = stdout();
     let mut buf = out.lock();
     write!(buf, "\x1b[?25l").ok();
+
+    // ── background star positions — 40 fixed stars ──────────
+    let mut stars = [(0usize, 0usize, 0u64); 40];
+    for (i, s) in stars.iter_mut().enumerate() {
+        let h = i.wrapping_mul(0x9e37_79b9);
+        s.0 = 2 + (h & 0x2f) as usize;         // col offset
+        s.1 = 1 + ((h >> 8) & 0x1f) as usize;  // row offset
+        s.2 = (h >> 16) as u64 & 0x3f;          // phase
+    }
 
     let mut frame = 0u64;
     loop {
@@ -353,14 +393,28 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
         if let Some(max) = max_frames { if frame >= max { break; } }
 
         let rot = (frame as f64 * PI / 6.0) % (2.0*PI);
+
+        // ── shooting star — rare, fast ──────────────────────
+        let (ss_col, ss_row, ss_alive) = if frame % 17 == 3 && frame > 4 {
+            let h = frame.wrapping_mul(0x6c8e_9cf5);
+            let c = (h & 0x1f) as usize + 2;
+            let r = ((h >> 8) & 0x0f) as usize + 2;
+            (c, r, true)
+        } else { (0, 0, false) };
+
         write!(buf, "\x1b[H").ok();
 
+        // ── header with pulsing dot ─────────────────────────
+        let pulse = ((frame as f64 * 0.12).sin() * 0.3 + 0.7);
         write!(buf, "\x1b[K").ok();
         writeln!(buf).ok();
         write!(buf, "\x1b[K").ok();
-        writeln!(buf,
-            "  {B}{MV}\u{25cf}  arcfetch{R}  {OVL}\u{00b7}\u{00b7}\u{00b7}  {MV}SINGULARITY MODE{R}  {OVL}[{lbl}]{R}",
-            B=BOLD, MV=MAUVE, OVL=OVERLAY0, R=RESET, lbl=lbl).ok();
+        write!(buf, "  {}", BOLD).ok();
+        if pulse > 0.92 { write!(buf, "{}", YELLOW).ok(); }
+        else if pulse > 0.75 { write!(buf, "{}", PEACH).ok(); }
+        else { write!(buf, "{}", MAUVE).ok(); }
+        writeln!(buf, "\u{25cf}{}  arcfetch{R}  {OVL}\u{00b7}\u{00b7}\u{00b7}  {MV}SINGULARITY MODE{R}  {OVL}[{lbl}]{R}",
+            RESET, OVL=OVERLAY0, MV=MAUVE, R=RESET, lbl=lbl).ok();
         write!(buf, "\x1b[K").ok();
         writeln!(buf, "  {OVL}{sep}{R}",
             OVL=OVERLAY0, sep="\u{2500}".repeat(62), R=RESET).ok();
@@ -369,7 +423,55 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
             write!(buf, "  ").ok();
             let mut prev: &str = "";
             for c in 0..BH_COLS {
+                // ── shooting star streak ────────────────────
+                if ss_alive && r == ss_row && c >= ss_col && c < ss_col + 6 {
+                    let tail = (c - ss_col) as f64;
+                    if tail < 1.0 { write!(buf, "{}{}", RESET, TEXT).ok(); write!(buf, "\u{258c}").ok(); prev = ""; continue; }
+                    let bright = 1.0 - tail / 6.0;
+                    if bright > 0.3 {
+                        let ch = if bright > 0.7 { '\u{2590}' } else { '\u{00b7}' };
+                        write!(buf, "{}{}", RESET, SKY).ok(); write!(buf, "{}", ch).ok(); prev = "";
+                        continue;
+                    }
+                }
+                // ── background star ─────────────────────────
+                let mut star_rendered = false;
+                for s in &stars {
+                    if s.0 == c && s.1 == r {
+                        let phase = (frame.wrapping_add(s.2)) & 0x1f;
+                        if phase < 22 {
+                            let star_colors = [OVERLAY0, LAVENDER, MAUVE, TEXT, SKY, BLUE];
+                            let ci = (s.2 as usize + frame as usize) % star_colors.len();
+                            let sc = if phase < 4 { star_colors[(ci + 1) % star_colors.len()] }
+                                     else { star_colors[ci] };
+                            write!(buf, "{}{}",
+                                RESET, sc).ok();
+                            write!(buf, "{}", '\u{00b7}').ok();
+                            prev = "";
+                            star_rendered = true;
+                        }
+                        break;
+                    }
+                }
+                if star_rendered { continue; }
+                // ── accretion disk ──────────────────────────
                 let (color, ch) = bh_cell(c, r, CX, CY, rot);
+                // ── relativistic jet (poles) ────────────────
+                let dx_j = c as f64 - CX;
+                let dy_j = r as f64 - CY;
+                let d_j  = (dx_j*dx_j + dy_j*dy_j).sqrt();
+                let jet  = d_j > 2.5 && d_j < 14.0 && dx_j.abs() < 1.5 && dy_j.abs() > 2.5
+                    && ((dy_j > 0.0 && ((dx_j * 0.4 + rot * 0.5).sin() > 0.0))
+                        || (dy_j < 0.0 && ((dx_j * 0.4 - rot * 0.5).sin() > 0.0)));
+                if jet && ch == ' ' {
+                    let jet_col = if dy_j < 0.0 { MAUVE } else { LAVENDER };
+                    let jet_ch  = if ((dx_j * 2.0 + rot * 1.5).sin() * 0.5 + 0.5) > 0.6
+                        { '\u{2591}' } else { '\u{00b7}' };
+                    write!(buf, "{}{}", RESET, jet_col).ok();
+                    write!(buf, "{}", jet_ch).ok();
+                    prev = "";
+                    continue;
+                }
                 if color != prev { write!(buf, "{}{}", RESET, color).ok(); prev = color; }
                 write!(buf, "{}", ch).ok();
             }
@@ -382,6 +484,11 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
         thread::sleep(Duration::from_millis(FRAME_MS));
     }
     write!(buf, "\x1b[?25h").ok();
+    // ── brief afterglow message ─────────────────────────────
+    write!(buf, "\x1b[H").ok();
+    for _ in 0..BH_ROWS + 4 { write!(buf, "\x1b[K\n").ok(); }
+    write!(buf, "\x1b[H").ok();
+    writeln!(buf, "  {OVL}the singularity collapsed. you are back.{R}", OVL=OVERLAY0, R=RESET).ok();
     writeln!(buf).ok();
     buf.flush().ok();
 }
@@ -587,7 +694,7 @@ fn print_config_help(cfg_path: &str) {
     println!("  {b}{BLUE}[show]{r}  {s}(true/false each field){r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  os=true  kernel=true  uptime=true  res=false  pkgs=true");
     println!("  shell=true  de_wm=true  term=true  cpu=true  gpu=true");
-    println!("  memory=true  disk=true  load=false  locale=false  swatches=true");
+    println!("  memory=true  disk=false  load=false  locale=false  swatches=false");
     println!();
     println!("  {b}{BLUE}[template]{r}  {s}overrides [show] entirely{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}preset{r} = full         {s}# full | minimal | hacker | science{r}", g=g, r=r, s=s);
@@ -682,7 +789,7 @@ ip          = false
 ssh         = false
 ports       = false
 
-swatches    = true
+swatches    = false   # color palette swatches row (hidden by default)
 
 [template]
 # preset overrides [show] entirely
