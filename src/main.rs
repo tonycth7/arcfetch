@@ -697,6 +697,10 @@ fn print_config_help(cfg_path: &str) {
     println!("  shell=true  de_wm=true  term=true  cpu=true  gpu=true");
     println!("  memory=true  disk=false  load=false  locale=false  swatches=false");
     println!();
+    println!("  {b}{BLUE}[logo]{r}  {s}choose logo or custom ASCII file{r}", b=b, BLUE=BLUE, r=r, s=s);
+    println!("  {g}name{r} = arch         {s}# arch | ascii | tux | nix | gentoo | mini | auto{r}", g=g, r=r, s=s);
+    println!("  {g}file{r} = <path>       {s}# custom ASCII file (overrides name){r}", g=g, r=r, s=s);
+    println!();
     println!("  {b}{BLUE}[template]{r}  {s}overrides [show] entirely{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}preset{r} = full         {s}# full | minimal | hacker | science{r}", g=g, r=r, s=s);
     println!();
@@ -716,6 +720,8 @@ fn print_config_help(cfg_path: &str) {
     println!("    c2 = lavender");
     println!("    [show]");
     println!("    res = false");
+    println!("    [logo]");
+    println!("    name = arch");
     println!("    [template]");
     println!("    preset = full");
     println!("    EOF");
@@ -791,6 +797,13 @@ ssh         = false
 ports       = false
 
 swatches    = false   # color palette swatches row (hidden by default)
+
+[logo]
+# logo name: arch | ascii | tux | nix | gentoo | mini | auto
+# name = arch
+
+# custom ASCII file path (overrides name if set)
+# file = ~/.config/arcfetch/logo.txt
 
 [template]
 # preset overrides [show] entirely
@@ -876,7 +889,7 @@ fn print_help(cfg_path: &str) {
 // ═══════════════════════════════════════════════════════════
 
 fn main() {
-    let args    = parse_args();
+    let mut args = parse_args();
     let cfg_path = config::config_path();
 
     if args.version  { print_version();               return; }
@@ -891,6 +904,19 @@ fn main() {
     }
 
     let cfg = config::load(args.accent.as_deref(), args.preset.as_deref());
+
+    // apply logo from config (CLI overrides config)
+    if !args.logo_explicit {
+        if let Some(ref name) = cfg.logo.name {
+            args.logo = name.clone();
+            args.logo_explicit = true;
+        }
+    }
+    if args.logo_file.is_none() {
+        if let Some(ref file) = cfg.logo.file {
+            args.logo_file = Some(file.clone());
+        }
+    }
 
     // collect all sysinfo — only read network for hacker preset
     let need_net = cfg.preset.as_deref() == Some("hacker")

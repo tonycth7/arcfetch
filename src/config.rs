@@ -22,6 +22,10 @@
 //   shell=true  de_wm=true  term=true  cpu=true  gpu=true
 //   memory=true  disk=true  load=false  locale=false  swatches=true
 //
+//   [logo]
+//   name = arch      # built-in: arch | ascii | tux | nix | gentoo | mini | auto
+//   file = ~/.config/arcfetch/logo.txt   # custom ASCII file (overrides name)
+//
 //   [template]
 //   preset = full    # full | minimal | hacker | science
 
@@ -264,12 +268,24 @@ impl Show {
     }
 }
 
+// ── Logo ─────────────────────────────────────────────────
+
+pub struct Logo {
+    pub name: Option<String>,  // built-in logo name (arch, ascii, tux, nix, gentoo, mini, auto)
+    pub file: Option<String>,  // custom ASCII file path (overrides name if set)
+}
+
+impl Default for Logo {
+    fn default() -> Self { Logo { name: None, file: None } }
+}
+
 // ── Config ───────────────────────────────────────────────
 
 pub struct Config {
     pub colors: Colors,
     pub show:   Show,
     pub preset: Option<String>,
+    pub logo:   Logo,
 }
 
 // ── File path ────────────────────────────────────────────
@@ -292,6 +308,7 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
     let mut colors = Colors::default();
     let mut show   = Show::default();
     let mut preset: Option<String> = None;
+    let mut logo   = Logo::default();
 
     // override accent from env var
     let env_accent = env::var("ARCFETCH_ACCENT").ok();
@@ -349,6 +366,13 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
                         show.set_field(key, enabled);
                     }
                 }
+                "logo" => {
+                    match key {
+                        "name" => logo.name = Some(val.to_string()),
+                        "file" => logo.file = Some(val.to_string()),
+                        _ => {}
+                    }
+                }
                 "template" => {
                     if key == "preset" { preset = Some(val.to_string()); }
                 }
@@ -370,5 +394,5 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
         colors.hostname = ansi;
     }
 
-    Config { colors, show, preset }
+    Config { colors, show, preset, logo }
 }
