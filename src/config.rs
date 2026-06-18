@@ -159,6 +159,11 @@ pub struct Show {
     pub ssh:          bool,
     pub ports:        bool,
     pub swatches:     bool,
+    pub init:         bool,
+    pub cpu_temp:     bool,
+    pub processes:    bool,
+    pub container:    bool,
+    pub session:      bool,
 }
 
 impl Default for Show {
@@ -168,9 +173,11 @@ impl Default for Show {
             os: true, kernel: true, uptime: true, uptime_long: false,
             res: false, pkgs: true, shell: true, de_wm: true, term: true,
             cpu: true, gpu: true, gpu_temp: false, battery: false,
-            memory: true, disk: true, load: false, locale: false,
+            memory: true, disk: false, load: false, locale: false,
             ip: false, ssh: false, ports: false,
-            swatches: true,
+            swatches: false,
+            init: false, cpu_temp: false, processes: false,
+            container: false, session: false,
         }
     }
 }
@@ -185,6 +192,8 @@ impl Show {
             memory: false, disk: false, load: false, locale: false,
             ip: false, ssh: false, ports: false,
             swatches: false,
+            init: false, cpu_temp: false, processes: false,
+            container: false, session: false,
         };
         match preset.trim() {
             "minimal" => {
@@ -215,6 +224,8 @@ impl Show {
                     memory: true, disk: true, load: true, locale: true,
                     ip: false, ssh: false, ports: false,
                     swatches: true,
+                    init: true, cpu_temp: true, processes: true,
+                    container: false, session: true,
                 };
             }
         }
@@ -243,6 +254,11 @@ impl Show {
             "ssh"         => self.ssh        = val,
             "ports"       => self.ports      = val,
             "swatches"    => self.swatches   = val,
+            "init"        => self.init       = val,
+            "cpu_temp"    => self.cpu_temp   = val,
+            "processes"   => self.processes  = val,
+            "container"   => self.container  = val,
+            "session"     => self.session    = val,
             _ => {}
         }
     }

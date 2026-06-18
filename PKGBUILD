@@ -1,7 +1,7 @@
 # Maintainer: tony <tonycth@proton.me>
 
 pkgname=arcfetch
-pkgver=0.7.0
+pkgver=0.7.3
 pkgrel=1
 pkgdesc="Blazing-fast Arch Linux sysinfo "
 arch=('x86_64' 'aarch64')
