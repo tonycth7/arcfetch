@@ -1,9 +1,9 @@
 # Maintainer: tony <tonycth@proton.me>
 
 pkgname=arcfetch
-pkgver=0.7.3
+pkgver=1.0.7
 pkgrel=1
-pkgdesc="Blazing-fast Arch Linux sysinfo "
+pkgdesc="Blazing-fast Arch Linux sysinfo"
 arch=('x86_64' 'aarch64')
 url="https://github.com/tonycth7/arcfetch"
 license=('MIT')

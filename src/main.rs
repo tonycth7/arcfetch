@@ -1,4 +1,4 @@
-// arcfetch v0.7.0 — sub-ms Arch Linux sysinfo 
+// arcfetch — blazing-fast Arch Linux sysinfo 
 // arcfetch [-h] [-V] [--blackhole [--t N]] [--logo NAME] [--accent COLOR]
 //          [--no-color] [--config]
 mod cache;
@@ -44,9 +44,21 @@ fn row(label_color: &str, key: &str, val: &str) -> String {
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut esc = false;
+    let mut osc = false;
     for ch in s.chars() {
-        if ch == '\x1b'  { esc = true; continue; }
-        if esc { if ch == 'm' { esc = false; } continue; }
+        if ch == '\x1b' { esc = true; osc = false; continue; }
+        if esc {
+            if ch == '[' { continue; }  // CSI introducer
+            if ch == ']' { osc = true; continue; }  // OSC introducer
+            if osc {
+                if ch == '\x1b' { continue; }
+                if ch == '\\' || ch == '\x07' { osc = false; esc = false; }
+                continue;
+            }
+            if ch == '\\' { esc = false; continue; }  // ST
+            if ch >= '\x40' && ch <= '\x7e' { esc = false; }  // CSI final byte
+            continue;
+        }
         out.push(ch);
     }
     out
@@ -56,9 +68,21 @@ fn strip_ansi(s: &str) -> String {
 fn visible_chars(s: &str) -> usize {
     let mut n = 0;
     let mut esc = false;
+    let mut osc = false;
     for ch in s.chars() {
-        if ch == '\x1b' { esc = true; continue; }
-        if esc { if ch == 'm' { esc = false; } continue; }
+        if ch == '\x1b' { esc = true; osc = false; continue; }
+        if esc {
+            if ch == '[' { continue; }
+            if ch == ']' { osc = true; continue; }
+            if osc {
+                if ch == '\x1b' { continue; }
+                if ch == '\\' || ch == '\x07' { osc = false; esc = false; }
+                continue;
+            }
+            if ch == '\\' { esc = false; continue; }
+            if ch >= '\x40' && ch <= '\x7e' { esc = false; }
+            continue;
+        }
         n += 1;
     }
     n
@@ -82,6 +106,14 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+fn expand_path(path: &str) -> String {
+    if path.starts_with('~') {
+        if let Some(home) = env::var("HOME").ok() {
+            path.replacen('~', &home, 1)
+        } else { path.to_string() }
+    } else { path.to_string() }
+}
+
 fn kitty_image(path: &str) -> Option<String> {
     let ext = path.rsplit('.').next()?.to_lowercase();
     let format = match ext.as_str() {
@@ -90,17 +122,22 @@ fn kitty_image(path: &str) -> Option<String> {
         "gif" => 102,
         _ => return None,
     };
-    let data = std::fs::read(path).ok()?;
+    let expanded = expand_path(path);
+    let data = std::fs::read(&expanded).ok()?;
     let b64 = base64_encode(&data);
     Some(format!("\x1b_Ga=T,f={},c=31,r=19,d=A;{}\x1b\\", format, b64))
 }
 
-/// Build the info column as a Vec<String> respecting show/hide config.
-fn science_quote() -> &'static str {
-    // deterministic-ish: pick by uptime seconds mod pool size
-    let secs = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
-    let n: usize = secs.split('.').next()
-        .and_then(|v| v.parse().ok()).unwrap_or(0);
+fn uptime_seed() -> usize {
+    std::fs::read_to_string("/proc/uptime")
+        .unwrap_or_default()
+        .split('.')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn science_quote(seed: usize) -> &'static str {
     const QUOTES: &[&str] = &[
         "\"imagination is more important than knowledge\" — Einstein",
         "\"if you can't explain it simply, you don't understand it\" — Feynman",
@@ -115,15 +152,11 @@ fn science_quote() -> &'static str {
         "\"not only is the universe stranger than we think, it is stranger than we can think\" — Heisenberg",
         "\"in physics, you don't have to go around making trouble for yourself — nature does it for you\" — Feynman",
     ];
-    QUOTES[n % QUOTES.len()]
+    QUOTES[seed % QUOTES.len()]
 }
 
-fn science_logo() -> &'static str {
-    let secs = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
-    let n: usize = secs.split('.').next()
-        .and_then(|v| v.parse().ok()).unwrap_or(0);
-    // science logos: dna atom wave emc2 pi
-    ["dna", "atom", "wave", "emc2", "pi"][n % 5]
+fn science_logo(seed: usize) -> &'static str {
+    ["dna", "atom", "wave", "emc2", "pi"][seed % 5]
 }
 
 fn detect_auto_logo() -> String {
@@ -144,7 +177,7 @@ fn detect_auto_logo() -> String {
     }
 }
 
-fn build_info(si: &info::SysInfo, cfg: &Config) -> (Vec<String>, bool) {
+fn build_info(si: &info::SysInfo, cfg: &Config, sci_seed: usize) -> (Vec<String>, bool) {
     let c      = &cfg.colors;
     let sh     = &cfg.show;
     let is_sci = matches!(cfg.preset.as_deref(), Some("science"));
@@ -258,10 +291,24 @@ fn build_info(si: &info::SysInfo, cfg: &Config) -> (Vec<String>, bool) {
     field!(li, lines, c, sh.container, "container", &si.container);
     field!(li, lines, c, sh.session,   "session",   &si.session);
 
-    // use li to avoid unused-assignments warning
+    // fastfetch-inspired fields
+    field!(li, lines, c, sh.swap,        "swap",        &si.swap);
+    field!(li, lines, c, sh.sound,       "sound",       &si.sound);
+    field!(li, lines, c, sh.gpu_driver,  "gpu driver",  &si.gpu_driver);
+    field!(li, lines, c, sh.bios,        "bios",        &si.bios);
+    field!(li, lines, c, sh.board,       "board",       &si.board);
+    field!(li, lines, c, sh.disk_type,   "disk type",   &si.disk_type);
+    field!(li, lines, c, sh.pkg_updates, "updates",     &si.pkg_updates);
+    field!(li, lines, c, sh.theme,       "theme",       &si.theme);
+    field!(li, lines, c, sh.icons,       "icons",       &si.icons);
+    field!(li, lines, c, sh.term_font,   "term font",   &si.term_font);
+    field!(li, lines, c, sh.de_wm_ver,   "de/wm ver",   &si.de_wm_ver);
+    field!(li, lines, c, sh.init_ver,    "init ver",    &si.init_ver);
+    field!(li, lines, c, sh.local_ip,    "local ip",    &si.local_ip);
+
     let _ = li;
 
-    // swatches
+    // swatches / color bar
     if sh.swatches {
         lines.push(String::new());
         lines.push(format!(
@@ -272,11 +319,19 @@ fn build_info(si: &info::SysInfo, cfg: &Config) -> (Vec<String>, bool) {
             bl=BLUE,      lv=LAVENDER, R=RESET
         ));
     }
+    if sh.color_bar {
+        lines.push(String::new());
+        lines.push(format!(
+            "{bl}\u{2588}{rd}\u{2588}{gn}\u{2588}{yw}\u{2588}{bl2}\u{2588}{mv}\u{2588}{cy}\u{2588}{wh}\u{2588}{R}",
+            bl=OVERLAY0, rd=RED, gn=GREEN, yw=YELLOW,
+            bl2=BLUE, mv=MAUVE, cy=TEAL, wh=TEXT, R=RESET
+        ));
+    }
 
     // science quote — always last if science preset
     if is_sci {
         lines.push(String::new());
-        lines.push(format!("{OVL}{q}{R}", OVL=OVERLAY0, q=science_quote(), R=RESET));
+        lines.push(format!("{OVL}{q}{R}", OVL=OVERLAY0, q=science_quote(sci_seed), R=RESET));
     }
 
     (lines, is_sci)
@@ -290,21 +345,6 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn sigint_handler(_: libc::c_int) {
     RUNNING.store(false, Ordering::Relaxed);
-}
-
-// ── deterministic starfield seeded from cell position ──────
-#[allow(dead_code)]
-fn bh_star(c: usize, r: usize, frame: u64) -> Option<(&'static str, char)> {
-    let h = (c.wrapping_mul(97) ^ r.wrapping_mul(191) ^ 0xdead_beefu64 as usize)
-        .wrapping_mul(0x9e37_79b9);
-    let star = (h >> 16) & 0xff;
-    let twinkle = (((h >> 8) as u64).wrapping_add(frame / 2)) & 0x1f;
-    if star > 230 { return None; }
-    let ch = if (h & 0x100) != 0 { '\u{2219}' } else { '\u{00b7}' };
-    let colors = [OVERLAY0, LAVENDER, MAUVE, TEXT, SKY, BLUE];
-    let ci = (h.wrapping_add(frame as usize)) % colors.len();
-    let bright = if twinkle < 4 { colors[(ci + 1) % colors.len()] } else { colors[ci] };
-    Some((bright, ch))
 }
 
 fn bh_cell(col: usize, row: usize, cx: f64, cy: f64, rot: f64) -> (&'static str, char) {
@@ -501,6 +541,18 @@ fn run_quantum(info_lines: &[String], logo_name: &str, custom_lines: &Option<Vec
     const FADES: usize = 8;
     const SUPER: &[char] = &['░', '▒', '▓', '█'];
 
+    // pre-compute logo widths once (all paths)
+    let (logo_widths, logo_max_w): (Vec<usize>, usize) = if let Some(lines) = custom_lines {
+        let w: Vec<usize> = lines.iter().map(|l| visible_chars(l)).collect();
+        let m = w.iter().max().copied().unwrap_or(0);
+        (w, m)
+    } else {
+        let logo = logos::from_name(logo_name);
+        let w: Vec<usize> = logo.iter().map(|l| visible_chars(l)).collect();
+        let m = w.iter().max().copied().unwrap_or(36);
+        (w, m)
+    };
+
     let out     = stdout();
     let mut buf = out.lock();
     write!(buf, "\x1b[?25l").ok();
@@ -543,13 +595,14 @@ fn run_quantum(info_lines: &[String], logo_name: &str, custom_lines: &Option<Vec
 
         writeln!(buf).ok();
         if let Some(lines) = custom_lines {
-            let logo_w = lines.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
-            for i in 0..lines.len().max(faded.len()) {
+            let max_rows = lines.len().max(faded.len());
+            for i in 0..max_rows {
                 let ll  = lines.get(i).map(String::as_str).unwrap_or("");
-                let pad = logo_w.saturating_sub(visible_chars(ll));
+                let pad = logo_max_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
                 let inf = faded.get(i).map(String::as_str).unwrap_or("");
                 if args.no_color {
-                    writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
+                    let stripped = if ll.contains('\x1b') { strip_ansi(ll) } else { ll.to_string() };
+                    writeln!(buf, "  {}{}  {}", stripped, " ".repeat(pad), inf).ok();
                 } else {
                     writeln!(buf, "  {acc}{ll}{pad}{R}  {inf}",
                         acc = &cfg.colors.accent, ll = ll,
@@ -558,17 +611,17 @@ fn run_quantum(info_lines: &[String], logo_name: &str, custom_lines: &Option<Vec
             }
         } else {
             let logo   = logos::from_name(logo_name);
-            let logo_w = logo.iter().map(|l| visible_chars(l)).max().unwrap_or(36);
-            let logo_accent: &str = if logo_name == "gentoo" { config::MAUVE } else { cfg.colors.accent.as_str() };
-            for i in 0..logo.len().max(faded.len()) {
+            let max_rows = logo.len().max(faded.len());
+            for i in 0..max_rows {
                 let ll  = logo.get(i).copied().unwrap_or("");
-                let pad = logo_w.saturating_sub(visible_chars(ll));
+                let pad = logo_max_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
                 let inf = faded.get(i).map(String::as_str).unwrap_or("");
+                let lc = logo_line_color(logo_name, i, cfg, args.color.is_some());
                 if args.no_color {
                     writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
                 } else {
-                    writeln!(buf, "  {acc}{ll}{pad}{R}  {inf}",
-                        acc = logo_accent, ll = ll,
+                    writeln!(buf, "  {lc}{ll}{pad}{R}  {inf}",
+                        lc = lc, ll = ll,
                         pad = " ".repeat(pad), R = RESET, inf = inf).ok();
                 }
             }
@@ -582,23 +635,23 @@ fn run_quantum(info_lines: &[String], logo_name: &str, custom_lines: &Option<Vec
     let final_lines: Vec<String> = info_lines.iter().map(|s| if args.no_color { strip_ansi(s) } else { s.clone() }).collect();
     writeln!(buf).ok();
     if let Some(lines) = custom_lines {
-        let logo_w = lines.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
-        for i in 0..lines.len().max(final_lines.len()) {
+        let max_rows = lines.len().max(final_lines.len());
+        for i in 0..max_rows {
             let ll  = lines.get(i).map(String::as_str).unwrap_or("");
-            let pad = logo_w.saturating_sub(visible_chars(ll));
+            let pad = logo_max_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
             let inf = final_lines.get(i).map(String::as_str).unwrap_or("");
-            write!(buf, "  {}{}  {}\n", ll, " ".repeat(pad), inf).ok();
+            writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
         }
     } else {
         let logo   = logos::from_name(logo_name);
-        let logo_w = logo.iter().map(|l| visible_chars(l)).max().unwrap_or(36);
-        let logo_accent: &str = if logo_name == "gentoo" { config::MAUVE } else { cfg.colors.accent.as_str() };
-        for i in 0..logo.len().max(final_lines.len()) {
+        let max_rows = logo.len().max(final_lines.len());
+        for i in 0..max_rows {
             let ll  = logo.get(i).copied().unwrap_or("");
-            let pad = logo_w.saturating_sub(visible_chars(ll));
+            let pad = logo_max_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
             let inf = final_lines.get(i).map(String::as_str).unwrap_or("");
-            write!(buf, "  {acc}{ll}{pad}{R}  {inf}\n",
-                acc = logo_accent, ll = ll,
+            let lc = logo_line_color(logo_name, i, cfg, args.color.is_some());
+            writeln!(buf, "  {lc}{ll}{pad}{R}  {inf}\n",
+                lc = lc, ll = ll,
                 pad = " ".repeat(pad), R = RESET, inf = inf).ok();
         }
     }
@@ -616,6 +669,7 @@ struct Args {
     logo_explicit: bool,
     logo_file:    Option<String>,
     accent:       Option<String>,
+    color:        Option<String>,
     preset:       Option<String>,
     no_color:     bool,
     blackhole:    bool,
@@ -632,14 +686,16 @@ struct Args {
 fn parse_args() -> Args {
     let mut a = Args {
         logo: "arch".into(), logo_explicit: false, logo_file: None,
-        accent: None, preset: None,
+        accent: None, color: None, preset: None,
         no_color: false, blackhole: false,
         mandelbrot: false, mandel_iter: 64,
         quantum: false, cosmic: false,
         duration: None, help: false, version: false, show_cfg: false,
     };
-    let mut it = env::args().skip(1);
-    while let Some(arg) = it.next() {
+    let raw: Vec<String> = env::args().skip(1).collect();
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = &raw[i];
         match arg.as_str() {
             "-h" | "--help"    => a.help      = true,
             "-V" | "--version" => a.version   = true,
@@ -647,23 +703,35 @@ fn parse_args() -> Args {
             "--no-color"       => a.no_color   = true,
             "--config"         => a.show_cfg   = true,
             "--full"           => { a.preset = Some("full".into()); }
-            "--mandelbrot"     => { a.mandelbrot = true; a.mandel_iter = it.next().and_then(|v| v.parse().ok()).unwrap_or(64); }
+            "--mandelbrot"     => {
+                a.mandelbrot = true;
+                // peek at next — only consume if it's a number
+                if i + 1 < raw.len() {
+                    if let Ok(n) = raw[i + 1].parse::<u32>() {
+                        a.mandel_iter = n;
+                        i += 1; // skip the number
+                    }
+                }
+            }
             "--quantum"        => a.quantum    = true,
             "--cosmic"         => a.cosmic     = true,
-            "--logo"      => { a.logo         = it.next().unwrap_or_else(|| "arch".into()); a.logo_explicit = true; }
-            "--logo-file" => { a.logo_file  = it.next(); }
-            "--accent"    => { a.accent     = it.next(); }
-            "--preset"    => { a.preset     = it.next(); }
-            "--t"         => { a.duration   = it.next().and_then(|v| v.parse().ok()); }
+            "--logo"      => { i += 1; if i < raw.len() { a.logo = raw[i].clone(); a.logo_explicit = true; } }
+            "--logo-file" => { i += 1; if i < raw.len() { a.logo_file = Some(raw[i].clone()); } }
+            "--accent"    => { i += 1; if i < raw.len() { a.accent = Some(raw[i].clone()); } }
+            "--color"     => { i += 1; if i < raw.len() { a.color = Some(raw[i].clone()); } }
+            "--preset"    => { i += 1; if i < raw.len() { a.preset = Some(raw[i].clone()); } }
+            "--t"         => { i += 1; if i < raw.len() { a.duration = raw[i].parse().ok(); } }
             _             => {}
         }
+        i += 1;
     }
     a
 }
 
 fn print_version() {
     println!();
-    println!("  {S}version  {B}{BLUE}0.7.3{R}", S=SUBTEXT1, B=BOLD, BLUE=BLUE, R=RESET);
+    let ver = env!("CARGO_PKG_VERSION");
+    println!("  {S}version  {B}{BLUE}{ver}{R}", S=SUBTEXT1, B=BOLD, BLUE=BLUE, ver=ver, R=RESET);
     println!();
     // E = mc²: energy of startup ≈ 0
     println!("  {Y}E{R} = {G}m{R}{S}c{R}\u{00b2}   {OVL}where E = startup time \u{2248} 0{R}",
@@ -691,11 +759,16 @@ fn print_config_help(cfg_path: &str) {
     println!("  {g}values{r}   = subtext1   {s}# all field values{r}", g=g, r=r, s=s);
     println!("  {g}sep{r}      = overlay0   {s}# separator ────{r}", g=g, r=r, s=s);
     println!("  {g}bar{r}      = blue       {s}# memory bar fill{r}", g=g, r=r, s=s);
+    println!("  {s}  logo1..logo9{r}  {s}custom logo inline colors (default: c1..c7 + accent + text){r}", s=s, r=r);
     println!();
     println!("  {b}{BLUE}[show]{r}  {s}(true/false each field){r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  os=true  kernel=true  uptime=true  res=false  pkgs=true");
     println!("  shell=true  de_wm=true  term=true  cpu=true  gpu=true");
-    println!("  memory=true  disk=false  load=false  locale=false  swatches=false");
+    println!("  memory=true  disk=false  load=false  locale=false");
+    println!("  swatches=false  color_bar=false");
+    println!("  swap=false  sound=false  gpu_driver=false  theme=false");
+    println!("  bios=false  board=false  disk_type=false  pkg_updates=false");
+    println!("  local_ip=false  init_ver=false  de_wm_ver=false");
     println!();
     println!("  {b}{BLUE}[logo]{r}  {s}choose logo or custom ASCII file{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}name{r} = arch         {s}# arch | ascii | tux | nix | gentoo | mini | auto{r}", g=g, r=r, s=s);
@@ -769,6 +842,18 @@ values = subtext1
 sep    = overlay0
 bar    = blue
 
+# logo inline colors for custom logo files ($1..$9)
+# defaults: c1..c7 + accent + text
+logo1 = blue
+logo2 = sapphire
+logo3 = sky
+logo4 = teal
+logo5 = green
+logo6 = yellow
+logo7 = peach
+logo8 = mauve
+logo9 = text
+
 [show]
 # header: both | user | host | none
 header      = both
@@ -787,7 +872,7 @@ gpu         = true
 gpu_temp    = false   # GPU temperature — reads /sys/class/drm hwmon
 battery     = false   # battery % + status — N/A on desktop
 memory      = true
-disk        = true
+disk        = false
 load        = false
 locale      = false
 
@@ -796,7 +881,23 @@ ip          = false
 ssh         = false
 ports       = false
 
-swatches    = false   # color palette swatches row (hidden by default)
+swatches    = false   # color palette swatches row
+color_bar   = false   # neofetch-style 8-color bar (■■■■■■■■)
+
+# fastfetch-inspired fields (all hidden by default)
+swap        = false   # swap usage
+sound       = false   # audio server (PipeWire/PulseAudio/ALSA)
+gpu_driver  = false   # GPU driver name + version
+bios        = false   # BIOS version + date
+board       = false   # motherboard vendor + model
+disk_type   = false   # SSD / NVMe / HDD
+pkg_updates = false   # available package updates
+theme       = false   # GTK theme name
+icons       = false   # icon theme name
+term_font   = false   # terminal font name
+de_wm_ver   = false   # desktop environment version
+init_ver    = false   # init system version
+local_ip    = false   # interface + local IP
 
 [logo]
 # logo name: arch | ascii | tux | nix | gentoo | mini | auto
@@ -828,7 +929,8 @@ swatches    = false   # color palette swatches row (hidden by default)
 fn print_help(cfg_path: &str) {
     let (b, r, s, g) = (BOLD, RESET, SUBTEXT1, GREEN);
     println!();
-    println!("  {b}{MAUVE}arcfetch{r}  v0.7  blazing-fast Arch sysinfo", b=b, MAUVE=MAUVE, r=r);
+    let ver = env!("CARGO_PKG_VERSION");
+    println!("  {b}{MAUVE}arcfetch{r}  v{ver}  blazing-fast Arch sysinfo", b=b, MAUVE=MAUVE, ver=ver, r=r);
     println!();
     println!("  {b}{BLUE}usage{r}   arcfetch [OPTIONS]", b=b, BLUE=BLUE, r=r);
     println!();
@@ -843,6 +945,7 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}--preset <n>{r}               {s}full|minimal|hacker|science{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--full{r}                     {s}show all fields (overrides minimal default){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--accent <color>{r}           hex or catppuccin name", b=b, g=g, r=r);
+    println!("    {b}{g}--color <scheme>{r}            logo color: name | hex | random", b=b, g=g, r=r);
     println!("    {b}{g}--no-color{r}                 plain text (pipe-friendly)", b=b, g=g, r=r);
     println!("    {b}{g}--mandelbrot [iter]{r}        {GREEN}Mandelbrot set as logo{r}", b=b, g=g, r=r, GREEN=GREEN);
     println!("    {b}{g}--quantum{r}                  {MAUVE}wave-function collapse animation{r}", b=b, g=g, r=r, MAUVE=MAUVE);
@@ -884,6 +987,19 @@ fn print_help(cfg_path: &str) {
     println!();
 }
 
+fn logo_line_color<'a>(logo_name: &str, i: usize, cfg: &'a Config, color_override: bool) -> &'a str {
+    if color_override {
+        cfg.colors.accent.as_str()
+    } else {
+        match logo_name {
+            "mini" => cfg.colors.label(i),
+            "nix" => if i % 2 == 0 { config::NIX_LIGHT } else { config::NIX_DARK },
+            "gentoo" => if i % 2 == 0 { config::GENTOO_DARK } else { config::GENTOO_LIGHT },
+            _ => cfg.colors.accent.as_str(),
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 //  main
 // ═══════════════════════════════════════════════════════════
@@ -903,13 +1019,45 @@ fn main() {
         return;
     }
 
-    let cfg = config::load(args.accent.as_deref(), args.preset.as_deref());
+    let mut cfg = config::load(args.accent.as_deref(), args.preset.as_deref());
+
+    // --color overrides logo/accent color
+    if let Some(ref color) = args.color {
+        if color == "random" {
+            use config::*;
+            let palette = [BLUE, GREEN, TEAL, YELLOW, PEACH, MAUVE, RED, SKY, SAPPHIRE, LAVENDER];
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+                .as_nanos() as usize;
+            cfg.colors.accent = palette[seed % palette.len()].into();
+        } else {
+            let ansi = config::name_to_ansi(color);
+            if ansi.is_empty() && color.starts_with('#') {
+                // hex color: construct ANSI escape
+                if color.len() >= 7 {
+                    if let (Ok(r), Ok(g), Ok(b)) = (
+                        u8::from_str_radix(&color[1..3], 16),
+                        u8::from_str_radix(&color[3..5], 16),
+                        u8::from_str_radix(&color[5..7], 16),
+                    ) {
+                        cfg.colors.accent = format!("\x1b[38;2;{};{};{}m", r, g, b);
+                    }
+                }
+            } else if !ansi.is_empty() {
+                cfg.colors.accent = ansi.into();
+            }
+        }
+    }
+
+    // auto-disable color & animations when stdout is not a terminal
+    let is_tty = unsafe { libc::isatty(1) } != 0;
+    if !is_tty { args.no_color = true; }
 
     // apply logo from config (CLI overrides config)
     if !args.logo_explicit {
         if let Some(ref name) = cfg.logo.name {
             args.logo = name.clone();
-            args.logo_explicit = true;
+            // don't set logo_explicit — presets (minimal, science) can still override
         }
     }
     if args.logo_file.is_none() {
@@ -923,11 +1071,18 @@ fn main() {
         || cfg.show.ip || cfg.show.ssh || cfg.show.ports;
     let si = info::collect_all(need_net, &cfg.show);
 
+    // science seed — one /proc/uptime read for both quote & logo
+    let sci_seed = uptime_seed();
+
     // build info column
-    let (info_lines, is_science) = build_info(&si, &cfg);
+    let (info_lines, is_science) = build_info(&si, &cfg, sci_seed);
 
     // ── blackhole mode: consume info_lines into out_lines ──
     if args.blackhole {
+        if !is_tty {
+            eprintln!("arcfetch: --blackhole requires a terminal");
+            return;
+        }
         let out_lines: Vec<String> = if args.no_color {
             info_lines.iter().map(|s| strip_ansi(s)).collect()
         } else {
@@ -950,16 +1105,33 @@ fn main() {
     };
 
     // load lines from a file — any number of lines, any width
+    // supports $1..$9 (inline color slots), $R (reset), $$ (literal $)
     let load_file = |path: &str| -> Option<Vec<String>> {
-        let expanded = if path.starts_with('~') {
-            env::var("HOME").ok()
-                .map(|h| path.replacen('~', &h, 1))
-                .unwrap_or_else(|| path.to_string())
-        } else {
-            path.to_string()
-        };
+        let expanded = expand_path(path);
         std::fs::read_to_string(&expanded).ok().map(|raw| {
-            raw.lines().map(String::from).collect()
+            let colors = &cfg.colors;
+            raw.lines().map(|line| {
+                let bytes = line.as_bytes();
+                let mut out = String::with_capacity(bytes.len() + 64);
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'$' && i + 1 < bytes.len() {
+                        let next = bytes[i + 1];
+                        if next >= b'1' && next <= b'9' {
+                            out.push_str(&colors.logo[(next - b'1') as usize]);
+                            i += 2; continue;
+                        }
+                        match next {
+                            b'R' => { out.push_str(RESET); i += 2; continue; }
+                            b'$' => { out.push('$'); i += 2; continue; }
+                            _ => {}
+                        }
+                    }
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                out
+            }).collect()
         })
     };
 
@@ -1008,8 +1180,8 @@ fn main() {
         let base = if args.logo == "auto" { detect_auto_logo() }
                    else if !args.logo_explicit && cfg.preset.as_deref() == Some("minimal") { "mini".into() }
                    else { args.logo.clone() };
-        if custom_lines.is_none() && is_science && base == "arch" {
-            science_logo().to_string()
+        if custom_lines.is_none() && is_science && !args.logo_explicit {
+            science_logo(sci_seed).to_string()
         } else {
             base
         }
@@ -1039,34 +1211,50 @@ fn main() {
     let mut out = String::with_capacity(4096);
     out.push('\n');
 
+    // emit kitty image escape first (the image IS the logo)
+    if let Some(ref img) = image_escape {
+        out.push_str(img);
+        out.push('\n');
+        // render info lines below the image, no logo needed
+        for line in &out_lines {
+            let _ = writeln!(out, "  {}", line);
+        }
+        out.push('\n');
+        unsafe { libc::write(1, out.as_ptr().cast::<core::ffi::c_void>(), out.len()); }
+        return;
+    }
+
     if let Some(ref lines) = custom_lines {
-        let logo_w = lines.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
+        // pre-compute visible widths for pre-processed lines (once, not per-frame)
+        let logo_widths: Vec<usize> = lines.iter().map(|l| visible_chars(l)).collect();
+        let logo_w = logo_widths.iter().max().copied().unwrap_or(0);
         let max_rows = lines.len().max(out_lines.len());
         for i in 0..max_rows {
             let ll   = lines.get(i).map(String::as_str).unwrap_or("");
-            let pad  = logo_w.saturating_sub(visible_chars(ll));
+            let pad  = logo_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
             let inf  = out_lines.get(i).map(String::as_str).unwrap_or("");
             if args.no_color {
-                let _ = write!(out, "  {}{:pad$}  {}\n", ll, "", inf, pad = pad);
+                let stripped = if ll.contains('\x1b') { strip_ansi(ll) } else { ll.to_string() };
+                let _ = write!(out, "  {}{:pad$}  {}\n", stripped, "", inf, pad = pad);
             } else {
-                let lc = if logo_name == "mini" { cfg.colors.label(i) } else { cfg.colors.accent.as_str() };
                 let _ = write!(out, "  {}{}{:pad$}{}  {}\n",
-                    lc, ll, "", RESET, inf, pad = pad);
+                    cfg.colors.accent, ll, "", RESET, inf, pad = pad);
             }
         }
     } else {
         let logo   = logos::from_name(&logo_name);
-        let logo_w = logo.iter().map(|l| visible_chars(l)).max().unwrap_or(36);
-        let logo_accent: &str = if logo_name == "gentoo" { config::MAUVE } else { cfg.colors.accent.as_str() };
+        // pre-compute visible widths for all logo lines (one pass)
+        let logo_widths: Vec<usize> = logo.iter().map(|l| visible_chars(l)).collect();
+        let logo_w = logo_widths.iter().max().copied().unwrap_or(36);
         let max_rows = logo.len().max(out_lines.len());
         for i in 0..max_rows {
             let ll   = logo.get(i).copied().unwrap_or("");
-            let pad  = logo_w.saturating_sub(visible_chars(ll));
+            let pad  = logo_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
             let inf  = out_lines.get(i).map(String::as_str).unwrap_or("");
             if args.no_color {
                 let _ = write!(out, "  {}{:pad$}  {}\n", ll, "", inf, pad = pad);
             } else {
-                let lc = if logo_name == "mini" { cfg.colors.label(i) } else { logo_accent };
+                let lc = logo_line_color(&logo_name, i, &cfg, args.color.is_some());
                 let _ = write!(out, "  {}{}{:pad$}{}  {}\n",
                     lc, ll, "", RESET, inf, pad = pad);
             }

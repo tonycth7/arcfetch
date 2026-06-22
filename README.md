@@ -2,49 +2,38 @@
 
 > *this is for you if you use arch. but it works everywhere else too.*
 
-arch linux sysinfo that's so fast it's almost rude — ~1.2ms in release, one `libc::write` and done. catppuccin mocha. 6 logos. zero overthinking. only dep is `libc`.
+arch linux sysinfo that's so fast it's almost rude — ~1.9ms default, ~2.6ms `--full`. one `libc::write` and done. catppuccin mocha. 10+ logos. zero overthinking. only dep is `libc`.
 
 ---
 
 ## what it looks like
 
 ```
-                  ▄                    tony@arch
-                 ▟█▙                   ─────────
-                ▟███▙                  os        Arch Linux
-               ▟█████▙                 kernel    7.0.11-arch1-1
-              ▟███████▙                uptime    3h 17m
-             ▂▔▀▜██████▙               pkgs      1227 (pacman)
-            ▟██▅▂▝▜█████▙              shell     zsh
-           ▟█████████████▙             de/wm     niri
-          ▟███████████████▙            term      alacritty
-         ▟█████████████████▙           cpu       AMD Ryzen 5 5625U (12x) @ 2.30 GHz
-        ▟███████████████████▙          gpu       AMD GPU (0x15e7)
-       ▟█████████▛▀▀▜████████▙         memory   ██████░░░░░░░░  6.9G / 15.0G
-      ▟████████▛      ▜███████▙
-     ▟█████████        ████████▙
-    ▟██████████        █████▆▅▄▃▂
-   ▟██████████▛        ▜█████████▙
-  ▟██████▀▀▀              ▀▀██████▙
- ▟███▀▘                       ▝▀███▙
-▟▛▀                               ▀▜▙
+        /\        tony@arch
+       /  \       ─────────
+      /    \      os        Arch Linux
+     /      \     uptime    1h 46m
+    /   ,,   \    pkgs      1288 (pacman)
+   /   |  |   \   shell     zsh
+  /_-''    ''-_\  term      alacritty
+                  battery   26% ↓
+                  memory   ███░░░░░░░░░░░  4.2G / 15.0G
+                  disk      112.4G / 455.9G
 ```
 
-or with the mini logo (auto-selected by `--preset minimal`):
+or with block arch (default):
 
 ```
-      /\         tony@arch
-     /  \        ─────────
-    /    \       os        Arch Linux
-   /      \      kernel    7.0.11-arch1-1
-  /   ,,   \     uptime    3h 17m
- /   |  |   \    pkgs      1227 (pacman)
-/_-''    ''-_\  shell     zsh
-                 de/wm     niri
-                 term      alacritty
-                 cpu       AMD Ryzen 5 5625U (12x) @ 2.30 GHz
-                 gpu       AMD GPU (0x15e7)
-                 memory   ██████░░░░░░░░  6.9G / 15.0G
+         ▟████▙               tony@arch
+        ▟██████▙              ─────────
+       ▟████████▙             os        Arch Linux
+      ▟██████████▙            uptime    1h 46m
+     ▂▔▀▜██████████▙          pkgs      1288 (pacman)
+    ▟██▅▂▝▜█████████▙        shell     zsh
+   ▟█████████████████▙       term      alacritty
+  ▟███████████████████▙      battery   26% ↓
+ ▟█████████▛▀▀▜██████████    memory   ███░░░░░░░░░░░  4.2G / 15.0G
+▟████████▛      ▜█████████▙  disk      112.4G / 455.9G
 ```
 
 ---
@@ -67,15 +56,15 @@ the disk renders as a rotating ring of block characters (`░` `▒` `▓` `█`
 
 ## speed
 
-| run          | time    |
-|--------------|---------|
-| arcfetch     | ~1.2ms  |
-| fastfetch    | ~31ms   |
-| neofetch     | ~300ms  |
+| run          | time     |
+|--------------|----------|
+| arcfetch     | ~1.9ms   |
+| fastfetch    | ~31ms    |
+| neofetch     | ~300ms   |
 
 no threads, no subprocesses, no waiting. cpuid for the cpu (zero i/o). `libc::sysinfo` + `libc::uname` for uptime and kernel — one syscall each. two-tier cache (`/dev/shm` + `~/.cache`) means the second run is even faster than the first.
 
-only 10 fields by default: os, kernel, uptime, pkgs, shell, de/wm, term, cpu, gpu, memory. no disk, no swatches, no load. just what you actually look at.
+default fields: os, kernel, uptime, pkgs, shell, term, cpu, memory, battery, disk. configurable via `[show]` in config or `--full` / `--preset`.
 
 ---
 
@@ -112,14 +101,16 @@ cp target/release/arcfetch ~/.local/bin/
 ```bash
 arcfetch                          # default — clean, fast
 arcfetch --logo mini              # compact ascii arch
-arcfetch --preset minimal         # os kernel uptime memory battery
-arcfetch --preset hacker          # kernel uptime cpu gpu gpu_temp mem disk load ip ssh ports
+arcfetch --preset minimal         # os kernel uptime pkgs shell term cpu memory
+arcfetch --preset hacker          # kernel uptime cpu gpu gpu_temp mem disk load ip
 arcfetch --preset science         # random logo + physicist quote
 arcfetch --full                   # most fields
 arcfetch --no-color               # plain text, pipe-friendly
 ```
 
 ---
+
+
 ```bash
 arcfetch                          # block arch (default)
 arcfetch --logo mini              # compact 7-line arch
@@ -127,6 +118,7 @@ arcfetch --logo ascii             # dotty neofetch-style
 arcfetch --logo tux               # linux penguin
 arcfetch --logo nix               # nixos snowflake
 arcfetch --logo gentoo            # gentoo G
+arcfetch --logo pi                # raspberry pi
 arcfetch --logo auto              # detect from /etc/os-release
 arcfetch --logo custom            # ~/.config/arcfetch/logo.txt
 arcfetch --logo-file <path>       # any ascii art or image (kitty protocol)
@@ -141,7 +133,9 @@ arcfetch --blackhole              # m87 accretion disk (3s)
 arcfetch --blackhole --t 0        # infinite loop
 arcfetch --mandelbrot [iter]      # mandelbrot fractal as logo
 arcfetch --quantum                # wave-function collapse
+arcfetch --quantum --t 5          # 5s quantum animation
 arcfetch --cosmic                 # starfield + moon phase
+arcfetch --cosmic --t 10          # 10s cosmic animation
 ```
 
 mutually exclusive. pick one.
@@ -168,15 +162,27 @@ c4 = teal
 c5 = green
 c6 = yellow
 c7 = peach
-values   = subtext1
-sep      = overlay0
-bar      = blue
+values = subtext1
+sep    = overlay0
+bar    = blue
+
+# custom logo file colors ($1..$9 placeholders)
+# defaults: c1..c7 + accent + text
+logo1 = blue
+logo2 = sapphire
+logo3 = sky
+logo4 = teal
+logo5 = green
+logo6 = yellow
+logo7 = peach
+logo8 = mauve
+logo9 = text
 
 [show]
+header      = both         # both | user | host | none
 os          = true
 kernel      = true
 uptime      = true
-res         = false
 pkgs        = true
 shell       = true
 de_wm       = true
@@ -186,19 +192,44 @@ gpu         = true
 memory      = true
 disk        = false
 battery     = false
-load        = false
-locale      = false
-ip          = false
-ssh         = false
-ports       = false
-swatches    = false
+
+# extra fields (hidden by default)
+res         = false        # screen resolution
+load        = false        # system load
+locale      = false        # system locale
+ip          = false        # local IP
+swatches    = false        # color palette row
+color_bar   = false        # neofetch-style 8-color bar
+swap        = false        # swap usage
+sound       = false        # audio server (pipewire/pulse/alsa)
+gpu_driver  = false        # gpu driver version
+gpu_temp    = false        # gpu temperature
+bios        = false        # bios version + date
+board       = false        # motherboard vendor + model
+disk_type   = false        # ssd / nvme / hdd
+pkg_updates = false        # available updates (pacman -Qu)
+theme       = false        # gtk theme
+icons       = false        # icon theme
+term_font   = false        # terminal font
+de_wm_ver   = false        # desktop environment version
+init_ver    = false        # init system version
+local_ip    = false        # interface + local ip
+ssh         = false        # ssh sessions
+ports       = false        # listening ports
 
 [logo]
-# name = arch         # arch | ascii | tux | nix | gentoo | mini | auto
-# file = <path>       # custom ascii file (overrides name)
+# name = arch          # arch | ascii | tux | nix | gentoo | mini | pi | auto
+# file = <path>        # custom ascii file (overrides name)
 
 [template]
-preset = full
+preset = full           # full | minimal | hacker | science
+```
+
+logos and presets can be overridden via CLI — handy for one-off flexes:
+
+```bash
+arcfetch --logo nix               # nixos snowflake even if config says arch
+arcfetch --preset science          # physicist quote even in minimal config
 ```
 
 ---
@@ -207,19 +238,58 @@ preset = full
 
 ```
 -h,  --help               this
--V,  --version            version + e=mc2
+-V,  --version            version + e=mc²
      --config             config reference + write sample
      --full               show most fields
      --preset <n>         full | minimal | hacker | science
-     --logo <name>        arch | mini | ascii | tux | nix | gentoo | auto | custom
-     --logo-file <path>   ascii art or image file
+     --logo <name>        arch | mini | ascii | tux | nix | gentoo | pi | auto | custom
+     --logo-file <path>   ascii art or image file (supports $1..$9 color tokens)
      --accent <color>     hex (#rrggbb) or catppuccin name
+     --color <scheme>     logo color: name | #hex | random
      --no-color           strip ansi
      --blackhole          m87 accretion disk animation
      --mandelbrot [iter]  mandelbrot fractal (default 64)
      --quantum            wave-function collapse
      --cosmic             starfield + moon
-     --t <secs>           0=forever, n=n secs (blackhole & cosmic)
+     --t <secs>           0=forever, n=n secs (blackhole, quantum, cosmic)
+```
+
+---
+
+## custom logo colors
+
+your custom ASCII art (via `--logo-file` or `[logo] file =`) can use inline color tokens:
+
+```
+$1  → logo1 (default: blue)
+$2  → logo2 (default: sapphire)
+$3  → logo3 (default: sky)
+... up to
+$9  → logo9 (default: text)
+```
+
+no tokens = default accent color. tokens expand at load time — zero per-frame cost.
+
+---
+
+## logo colors
+
+built-in logos use official distro colors:
+
+| logo    | scheme                     |
+|---------|----------------------------|
+| nix     | dark blue + light blue     |
+| gentoo  | dark purple + light purple |
+| mini    | cycling c1-c7 label colors |
+| others  | accent color (configurable) |
+
+override the accent for single-color logos:
+
+```bash
+arcfetch --color red            # solid red logo
+arcfetch --color "#00ff00"      # hex green
+arcfetch --color random         # random palette each run
+arcfetch --color blue --logo nix # nix keeps its official scheme
 ```
 
 ---
@@ -230,12 +300,12 @@ everything in `src/`:
 
 | file              | what                                  |
 |-------------------|---------------------------------------|
-| `main.rs`         | cli, render, anims, entrypoint        |
-| `info.rs`         | cpu, gpu, kernel, uptime, memory      |
+| `main.rs`         | cli, render, anims, entrypoint, color bar |
+| `info.rs`         | 25+ collectors — cpu, gpu, kernel, mem, swap, bios, board, ip … |
 | `pkgs.rs`         | pacman, dpkg, rpm, nix, apk, portage  |
 | `cache.rs`        | `/dev/shm` + `~/.cache` with ttl      |
 | `config.rs`       | catppuccin palette + toml parser      |
-| `logos.rs`        | 6 logos + auto-detect + custom loader |
+| `logos.rs`        | 10+ logos + auto-detect + custom loader |
 | `mandelbrot.rs`   | mandelbrot set in rust                |
 | `cosmic.rs`       | starfield + moon phase                |
 | `flake.nix`       | nix flake for reproducible builds     |
@@ -245,7 +315,6 @@ everything in `src/`:
 ## requirements
 
 - any linux — package count is the only arch-specific thing
-- rust 1.85+ (edition 2024)
 - true-color terminal (anything from 2015 onwards)
 - curiosity about what a terminal can do
 

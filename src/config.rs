@@ -52,6 +52,12 @@ pub const OVERLAY0:  &str = "\x1b[38;2;108;112;134m";
 pub const BOLD:      &str = "\x1b[1m";
 pub const RESET:     &str = "\x1b[0m";
 
+// ── Official distro colors ────────────────────────────────
+pub const NIX_DARK:   &str = "\x1b[38;2;82;119;195m";    // #5277C3
+pub const NIX_LIGHT:  &str = "\x1b[38;2;126;186;228m";   // #7EBAE4
+pub const GENTOO_DARK:  &str = "\x1b[38;2;84;72;122m";     // #54487A
+pub const GENTOO_LIGHT: &str = "\x1b[38;2;155;114;176m";   // #9B72B0
+
 // ── name → ANSI escape ───────────────────────────────────
 pub fn name_to_ansi(name: &str) -> &'static str {
     // also accepts #RRGGBB — but we return a static str so hex is handled
@@ -100,6 +106,7 @@ pub struct Colors {
     pub values:   String,
     pub sep:      String,
     pub bar:      String,
+    pub logo:     [String; 9],  // $1..$9 inline color slots for custom logos
 }
 
 impl Colors {
@@ -122,6 +129,11 @@ impl Default for Colors {
             values:   SUBTEXT1.into(),
             sep:      OVERLAY0.into(),
             bar:      BLUE.into(),
+            logo:     [
+                BLUE.into(), SAPPHIRE.into(), SKY.into(), TEAL.into(),
+                GREEN.into(), YELLOW.into(), PEACH.into(),
+                BLUE.into(), TEXT.into(),
+            ],
         }
     }
 }
@@ -145,7 +157,7 @@ pub struct Show {
     pub os:           bool,
     pub kernel:       bool,
     pub uptime:       bool,
-    pub uptime_long:  bool,   // true = "1 day, 2 hours, 30 mins" / false = "1d 2h 30m"
+    pub uptime_long:  bool,
     pub res:          bool,
     pub pkgs:         bool,
     pub shell:        bool,
@@ -168,6 +180,21 @@ pub struct Show {
     pub processes:    bool,
     pub container:    bool,
     pub session:      bool,
+    // new fastfetch-inspired fields
+    pub swap:         bool,
+    pub sound:        bool,
+    pub gpu_driver:   bool,
+    pub bios:         bool,
+    pub board:        bool,
+    pub disk_type:    bool,
+    pub pkg_updates:  bool,
+    pub theme:        bool,
+    pub icons:        bool,
+    pub term_font:    bool,
+    pub de_wm_ver:    bool,
+    pub init_ver:     bool,
+    pub local_ip:     bool,
+    pub color_bar:    bool,
 }
 
 impl Default for Show {
@@ -182,6 +209,11 @@ impl Default for Show {
             swatches: false,
             init: false, cpu_temp: false, processes: false,
             container: false, session: false,
+            swap: false, sound: false, gpu_driver: false,
+            bios: false, board: false, disk_type: false,
+            pkg_updates: false, theme: false, icons: false,
+            term_font: false, de_wm_ver: false, init_ver: false,
+            local_ip: false, color_bar: false,
         }
     }
 }
@@ -198,6 +230,11 @@ impl Show {
             swatches: false,
             init: false, cpu_temp: false, processes: false,
             container: false, session: false,
+            swap: false, sound: false, gpu_driver: false,
+            bios: false, board: false, disk_type: false,
+            pkg_updates: false, theme: false, icons: false,
+            term_font: false, de_wm_ver: false, init_ver: false,
+            local_ip: false, color_bar: false,
         };
         match preset.trim() {
             "minimal" => {
@@ -230,6 +267,11 @@ impl Show {
                     swatches: true,
                     init: true, cpu_temp: true, processes: true,
                     container: false, session: true,
+                    swap: true, sound: true, gpu_driver: true,
+                    bios: false, board: false, disk_type: true,
+                    pkg_updates: false, theme: true, icons: false,
+                    term_font: false, de_wm_ver: false, init_ver: true,
+                    local_ip: true, color_bar: false,
                 };
             }
         }
@@ -263,6 +305,20 @@ impl Show {
             "processes"   => self.processes  = val,
             "container"   => self.container  = val,
             "session"     => self.session    = val,
+            "swap"        => self.swap       = val,
+            "sound"       => self.sound      = val,
+            "gpu_driver"  => self.gpu_driver = val,
+            "bios"        => self.bios       = val,
+            "board"       => self.board      = val,
+            "disk_type"   => self.disk_type  = val,
+            "pkg_updates" => self.pkg_updates= val,
+            "theme"       => self.theme      = val,
+            "icons"       => self.icons      = val,
+            "term_font"   => self.term_font  = val,
+            "de_wm_ver"   => self.de_wm_ver  = val,
+            "init_ver"    => self.init_ver   = val,
+            "local_ip"    => self.local_ip   = val,
+            "color_bar"   => self.color_bar  = val,
             _ => {}
         }
     }
@@ -309,6 +365,7 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
     let mut show   = Show::default();
     let mut preset: Option<String> = None;
     let mut logo   = Logo::default();
+    let mut header_explicit = false;
 
     // override accent from env var
     let env_accent = env::var("ARCFETCH_ACCENT").ok();
@@ -320,16 +377,28 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
     let path = config_path();
     if let Ok(content) = fs::read_to_string(&path) {
         let mut section = "";
-        for line in content.lines() {
-            let line = line.trim();
+        for (lineno, raw_line) in content.lines().enumerate() {
+            let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') { continue; }
 
-            if line.starts_with('[') && line.ends_with(']') {
-                section = &line[1..line.len()-1];
+            // strip inline comment before checking section header
+            let header_part = line.split('#').next().unwrap_or("").trim();
+            if header_part.starts_with('[') {
+                if let Some(close) = header_part.find(']') {
+                    let name = header_part[1..close].trim();
+                    if !name.is_empty() {
+                        section = name;
+                        continue;
+                    }
+                }
+                eprintln!("arcfetch: warning: invalid section header at line {}: {}", lineno + 1, raw_line);
                 continue;
             }
 
-            let Some((key, val)) = line.split_once('=') else { continue };
+            let Some((key, val)) = line.split_once('=') else {
+                eprintln!("arcfetch: warning: skipping unparseable line {}: {}", lineno + 1, raw_line);
+                continue;
+            };
             let key = key.trim();
             let val = val.split('#').next().unwrap_or("").trim(); // strip inline comment
 
@@ -350,11 +419,21 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
                         "c5"       => colors.labels[4]  = ansi,
                         "c6"       => colors.labels[5]  = ansi,
                         "c7"       => colors.labels[6]  = ansi,
+                        "logo1"    => colors.logo[0]    = ansi,
+                        "logo2"    => colors.logo[1]    = ansi,
+                        "logo3"    => colors.logo[2]    = ansi,
+                        "logo4"    => colors.logo[3]    = ansi,
+                        "logo5"    => colors.logo[4]    = ansi,
+                        "logo6"    => colors.logo[5]    = ansi,
+                        "logo7"    => colors.logo[6]    = ansi,
+                        "logo8"    => colors.logo[7]    = ansi,
+                        "logo9"    => colors.logo[8]    = ansi,
                         _ => {}
                     }
                 }
                 "show" => {
                     if key == "header" {
+                        header_explicit = true;
                         show.header = match val {
                             "user"     | "username" => Header::UserOnly,
                             "host"     | "hostname" => Header::HostOnly,
@@ -384,8 +463,12 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
     // CLI preset overrides file preset
     if let Some(p) = cli_preset { preset = Some(p.to_string()); }
 
-    // apply preset (overrides [show] if set)
-    if let Some(p) = &preset { show.apply_preset(p); }
+    // apply preset (overrides [show] if set, but preserves explicit header)
+    if let Some(p) = &preset {
+        let saved_header = if header_explicit { Some(show.header.clone()) } else { None };
+        show.apply_preset(p);
+        if let Some(h) = saved_header { show.header = h; }
+    }
 
     // CLI / env accent wins over file
     if let Some(a) = accent_override {
