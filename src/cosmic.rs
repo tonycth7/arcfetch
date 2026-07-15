@@ -62,11 +62,12 @@ pub fn run(out_lines: &[String], _logo_name: &str, _cfg: &Config, args: &super::
     };
     let mut rng = seed;
 
-    let mut stars = [(0usize, 0usize, 0u8); STARS];
-    for s in stars.iter_mut() {
-        s.0 = rng_next(&mut rng) as usize % COLS;
-        s.1 = rng_next(&mut rng) as usize % ROWS;
-        s.2 = (rng_next(&mut rng) as u8 % 5) + 1;
+    let mut stars = [[0u8; COLS]; ROWS];
+    for _ in 0..STARS {
+        let col = rng_next(&mut rng) as usize % COLS;
+        let row = rng_next(&mut rng) as usize % ROWS;
+        let bri = (rng_next(&mut rng) as u8 % 5) + 1;
+        if stars[row][col] == 0 { stars[row][col] = bri; }
     }
 
     let mut shooting: Option<(f64, f64, f64, u64)> = None;
@@ -98,11 +99,11 @@ pub fn run(out_lines: &[String], _logo_name: &str, _cfg: &Config, args: &super::
 
         for r in 0..ROWS {
             write!(buf, "\x1b[K").ok();
-            let mut sl = vec![' '; COLS];
-            for (sx, sy, sb) in &stars {
-                if *sy == r {
-                    let t = ((frame.wrapping_add(*sy as u64 * 7).wrapping_add(*sx as u64 * 13)) % 8) as u8;
-                    sl[*sx] = star_char(sb.saturating_sub(t / 3));
+            let mut sl = [' '; COLS];
+            for (c, &sb) in stars[r].iter().enumerate() {
+                if sb > 0 {
+                    let t = ((frame.wrapping_add(r as u64 * 7).wrapping_add(c as u64 * 13)) % 8) as u8;
+                    sl[c] = star_char(sb.saturating_sub(t / 3));
                 }
             }
             if let Some((sx, sy, _, _)) = shooting {

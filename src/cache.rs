@@ -2,9 +2,12 @@ use std::{env, fs, time::{SystemTime, UNIX_EPOCH}};
 
 const CACHE_DIR: &str = "/dev/shm/arcfetch";
 
-fn persistent_dir() -> String {
-    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{home}/.cache/arcfetch")
+fn persistent_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{home}/.cache/arcfetch")
+    })
 }
 
 fn now_secs() -> u64 {

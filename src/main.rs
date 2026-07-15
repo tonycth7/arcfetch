@@ -185,12 +185,16 @@ fn build_info(si: &info::SysInfo, cfg: &Config, sci_seed: usize) -> (Vec<String>
 
     // ── header ────────────────────────────────────────────
     use config::Header;
-    let username = env::var("USER").or_else(|_| env::var("LOGNAME")).unwrap_or_else(|_| "user".into());
-    let hostname = {
-        let mut buf = [0i8; 256];
-        if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } == 0 {
-            unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
-        } else { "localhost".into() }
+    let (username, hostname) = if sh.header != Header::None {
+        (env::var("USER").or_else(|_| env::var("LOGNAME")).unwrap_or_else(|_| "user".into()),
+         {
+            let mut buf = [0i8; 256];
+            if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } == 0 {
+                unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
+            } else { "localhost".into() }
+        })
+    } else {
+        (String::new(), String::new())
     };
 
     match &sh.header {
@@ -420,12 +424,16 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
     write!(buf, "\x1b[?25l").ok();
 
     // ── background star positions — 40 fixed stars ──────────
-    let mut stars = [(0usize, 0usize, 0u64); 40];
-    for (i, s) in stars.iter_mut().enumerate() {
+    let mut stars = [[0u8; BH_COLS]; BH_ROWS];
+    let mut star_phase = [0u64; 40];
+    for i in 0usize..40 {
         let h = i.wrapping_mul(0x9e37_79b9);
-        s.0 = 2 + (h & 0x2f) as usize;         // col offset
-        s.1 = 1 + ((h >> 8) & 0x1f) as usize;  // row offset
-        s.2 = (h >> 16) as u64 & 0x3f;          // phase
+        let col = 2 + (h & 0x2f) as usize;
+        let row = 1 + ((h >> 8) & 0x1f) as usize;
+        star_phase[i] = (h >> 16) as u64 & 0x3f;
+        if col < BH_COLS && row < BH_ROWS {
+            stars[row][col] = (i + 1) as u8;
+        }
     }
 
     let mut frame = 0u64;
@@ -476,25 +484,21 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
                     }
                 }
                 // ── background star ─────────────────────────
-                let mut star_rendered = false;
-                for s in &stars {
-                    if s.0 == c && s.1 == r {
-                        let phase = (frame.wrapping_add(s.2)) & 0x1f;
-                        if phase < 22 {
-                            let star_colors = [OVERLAY0, LAVENDER, MAUVE, TEXT, SKY, BLUE];
-                            let ci = (s.2 as usize + frame as usize) % star_colors.len();
-                            let sc = if phase < 4 { star_colors[(ci + 1) % star_colors.len()] }
-                                     else { star_colors[ci] };
-                            write!(buf, "{}{}",
-                                RESET, sc).ok();
-                            write!(buf, "{}", '\u{00b7}').ok();
-                            prev = "";
-                            star_rendered = true;
-                        }
-                        break;
+                let si = stars[r][c];
+                if si > 0 {
+                    let idx = (si - 1) as usize;
+                    let phase = (frame.wrapping_add(star_phase[idx])) & 0x1f;
+                    if phase < 22 {
+                        let star_colors = [OVERLAY0, LAVENDER, MAUVE, TEXT, SKY, BLUE];
+                        let ci = (star_phase[idx] as usize + frame as usize) % star_colors.len();
+                        let sc = if phase < 4 { star_colors[(ci + 1) % star_colors.len()] }
+                                 else { star_colors[ci] };
+                        write!(buf, "{}{}", RESET, sc).ok();
+                        write!(buf, "{}", '\u{00b7}').ok();
+                        prev = "";
+                        continue;
                     }
                 }
-                if star_rendered { continue; }
                 // ── accretion disk ──────────────────────────
                 let (color, ch) = bh_cell(c, r, CX, CY, rot);
                 // ── relativistic jet (poles) ────────────────
@@ -557,9 +561,10 @@ fn run_quantum(info_lines: &[String], logo_name: &str, custom_lines: &Option<Vec
     let mut buf = out.lock();
     write!(buf, "\x1b[?25l").ok();
 
+    let out_lines: Vec<String> = info_lines.iter().map(|s| if args.no_color { strip_ansi(s) } else { s.clone() }).collect();
+
     for frame in 0..FADES {
         write!(buf, "\x1b[H").ok();
-        let out_lines: Vec<String> = info_lines.iter().map(|s| if args.no_color { strip_ansi(s) } else { s.clone() }).collect();
 
         // wave collapse — ripple envelope per line
         let faded: Vec<String> = out_lines.iter().enumerate().map(|(li, line)| {
@@ -632,23 +637,22 @@ fn run_quantum(info_lines: &[String], logo_name: &str, custom_lines: &Option<Vec
 
     // flash — measurement collapse
     write!(buf, "\x1b[H").ok();
-    let final_lines: Vec<String> = info_lines.iter().map(|s| if args.no_color { strip_ansi(s) } else { s.clone() }).collect();
     writeln!(buf).ok();
     if let Some(lines) = custom_lines {
-        let max_rows = lines.len().max(final_lines.len());
+        let max_rows = lines.len().max(out_lines.len());
         for i in 0..max_rows {
             let ll  = lines.get(i).map(String::as_str).unwrap_or("");
             let pad = logo_max_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
-            let inf = final_lines.get(i).map(String::as_str).unwrap_or("");
+            let inf = out_lines.get(i).map(String::as_str).unwrap_or("");
             writeln!(buf, "  {}{}  {}", ll, " ".repeat(pad), inf).ok();
         }
     } else {
         let logo   = logos::from_name(logo_name);
-        let max_rows = logo.len().max(final_lines.len());
+        let max_rows = logo.len().max(out_lines.len());
         for i in 0..max_rows {
             let ll  = logo.get(i).copied().unwrap_or("");
             let pad = logo_max_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
-            let inf = final_lines.get(i).map(String::as_str).unwrap_or("");
+            let inf = out_lines.get(i).map(String::as_str).unwrap_or("");
             let lc = logo_line_color(logo_name, i, cfg, args.color.is_some());
             writeln!(buf, "  {lc}{ll}{pad}{R}  {inf}\n",
                 lc = lc, ll = ll,
@@ -720,7 +724,7 @@ fn parse_args() -> Args {
             "--accent"    => { i += 1; if i < raw.len() { a.accent = Some(raw[i].clone()); } }
             "--color"     => { i += 1; if i < raw.len() { a.color = Some(raw[i].clone()); } }
             "--preset"    => { i += 1; if i < raw.len() { a.preset = Some(raw[i].clone()); } }
-            "--t"         => { i += 1; if i < raw.len() { a.duration = raw[i].parse().ok(); } }
+            "-t" | "--t" => { i += 1; if i < raw.len() { a.duration = raw[i].parse().ok(); } }
             _             => {}
         }
         i += 1;
@@ -939,7 +943,7 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}-V, --version{r}              version + E=mc² joke", b=b, g=g, r=r);
     println!("    {b}{g}--config{r}                   show config ref + write sample file", b=b, g=g, r=r);
     println!("    {b}{g}--blackhole{r}                {MAUVE}M87 accretion disk animation{r}", b=b, g=g, r=r, MAUVE=MAUVE);
-    println!("    {b}{g}--t <secs>{r}                 {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}-t, --t <secs>{r}            {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo <name>{r}              switch logo {s}(arch|mini|nix|ascii|auto…){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo-file <path>{r}         {s}ASCII art or image (kitty protocol){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--preset <n>{r}               {s}full|minimal|hacker|science{r}", b=b, g=g, r=r, s=s);
@@ -950,7 +954,6 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}--mandelbrot [iter]{r}        {GREEN}Mandelbrot set as logo{r}", b=b, g=g, r=r, GREEN=GREEN);
     println!("    {b}{g}--quantum{r}                  {MAUVE}wave-function collapse animation{r}", b=b, g=g, r=r, MAUVE=MAUVE);
     println!("    {b}{g}--cosmic{r}                   {SKY}starfield + moon + shooting stars{r}", b=b, g=g, r=r, SKY=SKY);
-    println!("    {b}{g}--t <secs>{r}                 {s}0=infinite  N=N seconds (blackhole & cosmic){r}", b=b, g=g, r=r, s=s);
     println!();
     println!("  {b}{TEAL}logos{r}", b=b, TEAL=TEAL, r=r);
 
@@ -1097,10 +1100,10 @@ fn main() {
 
     // default custom logo path: ~/.config/arcfetch/logo.txt
     let default_custom = {
-        let cfg_dir = config::config_path()
+        let cfg_dir = cfg_path
             .rsplit_once('/')
             .map(|(d, _)| d.to_string())
-            .unwrap_or_else(|| "~/.config/arcfetch".into());
+            .unwrap_or_else(|| format!("{}/.config/arcfetch", env::var("HOME").unwrap_or_default()));
         format!("{}/logo.txt", cfg_dir)
     };
 

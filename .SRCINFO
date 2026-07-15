@@ -1,6 +1,6 @@
 pkgbase = arcfetch
 	pkgdesc = Blazing-fast Arch Linux sysinfo — Catppuccin Mocha, 8 logos, blackhole mode
-	pkgver = 0.7.0
+	pkgver = 1.0.8
 	pkgrel = 1
 	url = https://github.com/tonycth7/arcfetch
 	arch = x86_64
@@ -11,7 +11,7 @@ pkgbase = arcfetch
 	depends = gcc-libs
 	provides = arcfetch
 	conflicts = arcfetch
-	source = arcfetch::git+https://github.com/tonycth7/arcfetch.git#tag=v0.7.0
+	source = arcfetch::git+https://github.com/tonycth7/arcfetch.git#tag=v1.0.8
 	sha256sums = SKIP
 
 pkgname = arcfetch
