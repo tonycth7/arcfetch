@@ -7,11 +7,10 @@ pkgbase = arcfetch
 	arch = aarch64
 	license = MIT
 	makedepends = cargo
-	makedepends = git
 	depends = gcc-libs
 	provides = arcfetch
 	conflicts = arcfetch
-	source = arcfetch::git+https://github.com/tonycth7/arcfetch.git#tag=v1.0.8
-	sha256sums = SKIP
+	source = https://github.com/tonycth7/arcfetch/archive/v1.0.8.tar.gz
+	sha256sums = e2ab68a49107d822fc67b824dae766658c63aad5300d2f8226b80b8604fddedc
 
 pkgname = arcfetch

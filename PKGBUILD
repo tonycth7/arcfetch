@@ -8,32 +8,32 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/tonycth7/arcfetch"
 license=('MIT')
 depends=('gcc-libs')
-makedepends=('cargo' 'git')
+makedepends=('cargo')
 provides=('arcfetch')
 conflicts=('arcfetch')
-source=("$pkgname::git+$url.git#tag=v$pkgver")
-sha256sums=('SKIP')
+source=("$url/archive/v$pkgver.tar.gz")
+sha256sums=('e2ab68a49107d822fc67b824dae766658c63aad5300d2f8226b80b8604fddedc')
 
 prepare() {
-    cd "$pkgname"
+    cd "$srcdir/$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$pkgname"
+    cd "$srcdir/$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     cargo build --frozen --release
 }
 
 check() {
-    cd "$pkgname"
+    cd "$srcdir/$pkgname-$pkgver"
     cargo test --frozen 2>/dev/null || true
 }
 
 package() {
-    cd "$pkgname"
+    cd "$srcdir/$pkgname-$pkgver"
     install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE" 2>/dev/null || true
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
