@@ -7,6 +7,8 @@ mod cosmic;
 mod info;
 mod logos;
 mod mandelbrot;
+mod modules;
+mod net;
 mod pkgs;
 
 use std::{env, thread};
@@ -56,7 +58,7 @@ fn strip_ansi(s: &str) -> String {
                 continue;
             }
             if ch == '\\' { esc = false; continue; }  // ST
-            if ch >= '\x40' && ch <= '\x7e' { esc = false; }  // CSI final byte
+            if ('\x40'..='\x7e').contains(&ch) { esc = false; }  // CSI final byte
             continue;
         }
         out.push(ch);
@@ -80,7 +82,7 @@ fn visible_chars(s: &str) -> usize {
                 continue;
             }
             if ch == '\\' { esc = false; continue; }
-            if ch >= '\x40' && ch <= '\x7e' { esc = false; }
+            if ('\x40'..='\x7e').contains(&ch) { esc = false; }
             continue;
         }
         n += 1;
@@ -92,7 +94,7 @@ fn visible_chars(s: &str) -> usize {
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
@@ -108,7 +110,7 @@ fn base64_encode(data: &[u8]) -> String {
 
 fn expand_path(path: &str) -> String {
     if path.starts_with('~') {
-        if let Some(home) = env::var("HOME").ok() {
+        if let Ok(home) = env::var("HOME") {
             path.replacen('~', &home, 1)
         } else { path.to_string() }
     } else { path.to_string() }
@@ -129,12 +131,21 @@ fn kitty_image(path: &str) -> Option<String> {
 }
 
 fn uptime_seed() -> usize {
-    std::fs::read_to_string("/proc/uptime")
-        .unwrap_or_default()
-        .split('.')
-        .next()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    info::system_uptime_secs() as usize
+}
+
+/// System hostname via `gethostname(2)`, or `"localhost"` on failure.
+fn hostname() -> String {
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes.
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } == 0 {
+        // SAFETY: `gethostname` NUL-terminates within `buf` on success.
+        unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        "localhost".into()
+    }
 }
 
 fn science_quote(seed: usize) -> &'static str {
@@ -159,22 +170,215 @@ fn science_logo(seed: usize) -> &'static str {
     ["dna", "atom", "wave", "emc2", "pi"][seed % 5]
 }
 
-fn detect_auto_logo() -> String {
+fn detect_auto_logo(si: &info::SysInfo) -> String {
+    if !si.os_id.is_empty() {
+        return logos::detect(&si.os_id, &si.os_id_like).to_string();
+    }
     let raw = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-    let mut id = "";
-    for line in raw.lines() {
-        if let Some(v) = line.strip_prefix("ID=") { id = v.trim_matches('"'); }
+    let field = |k: &str| -> String {
+        raw.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .unwrap_or_default()
+    };
+    logos::detect(&field("ID="), &field("ID_LIKE=")).to_string()
+}
+
+// ── animated logo mode (procedural engine from logos.rs) ──
+
+fn parse_effect(s: &str) -> logos::AnimEffect {
+    match s.trim().to_ascii_lowercase().as_str() {
+        // `frames`/`wave` add no glyph distortion — they let the native
+        // keyframes (atom/dna/arcreactor) and the colour wave speak for themselves.
+        "none" | "off" | "frames" | "keyframes" | "wave" | "rainbow"
+                                         => logos::AnimEffect::None,
+        "scanline" | "scan" | "crt"      => logos::AnimEffect::Scanline,
+        "boot" | "bootreveal" | "reveal" => logos::AnimEffect::BootReveal,
+        _                                => logos::AnimEffect::Shimmer,
     }
-    match id {
-        "arch" | "archarm"     => "arch".into(),
-        "nixos"                => "nix".into(),
-        "debian" | "ubuntu"
-        | "linuxmint"
-        | "pop" | "elementary" => "tux".into(),
-        "void"                 => "tux".into(),
-        "gentoo"               => "gentoo".into(),
-        _                      => "arch".into(),
+}
+
+/// Enter the terminal's alternate screen buffer (used by full-screen modes).
+/// The user's shell stays untouched underneath and is restored on exit.
+fn screen_enter<W: Write>(buf: &mut W) {
+    write!(buf, "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l").ok();
+    buf.flush().ok();
+}
+
+/// Leave the alternate screen buffer and restore the cursor.
+fn screen_leave<W: Write>(buf: &mut W) {
+    write!(buf, "{RESET}\x1b[?25h\x1b[?1049l").ok();
+    buf.flush().ok();
+}
+
+/// Colour each character of `line` from a flowing palette wave.
+fn wave_text(line: &str, row: usize, tick: usize, palette: &[String]) -> String {
+    let last = palette.len().saturating_sub(1);
+    let mut s = String::with_capacity(line.len() * 8);
+    for (col, ch) in line.chars().enumerate() {
+        let phase = logos::color_wave_phase(row, col, tick);
+        let idx = ((phase * last as f32).round() as usize).min(last);
+        s.push_str(&palette[idx]);
+        s.push(ch);
     }
+    s.push_str(RESET);
+    s
+}
+
+/// Short, self-overwriting intro played before the normal static render.
+/// Animated logos (atom/dna/arcreactor) cycle frames; others can shimmer.
+fn run_intro(
+    info: &[String],
+    logo_name: &str,
+    cfg: &Config,
+    args: &Args,
+    anim: &config::Animation,
+) {
+    use std::fmt::Write as _;
+    const FRAME_MS: u64 = 70;
+
+    let frames = (anim.intro_ms / FRAME_MS).clamp(1, 24);
+    let animated_logo = matches!(logo_name, "atom" | "dna" | "arcreactor");
+    let effect = if animated_logo {
+        logos::AnimEffect::None
+    } else {
+        parse_effect(&anim.effect)
+    };
+
+    RUNNING.store(true, Ordering::Relaxed);
+    unsafe {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(sig, sigint_handler as *const () as libc::sighandler_t);
+        }
+    }
+
+    let out = stdout();
+    let mut buf = out.lock();
+    write!(buf, "\x1b[?25l").ok();
+
+    let mut prev_nl = 0usize;
+    for tick in 0..frames {
+        if !RUNNING.load(Ordering::Relaxed) { break; }
+        let base: Vec<String> = logos::from_name_frame(logo_name, (tick / 3) as usize)
+            .iter().map(|s| (*s).to_string()).collect();
+        let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
+        let logo_w = widths.iter().max().copied().unwrap_or(36);
+        let rows = base.len().max(info.len());
+
+        let mut frame = String::with_capacity(8192);
+        if prev_nl > 0 { let _ = write!(frame, "\x1b[{prev_nl}A\r"); }
+        frame.push('\n');
+
+        for i in 0..rows {
+            let raw  = base.get(i).map(String::as_str).unwrap_or("");
+            let line = logos::animate_line(raw, i, tick as usize, effect);
+            let pad  = logo_w.saturating_sub(widths.get(i).copied().unwrap_or(0));
+            let inf  = info.get(i).map(String::as_str).unwrap_or("");
+
+            if args.no_color {
+                let _ = write!(frame, "  {}{}  {}\n", line, " ".repeat(pad), inf);
+            } else if animated_logo && anim.wave {
+                let shown = wave_text(&line, i, tick as usize, &cfg.colors.logo);
+                let _ = write!(frame, "  {}{}  {}\n", shown, " ".repeat(pad), inf);
+            } else {
+                let lc = logo_line_color(logo_name, i, cfg, args.color.is_some());
+                let _ = write!(frame, "  {}{}{}{}  {}\n", lc, line, RESET, " ".repeat(pad), inf);
+            }
+        }
+
+        prev_nl = frame.matches('\n').count();
+        buf.write_all(frame.as_bytes()).ok();
+        buf.flush().ok();
+        thread::sleep(Duration::from_millis(FRAME_MS));
+    }
+
+    if prev_nl > 0 { write!(buf, "\x1b[{prev_nl}A\r").ok(); }
+    write!(buf, "\x1b[?25h").ok();
+    buf.flush().ok();
+}
+
+fn run_animate(
+    info: &[String],
+    logo_name: &str,
+    custom: &Option<Vec<String>>,
+    cfg: &Config,
+    args: &Args,
+    effect_name: &str,
+    duration: Option<u64>,
+) {
+    use std::fmt::Write;
+
+    const FRAME_MS: u64 = 70;
+    const DEFAULT_FRAMES: u64 = 45; // ≈3s
+
+    RUNNING.store(true, Ordering::Relaxed);
+    unsafe {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(sig, sigint_handler as *const () as libc::sighandler_t);
+        }
+    }
+
+    let effect = parse_effect(effect_name);
+    let max_frames: Option<u64> = match duration {
+        None    => Some(DEFAULT_FRAMES),
+        Some(0) => None, // Ctrl+C to stop
+        Some(n) => Some((n * 1000 / FRAME_MS).max(1)),
+    };
+
+    // colour ramp for the wave; `logo` is a fixed 9-slot palette
+    let ramp = &cfg.colors.logo;
+    let last = ramp.len().saturating_sub(1);
+
+    let out = stdout();
+    let mut buf = out.lock();
+    screen_enter(&mut buf);
+
+    let mut tick: u64 = 0;
+    loop {
+        if !RUNNING.load(Ordering::Relaxed) { break; }
+        if let Some(max) = max_frames { if tick >= max { break; } }
+        let t = tick as usize;
+
+        // current logo frame: animated logos cycle, everything else stays put
+        let base: Vec<String> = match custom {
+            Some(c) => c.clone(),
+            None => logos::from_name_frame(logo_name, t / 6)
+                .iter().map(|s| (*s).to_string()).collect(),
+        };
+        let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
+        let logo_w = widths.iter().max().copied().unwrap_or(36);
+        let max_rows = base.len().max(info.len());
+
+        // build the whole frame, then emit it in one write (avoids tearing)
+        let mut screen = String::with_capacity(8192);
+        screen.push_str("\x1b[2J\x1b[H\n");
+        for i in 0..max_rows {
+            let raw  = base.get(i).map(String::as_str).unwrap_or("");
+            let anim = logos::animate_line(raw, i, t, effect);
+            let pad  = logo_w.saturating_sub(widths.get(i).copied().unwrap_or(0));
+            let inf  = info.get(i).map(String::as_str).unwrap_or("");
+            screen.push_str("  ");
+            if args.no_color {
+                screen.push_str(&anim);
+            } else {
+                // per-character colour wave across the logo
+                for (col, ch) in anim.chars().enumerate() {
+                    let phase = logos::color_wave_phase(i, col, t);
+                    let idx   = ((phase * last as f32).round() as usize).min(last);
+                    let _ = write!(screen, "{}{}", ramp[idx], ch);
+                }
+                screen.push_str(RESET);
+            }
+            let _ = writeln!(screen, "{:pad$}  {inf}", "", pad = pad);
+        }
+        buf.write_all(screen.as_bytes()).ok();
+        buf.flush().ok();
+
+        thread::sleep(Duration::from_millis(FRAME_MS));
+        tick += 1;
+    }
+
+    screen_leave(&mut buf);
 }
 
 fn build_info(si: &info::SysInfo, cfg: &Config, sci_seed: usize) -> (Vec<String>, bool) {
@@ -186,13 +390,10 @@ fn build_info(si: &info::SysInfo, cfg: &Config, sci_seed: usize) -> (Vec<String>
     // ── header ────────────────────────────────────────────
     use config::Header;
     let (username, hostname) = if sh.header != Header::None {
-        (env::var("USER").or_else(|_| env::var("LOGNAME")).unwrap_or_else(|_| "user".into()),
-         {
-            let mut buf = [0i8; 256];
-            if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } == 0 {
-                unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
-            } else { "localhost".into() }
-        })
+        (
+            env::var("USER").or_else(|_| env::var("LOGNAME")).unwrap_or_else(|_| "user".into()),
+            hostname(),
+        )
     } else {
         (String::new(), String::new())
     };
@@ -310,6 +511,43 @@ fn build_info(si: &info::SysInfo, cfg: &Config, sci_seed: usize) -> (Vec<String>
     field!(li, lines, c, sh.init_ver,    "init ver",    &si.init_ver);
     field!(li, lines, c, sh.local_ip,    "local ip",    &si.local_ip);
 
+    // opt-in modules
+    field!(li, lines, c, sh.datetime,      "datetime",   &si.datetime);
+    field!(li, lines, c, sh.editor,        "editor",     &si.editor);
+    field!(li, lines, c, sh.dns,           "dns",        &si.dns);
+    field!(li, lines, c, sh.host,          "host",       &si.host);
+    field!(li, lines, c, sh.chassis,       "chassis",    &si.chassis);
+    field!(li, lines, c, sh.bootmgr,       "bootmgr",    &si.bootmgr);
+    field!(li, lines, c, sh.cpu_cache,     "cpu cache",  &si.cpu_cache);
+    field!(li, lines, c, sh.login_manager, "login mgr",  &si.login_manager);
+    field!(li, lines, c, sh.brightness,    "brightness", &si.brightness);
+    field!(li, lines, c, sh.cpu_usage,     "cpu usage",  &si.cpu_usage);
+    field!(li, lines, c, sh.diskio,        "disk io",    &si.diskio);
+    field!(li, lines, c, sh.netio,         "net io",     &si.netio);
+    field!(li, lines, c, sh.physmem,       "phys mem",   &si.physmem);
+    field!(li, lines, c, sh.gpu_mem,       "gpu mem",    &si.gpu_mem);
+    field!(li, lines, c, sh.btrfs,         "btrfs",      &si.btrfs);
+    field!(li, lines, c, sh.wifi,          "wifi",       &si.wifi);
+    field!(li, lines, c, sh.users,         "users",      &si.users);
+    field!(li, lines, c, sh.wallpaper,     "wallpaper",  &si.wallpaper);
+    field!(li, lines, c, sh.media,         "media",      &si.media);
+    field!(li, lines, c, sh.public_ip,     "public ip",  &si.public_ip);
+    field!(li, lines, c, sh.weather,       "weather",    &si.weather);
+    field!(li, lines, c, sh.opengl,        "opengl",     &si.opengl);
+    field!(li, lines, c, sh.vulkan,        "vulkan",     &si.vulkan);
+    field!(li, lines, c, sh.cursor,        "cursor",     &si.cursor);
+    field!(li, lines, c, sh.term_size,     "term size",  &si.term_size);
+    field!(li, lines, c, sh.term_theme,    "term theme", &si.term_theme);
+    field!(li, lines, c, sh.codec,         "codec",      &si.codec);
+    field!(li, lines, c, sh.bluetooth,     "bluetooth",  &si.bluetooth);
+    field!(li, lines, c, sh.camera,        "camera",     &si.camera);
+    field!(li, lines, c, sh.mouse,         "mouse",      &si.mouse);
+    field!(li, lines, c, sh.keyboard,      "keyboard",   &si.keyboard);
+    field!(li, lines, c, sh.tpm,           "tpm",        &si.tpm);
+    field!(li, lines, c, sh.physical_disk, "phy disk",   &si.physical_disk);
+    field!(li, lines, c, sh.top_processes, "top procs",  &si.top_processes);
+    field!(li, lines, c, sh.monitor,       "monitor",    &si.monitor);
+
     let _ = li;
 
     // swatches / color bar
@@ -351,54 +589,86 @@ extern "C" fn sigint_handler(_: libc::c_int) {
     RUNNING.store(false, Ordering::Relaxed);
 }
 
-fn bh_cell(col: usize, row: usize, cx: f64, cy: f64, rot: f64) -> (&'static str, char) {
+#[inline]
+fn bh_char(i: f64) -> char {
+    if i > 0.88 { '\u{2588}' }        // █
+    else if i > 0.70 { '\u{2593}' }   // ▓
+    else if i > 0.52 { '\u{2592}' }   // ▒
+    else if i > 0.32 { '\u{2591}' }   // ░
+    else if i > 0.15 { '\u{00b7}' }   // ·
+    else { ' ' }
+}
+
+#[inline]
+fn rgb_scale(c: (u8, u8, u8), k: f64) -> (u8, u8, u8) {
+    let k = k.clamp(0.0, 1.0);
+    ((c.0 as f64 * k) as u8, (c.1 as f64 * k) as u8, (c.2 as f64 * k) as u8)
+}
+
+#[inline]
+fn lerp3(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    (
+        (a.0 as f64 + (b.0 as f64 - a.0 as f64) * t) as u8,
+        (a.1 as f64 + (b.1 as f64 - a.1 as f64) * t) as u8,
+        (a.2 as f64 + (b.2 as f64 - a.2 as f64) * t) as u8,
+    )
+}
+
+fn bh_cell(col: usize, row: usize, cx: f64, cy: f64, rot: f64, frame: u64)
+    -> ((u8, u8, u8), char)
+{
     let dx   = (col as f64 - cx) * 0.52;
     let dy   = row as f64 - cy;
     let dist = (dx*dx + dy*dy).sqrt();
-    let ra   = ((dy.atan2(dx) + rot) % (2.0*PI) + 2.0*PI) % (2.0*PI);
+    let ang  = dy.atan2(dx);
 
-    if dist < 1.8 { return (RESET, ' '); }
+    // ── event horizon: absolute black ───────────────────────
+    if dist < 1.9 { return ((0, 0, 0), ' '); }
 
-    // ── photon ring — intense blueshift inner edge ──────────
-    if dist < 2.8 {
-        let b = (ra * 1.7).sin() * 0.5 + 0.5;
-        return (BLUE, if b > 0.5 { '\u{2591}' } else { '\u{00b7}' });
+    // ── differential rotation: inner orbits sweep faster ────
+    let ra = (ang + rot * (1.0 + 3.0 / (dist + 1.5))).rem_euclid(2.0 * PI);
+
+    // ── photon ring: razor-thin, bright, gravitationally lensed ──
+    if dist < 2.7 {
+        let edge = (1.0 - (dist - 2.30).abs() / 0.42).clamp(0.0, 1.0);
+        let flick = 0.75 + 0.25 * (ra * 6.0).sin().abs();
+        let inten = (0.35 + 0.65 * edge) * flick;
+        let col = lerp3((120, 200, 255), (255, 255, 255), edge);
+        return (rgb_scale(col, inten), bh_char(inten));
     }
-    // ── inner accretion — blue → white → gold ───────────────
-    if dist < 4.5 {
-        let b = ((ra * 1.3).sin() * 0.4 + 0.35).clamp(0.0, 1.0);
-        let t = (dist - 2.8) / 1.7;
-        let col = if t < 0.33 { if b > 0.5 { SAPPHIRE } else { BLUE } }
-                  else if t < 0.66 { if b > 0.5 { SKY } else { SAPPHIRE } }
-                  else { if b > 0.5 { TEAL } else { SKY } };
-        return (col, if b > 0.45 { '\u{2591}' } else { '\u{00b7}' });
-    }
-    // ── main disk — hottest in, cooler out ──────────────────
-    if dist < 10.4 {
-        let bright = ((ra.sin() * 0.5 + 0.5)
-            * (1.0 - (dist - 4.5) / 5.9 * 0.42)).clamp(0.0, 1.0);
-        let ch: char = match (bright * 5.5) as u8 {
-            5 => '\u{2588}', 4 => '\u{2593}', 3 => '\u{2592}',
-            2 => '\u{2591}', 1 => '\u{00b7}', _ => ' ',
+
+    // ── accretion disk: temperature gradient + Doppler + turbulence ──
+    if dist < 11.5 {
+        let t = ((dist - 2.7) / 8.8).clamp(0.0, 1.0);
+        let temp = if t < 0.22 {
+            lerp3((255, 246, 224), (255, 214, 150), t / 0.22)
+        } else if t < 0.52 {
+            lerp3((255, 214, 150), (255, 132, 58), (t - 0.22) / 0.30)
+        } else if t < 0.80 {
+            lerp3((255, 132, 58), (198, 58, 30), (t - 0.52) / 0.28)
+        } else {
+            lerp3((198, 58, 30), (104, 24, 18), (t - 0.80) / 0.20)
         };
-        let t = (dist - 4.5) / 4.0;
-        let col: &'static str = match (bright * 5.0) as u8 {
-            5|4 if t < 0.5 => YELLOW,
-            5|4           => PEACH,
-            3             => PEACH,
-            2             => RED,
-            1 if bright > 0.1 => MAROON,
-            _ => OVERLAY0,
-        };
-        return (col, ch);
+        // relativistic beaming: the approaching side is brighter
+        let beam = 0.55 + 0.45 * ((ang + 0.35).cos() * 0.5 + 0.5);
+        // turbulent filaments co-rotating with the disk
+        let turb = 0.60 + 0.40
+            * ((ra * 7.0 + dist * 2.6 + frame as f64 * 0.85).sin() * 0.5 + 0.5);
+        let inten = (beam * turb * (1.18 - t * 0.55)).clamp(0.0, 1.0);
+        return (rgb_scale(temp, inten), bh_char(inten));
     }
-    // ── outer halo ──────────────────────────────────────────
-    if dist < 13.8 {
-        let w = ((ra * 4.0 + dist * 0.85 + rot * 0.25).sin() + 1.0) * 0.5;
-        if w > 0.76 { return (MAUVE,    '\u{00b7}'); }
-        if w > 0.62 { return (LAVENDER, '\u{00b7}'); }
+
+    // ── outer halo / lensed dust ────────────────────────────
+    if dist < 14.8 {
+        let w = (ra * 3.0 + dist * 0.7 + rot * 0.4).sin() * 0.5 + 0.5;
+        let inten = (w * 0.5 * (1.0 - (dist - 11.5) / 3.3)).clamp(0.0, 0.4);
+        if inten > 0.10 {
+            let c = rgb_scale((150, 120, 220), inten * 2.2);
+            return (c, if inten > 0.22 { '\u{00b7}' } else { ' ' });
+        }
     }
-    (RESET, ' ')
+    ((0, 0, 0), ' ')
 }
 
 fn run_blackhole(info: &[String], duration: Option<u64>) {
@@ -410,7 +680,11 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
 
 
     RUNNING.store(true, Ordering::Relaxed);
-    unsafe { libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t); }
+    unsafe {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(sig, sigint_handler as *const () as libc::sighandler_t);
+        }
+    }
 
     let max_frames: Option<u64> = match duration {
         None    => Some(56), Some(0) => None, Some(n) => Some(n * 1000 / FRAME_MS),
@@ -421,16 +695,16 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
     };
     let out     = stdout();
     let mut buf = out.lock();
-    write!(buf, "\x1b[?25l").ok();
+    screen_enter(&mut buf);
 
     // ── background star positions — 40 fixed stars ──────────
     let mut stars = [[0u8; BH_COLS]; BH_ROWS];
     let mut star_phase = [0u64; 40];
-    for i in 0usize..40 {
+    for (i, phase) in star_phase.iter_mut().enumerate() {
         let h = i.wrapping_mul(0x9e37_79b9);
-        let col = 2 + (h & 0x2f) as usize;
-        let row = 1 + ((h >> 8) & 0x1f) as usize;
-        star_phase[i] = (h >> 16) as u64 & 0x3f;
+        let col = 2 + (h & 0x2f);
+        let row = 1 + ((h >> 8) & 0x1f);
+        *phase = ((h >> 16) & 0x3f) as u64;
         if col < BH_COLS && row < BH_ROWS {
             stars[row][col] = (i + 1) as u8;
         }
@@ -468,39 +742,60 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
         writeln!(buf, "  {OVL}{sep}{R}",
             OVL=OVERLAY0, sep="\u{2500}".repeat(62), R=RESET).ok();
 
-        for r in 0..BH_ROWS {
+        for (r, star_row) in stars.iter().enumerate() {
             write!(buf, "  ").ok();
-            let mut prev: &str = "";
-            for c in 0..BH_COLS {
+            let mut prev: Option<(u8, u8, u8)> = None;
+            for (c, &cell) in star_row.iter().enumerate() {
                 // ── shooting star streak ────────────────────
                 if ss_alive && r == ss_row && c >= ss_col && c < ss_col + 6 {
                     let tail = (c - ss_col) as f64;
-                    if tail < 1.0 { write!(buf, "{}{}", RESET, TEXT).ok(); write!(buf, "\u{258c}").ok(); prev = ""; continue; }
+                    if tail < 1.0 {
+                        let cc = (220, 245, 255);
+                        if prev != Some(cc) {
+                            write!(buf, "\x1b[38;2;{};{};{}m", cc.0, cc.1, cc.2).ok();
+                            prev = Some(cc);
+                        }
+                        write!(buf, "\u{258c}").ok();
+                        continue;
+                    }
                     let bright = 1.0 - tail / 6.0;
                     if bright > 0.3 {
                         let ch = if bright > 0.7 { '\u{2590}' } else { '\u{00b7}' };
-                        write!(buf, "{}{}", RESET, SKY).ok(); write!(buf, "{}", ch).ok(); prev = "";
+                        let cc = rgb_scale((137, 220, 235), bright);
+                        if prev != Some(cc) {
+                            write!(buf, "\x1b[38;2;{};{};{}m", cc.0, cc.1, cc.2).ok();
+                            prev = Some(cc);
+                        }
+                        write!(buf, "{}", ch).ok();
                         continue;
                     }
                 }
                 // ── background star ─────────────────────────
-                let si = stars[r][c];
+                let si = cell;
                 if si > 0 {
                     let idx = (si - 1) as usize;
                     let phase = (frame.wrapping_add(star_phase[idx])) & 0x1f;
                     if phase < 22 {
-                        let star_colors = [OVERLAY0, LAVENDER, MAUVE, TEXT, SKY, BLUE];
-                        let ci = (star_phase[idx] as usize + frame as usize) % star_colors.len();
-                        let sc = if phase < 4 { star_colors[(ci + 1) % star_colors.len()] }
-                                 else { star_colors[ci] };
-                        write!(buf, "{}{}", RESET, sc).ok();
-                        write!(buf, "{}", '\u{00b7}').ok();
-                        prev = "";
+                        let palette: [(u8, u8, u8); 6] = [
+                            (108, 112, 134), (180, 190, 254), (203, 166, 247),
+                            (205, 214, 244), (137, 220, 235), (137, 180, 250),
+                        ];
+                        let ci = (star_phase[idx] as usize + frame as usize) % palette.len();
+                        let base = if phase < 4 { palette[(ci + 1) % palette.len()] }
+                                   else { palette[ci] };
+                        // twinkle: dim toward the middle of the cycle
+                        let tw = 0.55 + 0.45 * ((phase as f64 / 22.0) * PI).sin();
+                        let cc = rgb_scale(base, tw);
+                        if prev != Some(cc) {
+                            write!(buf, "\x1b[38;2;{};{};{}m", cc.0, cc.1, cc.2).ok();
+                            prev = Some(cc);
+                        }
+                        write!(buf, "\u{00b7}").ok();
                         continue;
                     }
                 }
                 // ── accretion disk ──────────────────────────
-                let (color, ch) = bh_cell(c, r, CX, CY, rot);
+                let (mut color, mut ch) = bh_cell(c, r, CX, CY, rot, frame);
                 // ── relativistic jet (poles) ────────────────
                 let dx_j = c as f64 - CX;
                 let dy_j = r as f64 - CY;
@@ -509,33 +804,32 @@ fn run_blackhole(info: &[String], duration: Option<u64>) {
                     && ((dy_j > 0.0 && ((dx_j * 0.4 + rot * 0.5).sin() > 0.0))
                         || (dy_j < 0.0 && ((dx_j * 0.4 - rot * 0.5).sin() > 0.0)));
                 if jet && ch == ' ' {
-                    let jet_col = if dy_j < 0.0 { MAUVE } else { LAVENDER };
-                    let jet_ch  = if ((dx_j * 2.0 + rot * 1.5).sin() * 0.5 + 0.5) > 0.6
-                        { '\u{2591}' } else { '\u{00b7}' };
-                    write!(buf, "{}{}", RESET, jet_col).ok();
-                    write!(buf, "{}", jet_ch).ok();
-                    prev = "";
-                    continue;
+                    let jet_base = if dy_j < 0.0 { (180, 190, 254) } else { (203, 166, 247) };
+                    let jf = ((dx_j * 2.0 + rot * 1.5).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                    color = rgb_scale(jet_base, 0.35 + 0.65 * jf);
+                    ch = if jf > 0.6 { '\u{2591}' } else { '\u{00b7}' };
                 }
-                if color != prev { write!(buf, "{}{}", RESET, color).ok(); prev = color; }
-                write!(buf, "{}", ch).ok();
+
+                if ch == ' ' && color == (0, 0, 0) {
+                    if prev.is_some() { write!(buf, "{}", RESET).ok(); prev = None; }
+                    write!(buf, " ").ok();
+                } else {
+                    if prev != Some(color) {
+                        write!(buf, "\x1b[38;2;{};{};{}m", color.0, color.1, color.2).ok();
+                        prev = Some(color);
+                    }
+                    write!(buf, "{}", ch).ok();
+                }
             }
             write!(buf, "{}  ", RESET).ok();
             if let Some(line) = info.get(r) { write!(buf, "{}{}", RESET, line).ok(); }
-            write!(buf, "\x1b[K\n").ok();
+            writeln!(buf, "\x1b[K").ok();
         }
         buf.flush().ok();
         frame += 1;
         thread::sleep(Duration::from_millis(FRAME_MS));
     }
-    write!(buf, "\x1b[?25h").ok();
-    // ── brief afterglow message ─────────────────────────────
-    write!(buf, "\x1b[H").ok();
-    for _ in 0..BH_ROWS + 4 { write!(buf, "\x1b[K\n").ok(); }
-    write!(buf, "\x1b[H").ok();
-    writeln!(buf, "  {OVL}the singularity collapsed. you are back.{R}", OVL=OVERLAY0, R=RESET).ok();
-    writeln!(buf).ok();
-    buf.flush().ok();
+    screen_leave(&mut buf);
 }
 
 // ── Quantum collapse — wave-function animation ─────────────
@@ -685,49 +979,147 @@ struct Args {
     help:         bool,
     version:      bool,
     show_cfg:     bool,
+    all:          bool,
+    json:         bool,
+    structure:    Option<String>,
+    watch:        bool,
+    scheme:       Option<String>,
+    animate:      Option<String>,
+    list_logos:   bool,
+    no_intro:     bool,
+    foreground:   bool,
+    stop:         bool,
 }
 
 fn parse_args() -> Args {
+    use lexopt::prelude::*;
+
     let mut a = Args {
-        logo: "arch".into(), logo_explicit: false, logo_file: None,
-        accent: None, color: None, preset: None,
-        no_color: false, blackhole: false,
-        mandelbrot: false, mandel_iter: 64,
-        quantum: false, cosmic: false,
-        duration: None, help: false, version: false, show_cfg: false,
+        logo: "arch".into(),
+        logo_explicit: false,
+        logo_file: None,
+        accent: None,
+        color: None,
+        preset: None,
+        no_color: false,
+        blackhole: false,
+        mandelbrot: false,
+        mandel_iter: 64,
+        quantum: false,
+        cosmic: false,
+        duration: None,
+        help: false,
+        version: false,
+        show_cfg: false,
+        all: false,
+        json: false,
+        structure: None,
+        watch: false,
+        scheme: None,
+        animate: None,
+        list_logos: false,
+        no_intro: false,
+        foreground: false,
+        stop: false,
     };
-    let raw: Vec<String> = env::args().skip(1).collect();
-    let mut i = 0;
-    while i < raw.len() {
-        let arg = &raw[i];
-        match arg.as_str() {
-            "-h" | "--help"    => a.help      = true,
-            "-V" | "--version" => a.version   = true,
-            "--blackhole"      => a.blackhole  = true,
-            "--no-color"       => a.no_color   = true,
-            "--config"         => a.show_cfg   = true,
-            "--full"           => { a.preset = Some("full".into()); }
-            "--mandelbrot"     => {
+
+    // lexopt cannot peek, so pre-scan for the space-separated `--mandelbrot <n>` form.
+    let mut mandel_space: Option<u32> = None;
+    let mut animate_space: Option<String> = None;
+    {
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        for w in argv.windows(2) {
+            if w[0] == "--mandelbrot" {
+                if let Some(s) = w[1].to_str() {
+                    if let Ok(n) = s.parse::<u32>() { mandel_space = Some(n); }
+                }
+            } else if w[0] == "--animate" {
+                if let Some(s) = w[1].to_str() { animate_space = Some(s.to_string()); }
+            }
+        }
+    }
+
+    let mut parser = lexopt::Parser::from_env();
+    while let Some(arg) = parser.next().ok().flatten() {
+        match arg {
+            Short('h') | Long("help")    => a.help = true,
+            Short('V') | Long("version") => a.version = true,
+            Long("blackhole")            => a.blackhole = true,
+            Long("no-color")             => a.no_color = true,
+            Long("config")               => a.show_cfg = true,
+            Long("full")                 => a.preset = Some("full".into()),
+            Long("quantum")              => a.quantum = true,
+            Long("cosmic")               => a.cosmic = true,
+            Long("mandelbrot") => {
                 a.mandelbrot = true;
-                // peek at next — only consume if it's a number
-                if i + 1 < raw.len() {
-                    if let Ok(n) = raw[i + 1].parse::<u32>() {
-                        a.mandel_iter = n;
-                        i += 1; // skip the number
+                // optional iteration count: `--mandelbrot=N` (joined) or `--mandelbrot N` (pre-scanned)
+                if let Some(v) = parser.optional_value() {
+                    if let Ok(n) = v.to_string_lossy().parse::<u32>() { a.mandel_iter = n; }
+                } else if let Some(n) = mandel_space {
+                    a.mandel_iter = n;
+                }
+            }
+            Long("logo") => {
+                if let Ok(v) = parser.value() {
+                    let name = v.to_string_lossy().into_owned();
+                    if name == "?" || name == "list" {
+                        a.list_logos = true;
+                    } else {
+                        a.logo = name;
+                        a.logo_explicit = true;
                     }
                 }
             }
-            "--quantum"        => a.quantum    = true,
-            "--cosmic"         => a.cosmic     = true,
-            "--logo"      => { i += 1; if i < raw.len() { a.logo = raw[i].clone(); a.logo_explicit = true; } }
-            "--logo-file" => { i += 1; if i < raw.len() { a.logo_file = Some(raw[i].clone()); } }
-            "--accent"    => { i += 1; if i < raw.len() { a.accent = Some(raw[i].clone()); } }
-            "--color"     => { i += 1; if i < raw.len() { a.color = Some(raw[i].clone()); } }
-            "--preset"    => { i += 1; if i < raw.len() { a.preset = Some(raw[i].clone()); } }
-            "-t" | "--t" => { i += 1; if i < raw.len() { a.duration = raw[i].parse().ok(); } }
-            _             => {}
+            Long("list-logos") | Long("logos") => a.list_logos = true,
+            Long("no-animate") | Long("no-intro") => a.no_intro = true,
+            Long("foreground") | Long("fg") => a.foreground = true,
+            Long("stop") => a.stop = true,
+            Long("logo-file") => {
+                if let Ok(v) = parser.value() {
+                    a.logo_file = Some(v.to_string_lossy().into_owned());
+                }
+            }
+            Long("accent") => {
+                if let Ok(v) = parser.value() {
+                    a.accent = Some(v.to_string_lossy().into_owned());
+                }
+            }
+            Long("color") => {
+                if let Ok(v) = parser.value() {
+                    a.color = Some(v.to_string_lossy().into_owned());
+                }
+            }
+            Long("preset") => {
+                if let Ok(v) = parser.value() {
+                    a.preset = Some(v.to_string_lossy().into_owned());
+                }
+            }
+            Short('t') | Long("t") => {
+                if let Ok(v) = parser.value() {
+                    a.duration = v.to_string_lossy().parse().ok();
+                }
+            }
+            Long("all")     => a.all = true,
+            Long("json")    => a.json = true,
+            Long("watch")   => a.watch = true,
+            Long("scheme")  => {
+                if let Ok(v) = parser.value() {
+                    a.scheme = Some(v.to_string_lossy().into_owned());
+                }
+            }
+            Long("animate") => {
+                a.animate = Some(parser.optional_value()
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .or_else(|| animate_space.clone())
+                    .unwrap_or_else(|| "shimmer".into()));
+            }
+            Short('s') | Long("structure") => {
+                if let Ok(v) = parser.value() {
+                    a.structure = Some(v.to_string_lossy().into_owned());
+                }
+            }
+            _ => {}
         }
-        i += 1;
     }
     a
 }
@@ -743,6 +1135,120 @@ fn print_version() {
     println!();
 }
 
+/// Escape a string for embedding in a JSON string literal.
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"'  => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// `--json`: emit enabled fields as a flat JSON object, one line.
+fn print_json(si: &info::SysInfo, cfg: &Config) {
+    let sh = &cfg.show;
+    let mut out = String::with_capacity(4096);
+    out.push('{');
+    let mut first = true;
+    macro_rules! j {
+        ($k:expr, $v:expr) => {{
+            if !first { out.push(','); }
+            first = false;
+            out.push('"'); out.push_str(&json_escape($k)); out.push_str("\":\"");
+            out.push_str(&json_escape($v)); out.push('"');
+        }};
+    }
+    macro_rules! jf {
+        ($flag:expr, $k:expr, $v:expr) => { if $flag { j!($k, $v); } };
+    }
+
+    jf!(sh.os, "os", &si.os);
+    jf!(sh.kernel, "kernel", &si.kernel);
+    jf!(true, "uptime", &si.uptime);
+    jf!(sh.res, "res", &si.res);
+    jf!(sh.pkgs, "pkgs", &si.pkgs);
+    jf!(sh.shell, "shell", &si.shell);
+    jf!(sh.de_wm, "de_wm", &si.de_wm);
+    jf!(sh.term, "term", &si.term);
+    jf!(sh.cpu, "cpu", &si.cpu);
+    jf!(sh.gpu, "gpu", &si.gpu);
+    jf!(sh.gpu_temp, "gpu_temp", &si.gpu_temp);
+    jf!(sh.battery, "battery", &si.battery);
+    jf!(sh.disk, "disk", &si.disk);
+    jf!(sh.load, "load", &si.load);
+    jf!(sh.locale, "locale", &si.locale);
+    jf!(sh.memory, "mem_used", &si.mem_used.to_string());
+    jf!(sh.memory, "mem_total", &si.mem_total.to_string());
+    jf!(sh.ip, "ip", &si.ip);
+    jf!(sh.ssh, "ssh", &si.ssh);
+    jf!(sh.ports, "ports", &si.ports);
+    jf!(sh.init, "init", &si.init);
+    jf!(sh.cpu_temp, "cpu_temp", &si.cpu_temp);
+    jf!(sh.processes, "processes", &si.processes);
+    jf!(sh.container, "container", &si.container);
+    jf!(sh.session, "session", &si.session);
+    jf!(sh.swap, "swap", &si.swap);
+    jf!(sh.sound, "sound", &si.sound);
+    jf!(sh.gpu_driver, "gpu_driver", &si.gpu_driver);
+    jf!(sh.bios, "bios", &si.bios);
+    jf!(sh.board, "board", &si.board);
+    jf!(sh.disk_type, "disk_type", &si.disk_type);
+    jf!(sh.pkg_updates, "pkg_updates", &si.pkg_updates);
+    jf!(sh.theme, "theme", &si.theme);
+    jf!(sh.icons, "icons", &si.icons);
+    jf!(sh.term_font, "term_font", &si.term_font);
+    jf!(sh.de_wm_ver, "de_wm_ver", &si.de_wm_ver);
+    jf!(sh.init_ver, "init_ver", &si.init_ver);
+    jf!(sh.local_ip, "local_ip", &si.local_ip);
+    jf!(sh.datetime, "datetime", &si.datetime);
+    jf!(sh.editor, "editor", &si.editor);
+    jf!(sh.dns, "dns", &si.dns);
+    jf!(sh.host, "host", &si.host);
+    jf!(sh.chassis, "chassis", &si.chassis);
+    jf!(sh.bootmgr, "bootmgr", &si.bootmgr);
+    jf!(sh.cpu_cache, "cpu_cache", &si.cpu_cache);
+    jf!(sh.login_manager, "login_manager", &si.login_manager);
+    jf!(sh.brightness, "brightness", &si.brightness);
+    jf!(sh.cpu_usage, "cpu_usage", &si.cpu_usage);
+    jf!(sh.diskio, "diskio", &si.diskio);
+    jf!(sh.netio, "netio", &si.netio);
+    jf!(sh.physmem, "physmem", &si.physmem);
+    jf!(sh.gpu_mem, "gpu_mem", &si.gpu_mem);
+    jf!(sh.btrfs, "btrfs", &si.btrfs);
+    jf!(sh.wifi, "wifi", &si.wifi);
+    jf!(sh.users, "users", &si.users);
+    jf!(sh.wallpaper, "wallpaper", &si.wallpaper);
+    jf!(sh.media, "media", &si.media);
+    jf!(sh.public_ip, "public_ip", &si.public_ip);
+    jf!(sh.weather, "weather", &si.weather);
+    jf!(sh.opengl, "opengl", &si.opengl);
+    jf!(sh.vulkan, "vulkan", &si.vulkan);
+    jf!(sh.cursor, "cursor", &si.cursor);
+    jf!(sh.term_size, "term_size", &si.term_size);
+    jf!(sh.term_theme, "term_theme", &si.term_theme);
+    jf!(sh.codec, "codec", &si.codec);
+    jf!(sh.bluetooth, "bluetooth", &si.bluetooth);
+    jf!(sh.camera, "camera", &si.camera);
+    jf!(sh.mouse, "mouse", &si.mouse);
+    jf!(sh.keyboard, "keyboard", &si.keyboard);
+    jf!(sh.tpm, "tpm", &si.tpm);
+    jf!(sh.physical_disk, "physical_disk", &si.physical_disk);
+    jf!(sh.top_processes, "top_processes", &si.top_processes);
+    jf!(sh.monitor, "monitor", &si.monitor);
+
+    out.push_str("}\n");
+    let _ = first;
+    unsafe { libc::write(1, out.as_ptr().cast::<core::ffi::c_void>(), out.len()); }
+}
+
 fn print_config_help(cfg_path: &str) {
     let (b, r, s, g) = (BOLD, RESET, SUBTEXT1, GREEN);
     println!();
@@ -750,6 +1256,8 @@ fn print_config_help(cfg_path: &str) {
     println!();
     println!("  {b}{BLUE}[colors]{r}", b=b, BLUE=BLUE, r=r);
     println!("  {s}# 7 label slots (cycle through fields), accent, values, sep, bar{r}", s=s, r=r);
+    println!("  {g}scheme{r}   = auto       {s}# auto|{} (auto = light/dark from the terminal){r}", config::SCHEMES.join("|"), g=g, r=r, s=s);
+    println!("  {s}# values: catppuccin names | black/white/gray/orange | ansi_* | #RGB | #RRGGBB | rgb(r,g,b) | color0..255{r}", s=s, r=r);
     println!("  {g}accent{r}   = blue       {s}# logo + hostname color{r}", g=g, r=r, s=s);
     println!("  {g}username{r} = mauve      {s}# user part of user@host{r}", g=g, r=r, s=s);
     println!("  {g}hostname{r} = blue", g=g, r=r);
@@ -773,10 +1281,23 @@ fn print_config_help(cfg_path: &str) {
     println!("  swap=false  sound=false  gpu_driver=false  theme=false");
     println!("  bios=false  board=false  disk_type=false  pkg_updates=false");
     println!("  local_ip=false  init_ver=false  de_wm_ver=false");
+    println!("  {s}# opt-in modules (all false by default — or use --all):{r}", s=s, r=r);
+    println!("  {s}datetime editor dns host chassis bootmgr cpu_cache login_manager{r}", s=s, r=r);
+    println!("  {s}brightness cpu_usage diskio netio physmem gpu_mem btrfs wifi users{r}", s=s, r=r);
+    println!("  {s}wallpaper media public_ip weather opengl vulkan{r}", s=s, r=r);
+    println!("  {s}cursor term_size term_theme codec bluetooth camera mouse keyboard{r}", s=s, r=r);
+    println!("  {s}tpm physical_disk top_processes monitor{r}", s=s, r=r);
     println!();
     println!("  {b}{BLUE}[logo]{r}  {s}choose logo or custom ASCII file{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}name{r} = arch         {s}# arch | ascii | tux | nix | gentoo | mini | auto{r}", g=g, r=r, s=s);
     println!("  {g}file{r} = <path>       {s}# custom ASCII file (overrides name){r}", g=g, r=r, s=s);
+    println!("  {s}list every logo name from the CLI: arcfetch --list-logos{r}", s=s, r=r);
+    println!();
+    println!("  {b}{BLUE}[animation]{r}  {s}short intro on a real terminal{r}", b=b, BLUE=BLUE, r=r, s=s);
+    println!("  {g}enabled{r}  = true      {s}# false = always static{r}", g=g, r=r, s=s);
+    println!("  {g}effect{r}   = none      {s}# none | shimmer | scanline | boot{r}", g=g, r=r, s=s);
+    println!("  {g}intro_ms{r} = 700       {s}# 0 disables; animated logos auto-play{r}", g=g, r=r, s=s);
+    println!("  {g}wave{r}     = true      {s}# colour-wave atom/dna/arcreactor{r}", g=g, r=r, s=s);
     println!();
     println!("  {b}{BLUE}[template]{r}  {s}overrides [show] entirely{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}preset{r} = full         {s}# full | minimal | hacker | science{r}", g=g, r=r, s=s);
@@ -832,6 +1353,13 @@ fn write_sample_config(cfg_path: &str) {
 # all values are optional — delete lines to use defaults
 
 [colors]
+# palette preset (uncomment to switch): auto | mocha | latte | frappe | macchiato |
+#   nord | dracula | gruvbox | tokyo-night | solarized-dark | rose-pine |
+#   onedark | kanagawa | everforest | ayu   (auto = light/dark from the terminal)
+# scheme = auto
+
+# every colour accepts: catppuccin names, black/white/gray/orange/purple/cyan,
+# ansi_red / ansi_bright_blue / …, #RGB, #RRGGBB, rgb(r,g,b), color0..color255
 accent   = blue
 username = mauve
 hostname = blue
@@ -903,12 +1431,64 @@ de_wm_ver   = false   # desktop environment version
 init_ver    = false   # init system version
 local_ip    = false   # interface + local IP
 
+# opt-in modules (all off by default; or just pass --all)
+datetime      = false  # local date + time
+editor        = false  # $VISUAL / $EDITOR
+dns           = false  # nameservers from /etc/resolv.conf
+host          = false  # DMI system vendor + product
+chassis       = false  # DMI chassis type (Laptop/Desktop/…)
+bootmgr       = false  # UEFI or BIOS
+cpu_cache     = false  # L1/L2/L3 cache sizes
+login_manager = false  # display-manager.service
+brightness    = false  # backlight %
+cpu_usage     = false  # /proc/stat sample (~200ms)
+diskio        = false  # /proc/diskstats totals
+netio         = false  # /proc/net/dev totals
+physmem       = false  # DIMM info (needs root for DMI)
+gpu_mem       = false  # VRAM used / total
+btrfs         = false  # btrfs volumes
+wifi          = false  # wireless iface + signal + SSID
+users         = false  # logged-in users
+wallpaper     = false  # current wallpaper (hyprland/sway/gnome)
+media         = false  # now playing (playerctl)
+public_ip     = false  # public IP (network)
+weather       = false  # weather (network, wttr.in)
+opengl        = false  # OpenGL renderer
+vulkan        = false  # Vulkan drivers
+cursor        = false  # cursor theme + size
+term_size     = false  # terminal columns x rows
+term_theme    = false  # terminal FG/BG ($COLORFGBG)
+codec         = false  # VA-API encoders / decoders (vainfo)
+bluetooth     = false  # Bluetooth radio + HCI version
+camera        = false  # connected cameras
+mouse         = false  # pointing devices
+keyboard      = false  # keyboards
+tpm           = false  # TPM version
+physical_disk = false  # disks: model, size, type, temp
+top_processes = false  # top 5 processes by CPU
+monitor       = false  # EDID: name, resolution, Hz, size, PPI
+
 [logo]
 # logo name: arch | ascii | tux | nix | gentoo | mini | auto
+# or any built-in distro logo: ubuntu | debian | fedora | opensuse | manjaro |
+#   endeavouros | cachyos | kali | alpine | void | pop | linuxmint | garuda |
+#   artix | rocky | almalinux | centos | steamos | raspbian | wsl | neon |
+#   deepin | mx | blackarch | redhat | zorin  (append _small for compact)
+# discover every built-in name: arcfetch --list-logos
 # name = arch
 
 # custom ASCII file path (overrides name if set)
 # file = ~/.config/arcfetch/logo.txt
+
+[animation]
+# short intro played on a real terminal before the static render
+enabled  = true
+# glyph effect: none | shimmer | scanline | boot
+effect   = none
+# intro length in milliseconds (0 disables)
+intro_ms = 700
+# colour-wave animated logos (atom/dna/arcreactor)
+wave     = true
 
 [template]
 # preset overrides [show] entirely
@@ -942,18 +1522,28 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}-h, --help{r}                 this screen", b=b, g=g, r=r);
     println!("    {b}{g}-V, --version{r}              version + E=mc² joke", b=b, g=g, r=r);
     println!("    {b}{g}--config{r}                   show config ref + write sample file", b=b, g=g, r=r);
-    println!("    {b}{g}--blackhole{r}                {MAUVE}M87 accretion disk animation{r}", b=b, g=g, r=r, MAUVE=MAUVE);
+    println!("    {b}{g}--blackhole{r}                {MAUVE}M87 accretion disk, pinned above your shell{r}", b=b, g=g, r=r, MAUVE=MAUVE);
     println!("    {b}{g}-t, --t <secs>{r}            {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--logo <name>{r}              switch logo {s}(arch|mini|nix|ascii|auto…){r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--logo <name>{r}              switch logo {s}(arch|ubuntu|debian|fedora|nix|auto…){r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--list-logos{r}              {s}show every logo name with a preview{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--logo ?{r}                  {s}same as --list-logos{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo-file <path>{r}         {s}ASCII art or image (kitty protocol){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--preset <n>{r}               {s}full|minimal|hacker|science{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--full{r}                     {s}show all fields (overrides minimal default){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--accent <color>{r}           hex or catppuccin name", b=b, g=g, r=r);
-    println!("    {b}{g}--color <scheme>{r}            logo color: name | hex | random", b=b, g=g, r=r);
+    println!("    {b}{g}--accent <color>{r}           name | #RRGGBB | rgb(r,g,b) | colorN", b=b, g=g, r=r);
+    println!("    {b}{g}--color <spec>{r}             logo colour: name | hex | random", b=b, g=g, r=r);
+    println!("    {b}{g}--scheme <name>{r}            palette: {s}{}{r}", config::SCHEMES.join("|"), b=b, g=g, r=r, s=s);
     println!("    {b}{g}--no-color{r}                 plain text (pipe-friendly)", b=b, g=g, r=r);
+    println!("    {b}{g}--all{r}                      {s}enable every optional field{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}-s, --structure <list>{r}     {s}show only listed fields (comma-sep){r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--json{r}                     {s}machine-readable JSON output{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--watch{r}                    {s}refresh every second (Ctrl+C stops){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--mandelbrot [iter]{r}        {GREEN}Mandelbrot set as logo{r}", b=b, g=g, r=r, GREEN=GREEN);
     println!("    {b}{g}--quantum{r}                  {MAUVE}wave-function collapse animation{r}", b=b, g=g, r=r, MAUVE=MAUVE);
     println!("    {b}{g}--cosmic{r}                   {SKY}starfield + moon + shooting stars{r}", b=b, g=g, r=r, SKY=SKY);
+    println!("    {b}{g}--animate [effect]{r}         {s}animate any logo, pinned above your shell (shimmer|scanline|boot|frames){r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--no-animate{r}              {s}skip the short intro in normal mode{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--foreground{r}             {s}blocking full-screen animation (alternate screen){r}", b=b, g=g, r=r, s=s);
     println!();
     println!("  {b}{TEAL}logos{r}", b=b, TEAL=TEAL, r=r);
 
@@ -965,6 +1555,7 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}gentoo{r}       Gentoo G (fastfetch style)", b=b, g=g, r=r);
     println!("    {b}{g}auto{r}         detect from {s}/etc/os-release{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}custom{r}  {s}~/.config/arcfetch/logo.txt{r}", b=b, g=g, r=r, s=s);
+    println!("    {s}{n} built-in logos — try {g}--logo ubuntu{r}", s=s, n=logos::all_names().len(), g=g, r=r);
     println!();
     println!("  {b}{TEAL}presets{r}", b=b, TEAL=TEAL, r=r);
     println!("    {g}full{r}      everything", g=g, r=r);
@@ -976,10 +1567,12 @@ fn print_help(cfg_path: &str) {
     println!("    run {b}{g}arcfetch --config{r} for full config reference", b=b, g=g, r=r);
     println!();
     println!("  {b}{SKY}display modes{r}", b=b, SKY=SKY, r=r);
-    println!("    {g}--blackhole{r}   accretion disk (physics)", g=g, r=r);
+    println!("    {g}--blackhole{r}   accretion disk, pinned above your shell", g=g, r=r);
     println!("    {g}--mandelbrot{r}  fractal logo (math)", g=g, r=r);
     println!("    {g}--quantum{r}     wave collapse (physics)", g=g, r=r);
     println!("    {g}--cosmic{r}      starfield + moon + shooting stars (astronomy)", g=g, r=r);
+    println!("    {g}--animate{r}     procedural logo animation, pinned above your shell", g=g, r=r);
+    println!("    {g}--stop{r}        remove the pinned animation from this terminal", g=g, r=r);
     println!("    {s}mutually exclusive — pick one{r}", s=s, r=r);
     println!();
     println!("  {b}{OVERLAY0}shell startup (e.g. ~/.zshrc){r}", b=b, OVERLAY0=OVERLAY0, r=r);
@@ -996,35 +1589,597 @@ fn logo_line_color<'a>(logo_name: &str, i: usize, cfg: &'a Config, color_overrid
     } else {
         match logo_name {
             "mini" => cfg.colors.label(i),
-            "nix" => if i % 2 == 0 { config::NIX_LIGHT } else { config::NIX_DARK },
-            "gentoo" => if i % 2 == 0 { config::GENTOO_DARK } else { config::GENTOO_LIGHT },
+            "nix" => if i.is_multiple_of(2) { config::NIX_LIGHT } else { config::NIX_DARK },
+            "gentoo" => if i.is_multiple_of(2) { config::GENTOO_DARK } else { config::GENTOO_LIGHT },
             _ => cfg.colors.accent.as_str(),
         }
     }
 }
 
 // ═══════════════════════════════════════════════════════════
+//  logo catalogue
+// ═══════════════════════════════════════════════════════════
+
+fn print_logos() {
+    let names = logos::all_names();
+
+    let is_fun = |n: &str| matches!(
+        n,
+        "ascii" | "tux" | "nix" | "gentoo" | "mini" | "dna" | "atom" | "wave"
+            | "emc2" | "pi" | "batman" | "batman_small" | "ironman" | "ironman_small"
+            | "arcreactor"
+    );
+    let is_animated = |n: &str| matches!(n, "atom" | "dna" | "arcreactor");
+
+    println!();
+    println!("  {BOLD}{BLUE}arcfetch logos{R}  {OVL}{n} available · use: arcfetch --logo <name>{R}",
+        BOLD = BOLD, BLUE = BLUE, OVL = OVERLAY0, R = RESET, n = names.len());
+    println!();
+
+    let fun: Vec<&str> = names.iter().copied().filter(|n| is_fun(n)).collect();
+    let distros: Vec<&str> = names.iter().copied().filter(|n| !is_fun(n)).collect();
+
+    for (title, list) in [("symbols, mascots & sci-fi", &fun), ("distributions", &distros)] {
+        if list.is_empty() { continue; }
+        println!("  {BOLD}{MAUVE}{title}{R}", BOLD = BOLD, MAUVE = MAUVE, R = RESET, title = title);
+
+        for name in list {
+            let art = logos::from_name(name);
+            let preview = art
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .max_by_key(|l| visible_chars(l))
+                .map(|l| l.trim())
+                .unwrap_or("");
+            let preview: String = preview.chars().take(30).collect();
+            let marker = if is_animated(name) {
+                format!(" {TEAL}[animated]{R}", TEAL = TEAL, R = RESET)
+            } else {
+                String::new()
+            };
+            println!("    {GREEN}{:<16}{R} {OVL}{}{R}{marker}",
+                name, preview, GREEN = GREEN, R = RESET, OVL = OVERLAY0);
+        }
+        println!();
+    }
+
+    println!();
+    println!("  {OVL}preview: arcfetch --logo <name>   ·   animate: arcfetch --animate --logo <name>{R}",
+        OVL = OVERLAY0, R = RESET);
+    println!("  {OVL}colour it: arcfetch --logo <name> --color '#ff8800'{R}", OVL = OVERLAY0, R = RESET);
+    println!();
+}
+
+// ═══════════════════════════════════════════════════════════
+//  background animation (top strip, shell stays usable)
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Clone, Copy)]
+enum PanelMode<'a> {
+    Blackhole,
+    Animate(&'a str),
+}
+
+fn term_size() -> (usize, usize) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0;
+    if ok && ws.ws_row > 0 && ws.ws_col > 0 {
+        (ws.ws_col as usize, ws.ws_row as usize)
+    } else {
+        (80, 24)
+    }
+}
+
+/// Build one blackhole frame sized to the strip's animation area.
+fn panel_blackhole(cols: usize, rows: usize, frame: u64) -> Vec<String> {
+    let cx = cols as f64 / 2.0;
+    let cy = rows as f64 / 2.0;
+    let rot = (frame as f64 * std::f64::consts::PI / 6.0)
+        % (2.0 * std::f64::consts::PI);
+    let mut out = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut line = String::new();
+        let mut prev: Option<(u8, u8, u8)> = None;
+        for c in 0..cols {
+            let (color, ch) = bh_cell(c, r, cx, cy, rot, frame);
+            if ch == ' ' && color == (0, 0, 0) {
+                if prev.is_some() { line.push_str(RESET); prev = None; }
+                line.push(' ');
+            } else {
+                if prev != Some(color) {
+                    line.push_str(&format!("\x1b[38;2;{};{};{}m", color.0, color.1, color.2));
+                    prev = Some(color);
+                }
+                line.push(ch);
+            }
+        }
+        if prev.is_some() { line.push_str(RESET); }
+        out.push(line);
+    }
+    out
+}
+
+/// Build one logo frame with the colour wave.
+fn panel_logo(
+    logo_name: &str,
+    tick: usize,
+    effect: logos::AnimEffect,
+    palette: &[String],
+) -> Vec<String> {
+    let base = logos::from_name_frame(logo_name, tick / 6);
+    let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
+    let w = widths.iter().max().copied().unwrap_or(36);
+    let last = palette.len().saturating_sub(1);
+
+    base.iter().enumerate().map(|(i, raw)| {
+        let line = logos::animate_line(raw, i, tick, effect);
+        let mut s = String::new();
+        for (col, ch) in line.chars().enumerate() {
+            let phase = logos::color_wave_phase(i, col, tick);
+            let idx = ((phase * last as f32).round() as usize).min(last);
+            s.push_str(&palette[idx]);
+            s.push(ch);
+        }
+        s.push_str(RESET);
+        s.push_str(&" ".repeat(w.saturating_sub(widths[i])));
+        s
+    }).collect()
+}
+
+/// The terminal device this process is talking to, e.g. `/dev/pts/3`.
+fn tty_name() -> Option<String> {
+    for fd in [1, 0, 2] {
+        let raw = unsafe { libc::ttyname(fd) };
+        if raw.is_null() { continue; }
+        let name = unsafe { std::ffi::CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        if !name.is_empty() { return Some(name); }
+    }
+    None
+}
+
+/// Pid file keyed by terminal, so two terminals can pin at the same time.
+fn bg_pid_path() -> Option<std::path::PathBuf> {
+    let name = tty_name()?;
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::env::temp_dir(),
+    };
+    let slug: String = name
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    Some(dir.join(format!("arcfetch-{slug}.pid")))
+}
+
+fn pid_is_ours(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim() == "arcfetch")
+        .unwrap_or(false)
+}
+
+fn wait_for_exit(pid: i32) {
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } != 0 { return; }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if pid_is_ours(pid) {
+        unsafe { libc::kill(pid, libc::SIGKILL); }
+    }
+}
+
+/// Write escape sequences to the terminal even when stdout is redirected, so
+/// `arcfetch --stop >log` restores the terminal instead of filling the log.
+fn write_tty(seq: &[u8]) {
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(seq);
+        let _ = tty.flush();
+    } else {
+        let mut out = stdout().lock();
+        let _ = out.write_all(seq);
+        let _ = out.flush();
+    }
+}
+
+/// Undo the pin: ordinary full-screen scrolling, no origin mode. The cursor is
+/// saved and restored because both escapes home the terminal as a side effect.
+fn reset_pin() {
+    write_tty(b"\x1b7\x1b[?6l\x1b[r\x1b8");
+}
+
+/// On an explicit `--stop`, take the frozen frame away as well as the region.
+fn clear_pane(pane_h: usize) {
+    if pane_h == 0 { return; }
+    let mut seq = String::with_capacity(32 + pane_h * 12);
+    seq.push_str("\x1b7\x1b[?6l");
+    for y in 0..pane_h {
+        seq.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
+    }
+    seq.push_str("\x1b[r\x1b8");
+    write_tty(seq.as_bytes());
+}
+
+fn stop_background() {
+    let Some(path) = bg_pid_path() else { return };
+    let mut found = false;
+
+    // Clean up the pre-pin global pid file too, so an animation started by an
+    // older build does not keep drawing over the terminal.
+    if let Some(dir) = path.parent() {
+        let legacy = dir.join("arcfetch-anim.pid");
+        if legacy != path {
+            if let Ok(text) = std::fs::read_to_string(&legacy) {
+                found = true;
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    if pid_is_ours(pid) {
+                        unsafe { libc::kill(pid, libc::SIGTERM); }
+                        wait_for_exit(pid);
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        found = true;
+        if let Ok(pid) = text.trim().parse::<i32>() {
+            if pid_is_ours(pid) {
+                unsafe { libc::kill(pid, libc::SIGTERM); }
+                wait_for_exit(pid);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    if found {
+        reset_pin();
+    }
+}
+
+/// Build one frame for the pinned pane.
+fn pane_frame(
+    mode: PanelMode,
+    logo_name: &str,
+    custom: &Option<Vec<String>>,
+    cfg: &Config,
+    pane_cols: usize,
+    pane_h: usize,
+    frame: u64,
+) -> Vec<String> {
+    match mode {
+        PanelMode::Blackhole => panel_blackhole(pane_cols, pane_h, frame),
+        PanelMode::Animate(effect) => {
+            let mut block = match custom {
+                Some(lines) => lines.clone(),
+                None => panel_logo(
+                    logo_name,
+                    frame as usize,
+                    parse_effect(effect),
+                    &cfg.colors.logo,
+                ),
+            };
+            block.truncate(pane_h);
+            block
+        }
+    }
+}
+
+/// Rows the pinned pane may claim on a terminal of `rows` rows.
+fn pane_height(mode: PanelMode, first_lines: Option<&[String]>, rows: usize) -> usize {
+    // Leave room for the gap row and at least four rows of shell.
+    let usable = rows.saturating_sub(5).max(1);
+    match mode {
+        PanelMode::Blackhole => (rows * 55 / 100).min(usable).max(1),
+        PanelMode::Animate(_) => first_lines
+            .map(|l| l.len())
+            .unwrap_or(1)
+            .min(usable)
+            .max(1),
+    }
+}
+
+/// Put the animation in a pinned pane above the shell and return immediately.
+///
+/// The terminal's scroll region is set below the pane, so the shell's prompt
+/// and all command output scroll under it and never push the art away. The
+/// animation runs in a child in its own process group (but the shell's
+/// session), so it can tell when a full-screen program owns the terminal and
+/// pause instead of painting over it. The shell itself is untouched: aliases,
+/// completion and starship keep working.
+fn run_background(
+    mode: PanelMode,
+    logo_name: &str,
+    custom: &Option<Vec<String>>,
+    cfg: &Config,
+    duration: Option<u64>,
+    no_color: bool,
+) {
+    let (cols, rows) = term_size();
+    if cols < 20 || rows < 8 {
+        return;
+    }
+
+    // A frame at tick 0 gives the logo its natural height.
+    let first_lines = match mode {
+        PanelMode::Animate(effect) => Some(match custom {
+            Some(lines) => lines.clone(),
+            None => panel_logo(logo_name, 0, parse_effect(effect), &cfg.colors.logo),
+        }),
+        PanelMode::Blackhole => None,
+    };
+
+    let pane_h = pane_height(mode, first_lines.as_deref(), rows);
+    let pane_cols = cols.min(120);
+    let scroll_top = (pane_h + 2) as u16;
+    let bottom = rows as u16;
+
+    // Replace any pin already on this terminal. This also resets a region
+    // left behind by a crash before we install the new one.
+    stop_background();
+
+    let shell_pid = unsafe { libc::getppid() };
+    let mut shell_pgid = unsafe { libc::getpgid(shell_pid) };
+    if shell_pgid < 0 {
+        shell_pgid = shell_pid;
+    }
+
+    // Clear the screen, confine scrolling to the rows below the pane, and home
+    // the cursor there. The shell's next prompt lands at scroll_top.
+    {
+        let mut out = stdout().lock();
+        let _ = write!(
+            out,
+            "\x1b[?6l\x1b[r\x1b[2J\x1b[{};{}r\x1b[?6h\x1b[H",
+            scroll_top, bottom
+        );
+        let _ = out.flush();
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        reset_pin();
+        return;
+    }
+    if pid > 0 {
+        // Write it before returning: `arcfetch --stop` straight afterwards must
+        // find the process that is actually drawing.
+        if let Some(path) = bg_pid_path() {
+            let _ = std::fs::write(path, pid.to_string());
+        }
+        return;
+    }
+
+    // ---- child ----
+    // Its own process group, so Ctrl+C at the shell prompt does not kill it,
+    // but the same session, so tcgetpgrp() can see who owns the terminal.
+    unsafe {
+        libc::setpgid(0, 0);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, sigint_handler as *const () as libc::sighandler_t);
+    }
+    RUNNING.store(true, Ordering::Relaxed);
+
+    let start = std::time::Instant::now();
+    let limit = match duration {
+        None | Some(0) => None,
+        Some(n) => Some(Duration::from_secs(n)),
+    };
+
+    let mut cur_cols = cols;
+    let mut cur_rows = rows;
+    let mut cur_pane_h = pane_h;
+    let mut cur_pane_cols = pane_cols;
+    let mut cur_scroll_top = scroll_top;
+    let mut painted_h = 0usize;
+    let mut held = true;
+    let mut invalidate = true;
+    let mut frame: u64 = 0;
+
+    loop {
+        if !RUNNING.load(Ordering::Relaxed) { break; }
+        if let Some(lim) = limit {
+            if start.elapsed() >= lim { break; }
+        }
+
+        // The shell that owns the pin went away: take the region with us.
+        if unsafe { libc::kill(shell_pid, 0) } != 0 { break; }
+
+        let foreground = unsafe { libc::tcgetpgrp(1) };
+        if foreground < 0 { break; }
+        let holds = foreground == shell_pgid;
+
+        if holds {
+            // A resize drops the scroll region. Put it back before painting.
+            let (w, h) = term_size();
+            if (w, h) != (cur_cols, cur_rows) {
+                cur_cols = w;
+                cur_rows = h;
+                cur_pane_cols = w.min(120);
+                // Keep the pane height, and with it the shell's prompt row,
+                // stable across ordinary resizes. Only shrink when the
+                // terminal can no longer hold the pane above the shell.
+                if cur_scroll_top > h as u16 {
+                    cur_pane_h = pane_height(mode, first_lines.as_deref(), h);
+                    cur_scroll_top = (cur_pane_h + 2).min(h) as u16;
+                }
+                let mut out = stdout().lock();
+                // Clear the gap row too: a shrink can slide the shell's first
+                // prompt line into it, and that row is outside the region, so
+                // it would otherwise stay pinned there forever.
+                let gap = cur_scroll_top.saturating_sub(1).max(1);
+                let _ = write!(
+                    out,
+                    "\x1b7\x1b[?6l\x1b[{};1H\x1b[2K\x1b[{};{}r\x1b[?6h\x1b8",
+                    gap, cur_scroll_top, h as u16
+                );
+                let _ = out.flush();
+                invalidate = true;
+            }
+
+            if !held {
+                // A full-screen program may have reset the region on exit.
+                // Clear the gap row too: the program may have left something
+                // there, and it is outside the scrolling region.
+                let mut out = stdout().lock();
+                let gap = cur_scroll_top.saturating_sub(1).max(1);
+                let _ = write!(
+                    out,
+                    "\x1b7\x1b[?6l\x1b[{};1H\x1b[2K\x1b[{};{}r\x1b[?6h\x1b8",
+                    gap, cur_scroll_top, cur_rows as u16
+                );
+                let _ = out.flush();
+                invalidate = true;
+            }
+
+            let block = pane_frame(
+                mode, logo_name, custom, cfg, cur_pane_cols, cur_pane_h, frame,
+            );
+            let block: Vec<String> = if no_color {
+                block.iter().map(|l| strip_ansi(l)).collect()
+            } else {
+                block
+            };
+
+            // Logos are centred in the pane; the blackhole fills it.
+            let left = match mode {
+                PanelMode::Animate(_) => {
+                    let w = block.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
+                    cur_cols.saturating_sub(w) / 2
+                }
+                PanelMode::Blackhole => cur_cols.saturating_sub(cur_pane_cols) / 2,
+            };
+
+            // Never clear below the top of the new scroll region: that is the
+            // shell's space, not ours.
+            let clear_to = painted_h
+                .max(cur_pane_h)
+                .min(cur_scroll_top.saturating_sub(1) as usize);
+            let mut scr = String::with_capacity(4096);
+            scr.push_str("\x1b[?2026h"); // synchronized update, ignored if unsupported
+            scr.push_str("\x1b7");
+            scr.push_str("\x1b[?6l"); // the pane lives at absolute rows 1..pane_h
+
+            if invalidate {
+                for y in 0..clear_to {
+                    scr.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
+                }
+                invalidate = false;
+            }
+
+            let visible = block.len().min(cur_pane_h);
+            for (y, line) in block.iter().take(visible).enumerate() {
+                scr.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
+                if left > 0 {
+                    scr.push_str(&" ".repeat(left));
+                }
+                scr.push_str(line);
+            }
+            // If the frame got shorter, erase the rows it used to occupy.
+            for y in visible..clear_to {
+                scr.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
+            }
+
+            scr.push_str(RESET);
+            scr.push_str("\x1b[?6h");
+            scr.push_str("\x1b8");
+            scr.push_str("\x1b[?2026l");
+
+            let mut out = stdout().lock();
+            if out.write_all(scr.as_bytes()).is_err() { break; }
+            if out.flush().is_err() { break; }
+            drop(out);
+
+            painted_h = cur_pane_h;
+            frame += 1;
+        }
+
+        held = holds;
+        thread::sleep(Duration::from_millis(70));
+    }
+
+    // Leave the shell a normal terminal again. A timer expiry leaves the last
+    // frame as a static picture; an explicit --stop takes it away too.
+    if !RUNNING.load(Ordering::Relaxed) && held {
+        clear_pane(cur_pane_h);
+    } else {
+        reset_pin();
+    }
+
+    if let Some(path) = bg_pid_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if text.trim() == std::process::id().to_string() {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    unsafe { libc::_exit(0); }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  main
 // ═══════════════════════════════════════════════════════════
 
+/// Repopulate the slow network caches in the background. Invoked by the
+/// detached child that [`cache::get_or_compute_swr`] spawns; produces no output.
+fn refresh_cache() {
+    crate::cache::set("public_ip", &net::public_ip().unwrap_or_else(|| "N/A".into()));
+    crate::cache::set("weather", &net::weather("").unwrap_or_else(|| "N/A".into()));
+}
+
 fn main() {
+    // behave like standard Unix tools when the reader goes away (e.g. `arcfetch | head`)
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+
+    // Stale-while-revalidate worker: refresh the network caches, then exit.
+    if env::var_os("ARCFETCH_REFRESH_CACHE").is_some() {
+        refresh_cache();
+        return;
+    }
+
     let mut args = parse_args();
     let cfg_path = config::config_path();
 
     if args.version  { print_version();               return; }
     if args.help     { print_help(&cfg_path);          return; }
     if args.show_cfg { print_config_help(&cfg_path); write_sample_config(&cfg_path); return; }
+    if args.list_logos { print_logos(); return; }
+    if args.stop { stop_background(); return; }
 
     // mutual exclusion for display modes
-    let mode_count = [args.blackhole, args.cosmic, args.quantum, args.mandelbrot].iter().filter(|&&m| m).count();
+    let mode_count = [args.blackhole, args.cosmic, args.quantum, args.mandelbrot, args.animate.is_some()]
+        .iter().filter(|&&m| m).count();
     if mode_count > 1 {
-        eprintln!("arcfetch: only one display mode at a time (--blackhole, --cosmic, --quantum, --mandelbrot)");
+        eprintln!("arcfetch: only one display mode at a time (--blackhole, --cosmic, --quantum, --mandelbrot, --animate)");
         return;
     }
 
     let mut cfg = config::load(args.accent.as_deref(), args.preset.as_deref());
 
-    // --color overrides logo/accent color
+    // --all enables every optional field; -s/--structure shows only the listed ones
+    if args.all { cfg.show.enable_all(); }
+    if let Some(ref st) = args.structure { cfg.show.select(st); }
+
+    // --scheme replaces the whole palette (then --accent / ARCFETCH_ACCENT re-wins)
+    if let Some(ref s) = args.scheme {
+        match config::scheme(s) {
+            Some(c) => {
+                cfg.colors = c;
+                if let Some(a) = args.accent.clone().or_else(|| env::var("ARCFETCH_ACCENT").ok()) {
+                    let ansi = config::resolve(&a);
+                    cfg.colors.accent = ansi.clone();
+                    cfg.colors.hostname = ansi;
+                }
+            }
+            None => eprintln!("arcfetch: unknown scheme '{}' (try: {})", s, config::SCHEMES.join(", ")),
+        }
+    }
+
+    // --color overrides logo/accent colour: name, #RRGGBB, rgb(), colorN, or random
     if let Some(ref color) = args.color {
         if color == "random" {
             use config::*;
@@ -1034,27 +2189,40 @@ fn main() {
                 .as_nanos() as usize;
             cfg.colors.accent = palette[seed % palette.len()].into();
         } else {
-            let ansi = config::name_to_ansi(color);
-            if ansi.is_empty() && color.starts_with('#') {
-                // hex color: construct ANSI escape
-                if color.len() >= 7 {
-                    if let (Ok(r), Ok(g), Ok(b)) = (
-                        u8::from_str_radix(&color[1..3], 16),
-                        u8::from_str_radix(&color[3..5], 16),
-                        u8::from_str_radix(&color[5..7], 16),
-                    ) {
-                        cfg.colors.accent = format!("\x1b[38;2;{};{};{}m", r, g, b);
-                    }
-                }
-            } else if !ansi.is_empty() {
-                cfg.colors.accent = ansi.into();
-            }
+            cfg.colors.accent = config::resolve(color);
         }
     }
 
-    // auto-disable color & animations when stdout is not a terminal
+    // auto-disable colour when stdout is not a terminal; honour NO_COLOR / CLICOLOR / FORCE_COLOR
     let is_tty = unsafe { libc::isatty(1) } != 0;
-    if !is_tty { args.no_color = true; }
+    let force_color = env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty());
+    if !is_tty && !force_color { args.no_color = true; }
+    if env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) { args.no_color = true; }
+    if env::var("CLICOLOR").ok().as_deref() == Some("0") { args.no_color = true; }
+
+    // Down-sample colours to what the terminal can actually show (truecolor →
+    // 256 → 16), so the tool stays legible on any terminal.
+    let depth = if args.no_color {
+        config::ColorDepth::True
+    } else {
+        config::ColorDepth::detect()
+    };
+    config::apply_depth(&mut cfg.colors, depth);
+
+    // --watch: re-run this binary every second, clearing the screen each time
+    if args.watch {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let child_args: Vec<String> = std::env::args().skip(1)
+            .filter(|a| a != "--watch").collect();
+        if is_tty { print!("\x1b[?25l"); let _ = stdout().flush(); }
+        while RUNNING.load(Ordering::Relaxed) {
+            if is_tty { print!("\x1b[2J\x1b[H"); let _ = stdout().flush(); }
+            let _ = std::process::Command::new(&exe).args(&child_args).status();
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        if is_tty { print!("\x1b[?25h"); let _ = stdout().flush(); }
+        return;
+    }
 
     // apply logo from config (CLI overrides config)
     if !args.logo_explicit {
@@ -1074,6 +2242,12 @@ fn main() {
         || cfg.show.ip || cfg.show.ssh || cfg.show.ports;
     let si = info::collect_all(need_net, &cfg.show);
 
+    // --json: emit machine-readable output and exit
+    if args.json {
+        print_json(&si, &cfg);
+        return;
+    }
+
     // science seed — one /proc/uptime read for both quote & logo
     let sci_seed = uptime_seed();
 
@@ -1091,7 +2265,13 @@ fn main() {
         } else {
             info_lines
         };
-        run_blackhole(&out_lines, args.duration);
+        if args.foreground {
+            stop_background();
+            run_blackhole(&out_lines, args.duration);
+        } else {
+            let no_custom: Option<Vec<String>> = None;
+            run_background(PanelMode::Blackhole, "arch", &no_custom, &cfg, args.duration, args.no_color);
+        }
         return;
     }
 
@@ -1120,7 +2300,7 @@ fn main() {
                 while i < bytes.len() {
                     if bytes[i] == b'$' && i + 1 < bytes.len() {
                         let next = bytes[i + 1];
-                        if next >= b'1' && next <= b'9' {
+                        if (b'1'..=b'9').contains(&next) {
                             out.push_str(&colors.logo[(next - b'1') as usize]);
                             i += 2; continue;
                         }
@@ -1180,7 +2360,7 @@ fn main() {
     };
 
     let logo_name = {
-        let base = if args.logo == "auto" { detect_auto_logo() }
+        let base = if args.logo == "auto" { detect_auto_logo(&si) }
                    else if !args.logo_explicit && cfg.preset.as_deref() == Some("minimal") { "mini".into() }
                    else { args.logo.clone() };
         if custom_lines.is_none() && is_science && !args.logo_explicit {
@@ -1203,10 +2383,40 @@ fn main() {
         info_lines
     };
 
+    // ── animated logo mode ──
+    if let Some(ref eff) = args.animate {
+        if !is_tty {
+            eprintln!("arcfetch: --animate requires a terminal");
+            return;
+        }
+        if args.foreground {
+            stop_background();
+            run_animate(&out_lines, &logo_name, &custom_lines, &cfg, &args, eff, args.duration);
+        } else {
+            run_background(PanelMode::Animate(eff), &logo_name, &custom_lines, &cfg, args.duration, args.no_color);
+        }
+        return;
+    }
+
     // ── cosmic mode ──
     if args.cosmic {
         cosmic::run(&out_lines, &logo_name, &cfg, &args);
         return;
+    }
+
+    // ── short intro animation in normal mode (TTY only) ──
+    if is_tty
+        && !args.no_intro
+        && cfg.animation.enabled
+        && cfg.animation.intro_ms > 0
+        && custom_lines.is_none()
+        && image_escape.is_none()
+    {
+        let animated_logo = matches!(logo_name.as_str(), "atom" | "dna" | "arcreactor");
+        let effect_on = !cfg.animation.effect.eq_ignore_ascii_case("none");
+        if animated_logo || effect_on {
+            run_intro(&out_lines, &logo_name, &cfg, &args, &cfg.animation);
+        }
     }
 
     // ── single-buffer render (one syscall) ──
@@ -1238,9 +2448,9 @@ fn main() {
             let inf  = out_lines.get(i).map(String::as_str).unwrap_or("");
             if args.no_color {
                 let stripped = if ll.contains('\x1b') { strip_ansi(ll) } else { ll.to_string() };
-                let _ = write!(out, "  {}{:pad$}  {}\n", stripped, "", inf, pad = pad);
+                let _ = writeln!(out, "  {}{:pad$}  {}", stripped, "", inf, pad = pad);
             } else {
-                let _ = write!(out, "  {}{}{:pad$}{}  {}\n",
+                let _ = writeln!(out, "  {}{}{:pad$}{}  {}",
                     cfg.colors.accent, ll, "", RESET, inf, pad = pad);
             }
         }
@@ -1255,15 +2465,20 @@ fn main() {
             let pad  = logo_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
             let inf  = out_lines.get(i).map(String::as_str).unwrap_or("");
             if args.no_color {
-                let _ = write!(out, "  {}{:pad$}  {}\n", ll, "", inf, pad = pad);
+                let _ = writeln!(out, "  {}{:pad$}  {}", ll, "", inf, pad = pad);
             } else {
                 let lc = logo_line_color(&logo_name, i, &cfg, args.color.is_some());
-                let _ = write!(out, "  {}{}{:pad$}{}  {}\n",
+                let _ = writeln!(out, "  {}{}{:pad$}{}  {}",
                     lc, ll, "", RESET, inf, pad = pad);
             }
         }
     }
 
     out.push('\n');
+    let out = if depth == config::ColorDepth::True {
+        out
+    } else {
+        config::downgrade_str(&out, depth)
+    };
     unsafe { libc::write(1, out.as_ptr().cast::<core::ffi::c_void>(), out.len()); }
 }

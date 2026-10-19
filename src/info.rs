@@ -1,5 +1,7 @@
 use std::{env, fs};
 
+use crate::{modules, net};
+
 pub struct SysInfo {
     pub os:          String,
     pub kernel:      String,
@@ -41,12 +43,108 @@ pub struct SysInfo {
     pub de_wm_ver:   String,
     pub init_ver:    String,
     pub local_ip:    String,
+    pub os_id:       String,
+    pub os_id_like:  String,
+    // opt-in modules
+    pub datetime:      String,
+    pub editor:        String,
+    pub dns:           String,
+    pub host:          String,
+    pub chassis:       String,
+    pub bootmgr:       String,
+    pub cpu_cache:     String,
+    pub login_manager: String,
+    pub brightness:    String,
+    pub cpu_usage:     String,
+    pub diskio:        String,
+    pub netio:         String,
+    pub physmem:       String,
+    pub gpu_mem:       String,
+    pub btrfs:         String,
+    pub wifi:          String,
+    pub users:         String,
+    pub wallpaper:     String,
+    pub media:         String,
+    pub public_ip:     String,
+    pub weather:       String,
+    pub opengl:        String,
+    pub vulkan:        String,
+    pub cursor:        String,
+    pub term_size:     String,
+    pub term_theme:    String,
+    pub codec:         String,
+    pub bluetooth:     String,
+    pub camera:        String,
+    pub mouse:         String,
+    pub keyboard:      String,
+    pub tpm:           String,
+    pub physical_disk: String,
+    pub top_processes: String,
+    pub monitor:       String,
 }
 
 // ── Low-level helpers ────────────────────────────────────
 
 #[inline]
 fn slurp(p: &str) -> String { fs::read_to_string(p).unwrap_or_default() }
+
+/// CPU package temperature in whole °C.
+///
+/// Prefers hwmon drivers (`k10temp`/`zenpower` on AMD, `coretemp` on Intel,
+/// generic SoC thermal on ARM) and falls back to ACPI thermal zones. Returns
+/// `None` when no CPU sensor is exposed.
+fn cpu_temp_c() -> Option<u32> {
+    const CPU_SENSORS: &[&str] = &[
+        "k10temp", "zenpower", "coretemp", "k8temp", "cpu_thermal", "cpu-thermal",
+        "soc_thermal", "soc-thermal", "arm_thermal", "x86_pkg_temp", "acpitz",
+    ];
+    // 1. hwmon — name match, then read the package sensor (temp1 = Tctl /
+    //    "Package id 0"); fall back to any positive tempN_input.
+    if let Ok(dir) = fs::read_dir("/sys/class/hwmon") {
+        for e in dir.flatten() {
+            let base = e.path();
+            let name = fs::read_to_string(base.join("name")).unwrap_or_default();
+            let name = name.trim().to_ascii_lowercase();
+            if !CPU_SENSORS.iter().any(|s| name == *s) { continue; }
+            for cand in ["temp1_input", "temp2_input", "temp3_input"] {
+                if let Ok(mc) = fs::read_to_string(base.join(cand)).unwrap_or_default()
+                    .trim().parse::<u32>()
+                {
+                    if mc > 0 { return Some(mc / 1000); }
+                }
+            }
+        }
+    }
+    // 2. ACPI / SoC thermal zones whose type names a CPU.
+    if let Ok(dir) = fs::read_dir("/sys/class/thermal") {
+        for e in dir.flatten() {
+            let base = e.path();
+            let ty = fs::read_to_string(base.join("type")).unwrap_or_default();
+            let ty = ty.trim().to_ascii_lowercase();
+            if !(ty.contains("cpu") || ty.contains("pkg") || ty.contains("soc") || ty.contains("x86")) {
+                continue;
+            }
+            if let Ok(mc) = fs::read_to_string(base.join("temp")).unwrap_or_default()
+                .trim().parse::<u32>()
+            {
+                if mc > 0 { return Some(mc / 1000); }
+            }
+        }
+    }
+    None
+}
+
+/// Seconds since boot via `sysinfo(2)`, or 0 on failure.
+pub fn system_uptime_secs() -> u64 {
+    let mut info = std::mem::MaybeUninit::<libc::sysinfo>::uninit();
+    // SAFETY: `sysinfo` initializes the whole struct when it returns 0.
+    if unsafe { libc::sysinfo(info.as_mut_ptr()) } == 0 {
+        // SAFETY: initialized by the successful call above.
+        unsafe { info.assume_init() }.uptime as u64
+    } else {
+        0
+    }
+}
 
 /// CPU brand string via CPUID (~1µs) — just the name, no frequency/cores
 #[inline]
@@ -100,7 +198,9 @@ fn gpu_probe() -> String {
             }
         }
     }
-    // 3. PCI fallback (slow — only when DRM/NVIDIA fail)
+    // 3. PCI fallback (only when DRM/NVIDIA fail) — the name is resolved from
+    //    `pci.ids` and cached, since this path runs on every invocation on
+    //    machines (e.g. AMD APUs) that expose no `product_name`.
     if let Ok(devs) = fs::read_dir("/sys/bus/pci/devices") {
         for e in devs.flatten() {
             let p = e.path();
@@ -110,16 +210,151 @@ fn gpu_probe() -> String {
                 _ => continue,
             }
             let vid = fs::read_to_string(p.join("vendor")).unwrap_or_default();
+            let vid = vid.trim().to_string();
             let did = fs::read_to_string(p.join("device")).unwrap_or_default();
-            return match vid.trim() {
-                "0x1002" => format!("AMD GPU ({})", did.trim()),
-                "0x10de" => format!("NVIDIA GPU ({})", did.trim()),
-                "0x8086" => format!("Intel GPU ({})", did.trim()),
-                v        => format!("GPU {}", v),
-            };
+            let did = did.trim().to_string();
+            let key = format!("gpu_pci_{vid}_{did}");
+            return crate::cache::get_or_compute_ttl(&key, 86_400, || gpu_pci_name(&vid, &did));
         }
     }
     "Unknown".into()
+}
+
+/// Human-readable GPU name for a `("0x1002", "0x15e7")` PCI vendor/device pair.
+/// Uses the system `pci.ids` database when present, else a vendor label.
+fn gpu_pci_name(vid: &str, did: &str) -> String {
+    let short = match vid {
+        "0x1002" => "AMD",
+        "0x10de" => "NVIDIA",
+        "0x8086" => "Intel",
+        _ => "",
+    };
+    let vid_n = u16::from_str_radix(vid.trim_start_matches("0x"), 16).unwrap_or(0);
+    let did_n = u16::from_str_radix(did.trim_start_matches("0x"), 16).unwrap_or(0);
+    if let Some(name) = pci_ids_name(vid_n, did_n) {
+        return format!("{short} {name}").trim().to_string();
+    }
+    if short.is_empty() {
+        format!("GPU {vid}")
+    } else {
+        format!("{short} GPU ({did})")
+    }
+}
+
+/// Look up a PCI device name in the system `pci.ids` database.
+fn pci_ids_name(vid: u16, did: u16) -> Option<String> {
+    const PATHS: &[&str] = &[
+        "/usr/share/hwdata/pci.ids",
+        "/usr/share/misc/pci.ids",
+        "/usr/share/pci.ids",
+        "/usr/share/pciutils/pci.ids",
+        "/var/lib/pciutils/pci.ids",
+    ];
+    let want_v = format!("{vid:04x}");
+    let want_d = format!("{did:04x}");
+    for path in PATHS {
+        let Ok(raw) = fs::read_to_string(path) else { continue };
+        let mut in_vendor = false;
+        for line in raw.lines() {
+            if line.is_empty() || line.starts_with('#') { continue; }
+            if !line.starts_with('\t') {
+                // vendor line: "1002  Advanced Micro Devices, Inc. [AMD/ATI]"
+                in_vendor = line.get(..4)
+                    .map(|v| v.eq_ignore_ascii_case(&want_v))
+                    .unwrap_or(false);
+                continue;
+            }
+            if !in_vendor { continue; }
+            // device lines have one tab; subsystem lines have two
+            let Some(rest) = line.strip_prefix('\t') else { continue };
+            if rest.starts_with('\t') { continue; }
+            if rest.get(..4).map(|d| d.eq_ignore_ascii_case(&want_d)).unwrap_or(false) {
+                let name = rest[4..].trim();
+                if !name.is_empty() { return Some(name.to_string()); }
+            }
+        }
+    }
+    None
+}
+
+/// A `getifaddrs(3)` result that frees itself on drop.
+struct IfAddrs(*mut libc::ifaddrs);
+
+impl Drop for IfAddrs {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from a successful `getifaddrs` call.
+        unsafe { libc::freeifaddrs(self.0) };
+    }
+}
+
+/// Interface carrying the IPv4 default route, from `/proc/net/route`.
+fn default_route_iface() -> Option<String> {
+    let route = slurp("/proc/net/route");
+    for line in route.lines().skip(1) {
+        // Iface Destination Gateway Flags …
+        let mut f = line.split_whitespace();
+        let iface = f.next()?;
+        let dest = f.next().unwrap_or("");
+        let _gw = f.next();
+        let flags = f.next().unwrap_or("");
+        if dest == "00000000"
+            && u32::from_str_radix(flags, 16).map(|v| v & 0x1 != 0).unwrap_or(false)
+        {
+            return Some(iface.to_string());
+        }
+    }
+    None
+}
+
+/// Primary IPv4 address as `("iface", "a.b.c.d")`.
+///
+/// Prefers the interface that carries the default route so bridges, VM
+/// adapters and drained interfaces can't shadow the real one; skips
+/// down/loopback/point-to-point links and link-local addresses.
+fn local_ipv4() -> Option<(String, String)> {
+    let want = default_route_iface();
+
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `list` is a valid out-pointer; on success it points at an owned list.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so `list` is valid and owned; the guard frees it.
+    let list = IfAddrs(list);
+
+    let mut best: Option<(String, String)> = None;
+    let mut cur = list.0;
+    while !cur.is_null() {
+        // SAFETY: `cur` always points at a node in the list owned by `list`.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() { continue; }
+        // SAFETY: `ifa_addr` is non-null and points at a `sockaddr`.
+        let family = unsafe { (*ifa.ifa_addr).sa_family } as libc::c_int;
+        if family != libc::AF_INET { continue; }
+
+        let flags = ifa.ifa_flags as libc::c_int;
+        if flags & libc::IFF_UP == 0 { continue; }
+        if flags & (libc::IFF_LOOPBACK | libc::IFF_POINTOPOINT) != 0 { continue; }
+
+        // SAFETY: `ifa_name` is a NUL-terminated C string.
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: `family` is `AF_INET`, so the address is a `sockaddr_in`.
+        let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+        let octets = sa.sin_addr.s_addr.to_ne_bytes();
+        let ip = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+        if ip.starts_with("127.") || ip.starts_with("169.254.") || ip == "0.0.0.0" { continue; }
+
+        if want.as_deref() == Some(name.as_str()) {
+            return Some((name, ip));
+        }
+        if best.is_none() {
+            best = Some((name, ip));
+        }
+    }
+    best
 }
 
 /// Collect all system info.
@@ -128,16 +363,55 @@ fn gpu_probe() -> String {
 pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     // ── fast sequential: all reads on main thread ──────────
 
-    // /proc/meminfo — single pass (gated on show.memory || show.swap)
-    let (mem_used, mem_total) = if show.memory || show.swap {
+    // /proc/meminfo — single pass shared by memory + swap (was read twice)
+    let (mem_used, mem_total, swap) = if show.memory || show.swap {
         let raw = slurp("/proc/meminfo");
-        let (mut tot, mut avl) = (0u64, 0u64);
+        let (mut mem_total_kib, mut mem_avail_kib) = (0u64, 0u64);
+        let (mut swap_total_kib, mut swap_free_kib) = (0u64, 0u64);
         for line in raw.lines() {
-            if      line.starts_with("MemTotal:")     { tot = line.split_ascii_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
-            else if line.starts_with("MemAvailable:") { avl = line.split_ascii_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); break; }
+            let Some((key, rest)) = line.split_once(':') else { continue };
+            let value = rest
+                .split_ascii_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            match key {
+                "MemTotal"     => mem_total_kib = value,
+                "MemAvailable" => mem_avail_kib = value,
+                "SwapTotal"    => swap_total_kib = value,
+                "SwapFree"     => swap_free_kib = value,
+                _ => {}
+            }
         }
-        (tot.saturating_sub(avl) / 1024, tot / 1024)
-    } else { (0, 0) };
+
+        let (used, total) = if show.memory {
+            (
+                mem_total_kib.saturating_sub(mem_avail_kib) / 1024,
+                mem_total_kib / 1024,
+            )
+        } else {
+            (0, 0)
+        };
+
+        let swap = if show.swap {
+            if swap_total_kib > 0 {
+                let swap_used = swap_total_kib.saturating_sub(swap_free_kib);
+                format!(
+                    "{:.1}G / {:.1}G",
+                    swap_used as f64 / 1_048_576.0,
+                    swap_total_kib as f64 / 1_048_576.0
+                )
+            } else {
+                "N/A".into()
+            }
+        } else {
+            String::new()
+        };
+
+        (used, total, swap)
+    } else {
+        (0, 0, String::new())
+    };
 
     // CPUID + sysconf (no I/O) + frequency (cached) — gated on show.cpu
     let cpu = if show.cpu {
@@ -158,31 +432,42 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         }
     } else { String::new() };
 
+    // /etc/os-release — read once (pretty name + IDs for logo detection)
+    let os_raw = if show.os { Some(slurp("/etc/os-release")) } else { None };
+    let os_id = os_raw.as_deref()
+        .and_then(|r| r.lines().find(|l| l.starts_with("ID=")))
+        .map(|l| l[3..].trim().trim_matches('"').to_string()).unwrap_or_default();
+    let os_id_like = os_raw.as_deref()
+        .and_then(|r| r.lines().find(|l| l.starts_with("ID_LIKE=")))
+        .map(|l| l[8..].trim().trim_matches('"').to_string()).unwrap_or_default();
+
     let os = if show.os {
         crate::cache::get_or_compute("os", 86400, || {
-            slurp("/etc/os-release").lines()
-                .find(|l| l.starts_with("PRETTY_NAME="))
+            os_raw.as_deref()
+                .and_then(|r| r.lines().find(|l| l.starts_with("PRETTY_NAME=")))
                 .map(|l| l[12..].trim_matches('"').to_string())
                 .unwrap_or_else(|| "Arch Linux".into())
         })
     } else { String::new() };
 
     let kernel = if show.kernel {
-        let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
-        if unsafe { libc::uname(&mut uts) } == 0 {
-            let rel = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) };
-            rel.to_string_lossy().to_string()
-        } else { "unknown".into() }
+        let mut uts = std::mem::MaybeUninit::<libc::utsname>::uninit();
+        // SAFETY: `uname` fully initializes `uts` when it returns 0.
+        if unsafe { libc::uname(uts.as_mut_ptr()) } == 0 {
+            // SAFETY: initialized by the successful call above.
+            let uts = unsafe { uts.assume_init() };
+            // SAFETY: `uts.release` is a NUL-terminated C string.
+            unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "unknown".into()
+        }
     } else { String::new() };
 
     // uptime via sysinfo (1 syscall, no file I/O)
     let (uptime_secs, uptime) = if show.uptime {
-        let secs: u64 = {
-            let mut si: libc::sysinfo = unsafe { std::mem::zeroed() };
-            if unsafe { libc::sysinfo(&mut si) } == 0 {
-                si.uptime as u64
-            } else { 0 }
-        };
+        let secs = system_uptime_secs();
         let (d, h, m) = (secs/86400, (secs%86400)/3600, (secs%3600)/60);
         let short = match (d, h, m) {
             (0, 0, m) => format!("{}m", m),
@@ -244,11 +529,14 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
 
     // disk — one statvfs syscall
     let disk = if show.disk {
-        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(b"/\0".as_ptr().cast::<libc::c_char>(), &mut st) } == 0 {
-            let blk   = st.f_frsize as u64;
-            let total = st.f_blocks as u64 * blk;
-            let avail = st.f_bavail as u64 * blk;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `c"/"` is a valid NUL-terminated path; `statvfs` fills `st` on success.
+        if unsafe { libc::statvfs(c"/".as_ptr(), st.as_mut_ptr()) } == 0 {
+            // SAFETY: initialized by the successful call above.
+            let st = unsafe { st.assume_init() };
+            let blk   = st.f_frsize;
+            let total = st.f_blocks * blk;
+            let avail = st.f_bavail * blk;
             let gb    = 1_073_741_824.0f64;
             format!("{:.1}G / {:.1}G",
                 total.saturating_sub(avail) as f64 / gb, total as f64 / gb)
@@ -298,13 +586,9 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         }.to_string()
     } else { String::new() };
 
-    // cpu_temp — /sys/class/thermal/thermal_zone0/temp
+    // cpu_temp — hwmon (k10temp/coretemp/…) with ACPI thermal-zone fallback
     let cpu_temp = if show.cpu_temp {
-        let raw = slurp("/sys/class/thermal/thermal_zone0/temp");
-        match raw.trim().parse::<u32>() {
-            Ok(mc) if mc > 0 => format!("{}°C", mc / 1000),
-            _ => "N/A".into(),
-        }
+        cpu_temp_c().map(|c| format!("{}°C", c)).unwrap_or_else(|| "N/A".into())
     } else { String::new() };
 
     // processes — count numeric entries in /proc
@@ -333,29 +617,11 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
 
     // ── network: only collected for hacker preset ─────────
     let (ip, ssh, ports) = if need_network {
-        // local IP from /proc/net/fib_trie (no subprocess)
-        let ip = {
-            let mut found = String::new();
-            if let Ok(raw) = fs::read_to_string("/proc/net/fib_trie") {
-                let mut local = false;
-                for line in raw.lines() {
-                    let t = line.trim();
-                    if t.ends_with("LOCAL") { local = true; continue; }
-                    if local && t.starts_with("32 host") { local = false; continue; }
-                    if local {
-                        if let Some(ip_part) = t.strip_prefix("|-- ").or_else(|| t.strip_prefix("+-- ")) {
-                            let ip_str = ip_part.trim();
-                            if ip_str != "127.0.0.1" && !ip_str.starts_with("127.")
-                                && ip_str != "0.0.0.0" && ip_str.contains('.') {
-                                found = ip_str.to_string();
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if found.is_empty() { "N/A".into() } else { found }
-        };
+        // primary interface address via getifaddrs(3) — no subprocess, and it
+        // follows the default route instead of fib_trie's broadcast /32 entries.
+        let ip = local_ipv4()
+            .map(|(_, ip)| ip)
+            .unwrap_or_else(|| "N/A".into());
         // SSH: port 22 (0x0016) in LISTEN (0A) in /proc/net/tcp
         let ssh = {
             let tcp = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
@@ -389,20 +655,6 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     } else { String::new() };
 
     // ── new fastfetch-inspired fields ───────────────────
-
-    // swap — read SwapTotal and SwapFree from /proc/meminfo (already slurped)
-    let swap = if show.swap {
-        let raw = slurp("/proc/meminfo");
-        let (mut total, mut free) = (0u64, 0u64);
-        for line in raw.lines() {
-            if      line.starts_with("SwapTotal:") { total = line.split_ascii_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
-            else if line.starts_with("SwapFree:")  { free  = line.split_ascii_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0); }
-        }
-        if total > 0 {
-            let used = total.saturating_sub(free);
-            format!("{:.1}G / {:.1}G", used as f64 / 1_048_576.0, total as f64 / 1_048_576.0)
-        } else { "N/A".into() }
-    } else { String::new() };
 
     // sound server — check PipeWire, PulseAudio sockets
     let sound = if show.sound {
@@ -480,7 +732,7 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         let mounts = slurp("/proc/mounts");
         let root_dev = mounts.lines()
             .find(|l| l.split_whitespace().nth(1) == Some("/"))
-            .and_then(|l| l.split_whitespace().nth(0))
+            .and_then(|l| l.split_whitespace().next())
             .unwrap_or("").to_string();
         let dev_name = root_dev.rsplit('/').next().unwrap_or("");
         // strip partition number (e.g. nvme0n1p3 -> nvme0n1, sda2 -> sda)
@@ -553,38 +805,14 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         if t.is_empty() { "N/A".into() } else { t }
     } else { String::new() };
 
-    // term_font — check env vars
+    // term_font — env, then the terminal's own config file
     let term_font = if show.term_font {
-        let font = env::var("ARC_FONT")
-            .or_else(|_| env::var("FONT"))
-            .or_else(|_| env::var("TERM_FONT"));
-        match font {
-            Ok(f) => f,
-            Err(_) => "N/A".into(),
-        }
+        modules::term_font()
     } else { String::new() };
 
-    // de_wm_ver — version string for DE/WM
-    let de_wm_ver = if show.de_wm_ver {
-        let de = env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
-        if de.contains("gnome") {
-            let raw = slurp("/usr/share/gnome/gnome-version.xml");
-            // quick parse: look for <version>...</version>
-            if let Some(start) = raw.find("<version>") {
-                let after = &raw[start + 9..];
-                if let Some(end) = after.find("</version>") {
-                    after[..end].to_string()
-                } else { "N/A".into() }
-            } else { "N/A".into() }
-        } else if de.contains("kde") || de.contains("plasma") {
-            slurp("/usr/share/plasma/plasma-version").trim().to_string()
-        } else if env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok() {
-            // hyprctl version
-            String::new() // would need subprocess — skip for now
-        } else {
-            String::new()
-        }
-    } else { String::new() };
+    // de_wm_ver — resolved in the parallel batch below (may spawn `<wm> --version`)
+
+    // de_wm_ver — version string for DE/WM (computed in the parallel batch)
 
     // init_ver — version of init system
     let init_ver = if show.init_ver {
@@ -613,42 +841,122 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
 
     // local_ip — interface + IPv4 via getifaddrs
     let local_ip = if show.local_ip {
-        let mut result = String::new();
-        unsafe {
-            let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-            if libc::getifaddrs(&mut ifap) == 0 {
-                let mut cur = ifap;
-                while !cur.is_null() {
-                    let ifa = &*cur;
-                    if !ifa.ifa_addr.is_null()
-                        && (*ifa.ifa_addr).sa_family as libc::c_int == libc::AF_INET
-                    {
-                        let name = std::ffi::CStr::from_ptr(ifa.ifa_name)
-                            .to_string_lossy().to_string();
-                        if name != "lo" {
-                            let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                            let octets = sa.sin_addr.s_addr.to_ne_bytes();
-                            let ip = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
-                            if !ip.starts_with("127.") {
-                                result = format!("{} {}", name, ip);
-                                break;
-                            }
-                        }
-                    }
-                    cur = ifa.ifa_next;
-                }
-                libc::freeifaddrs(ifap);
+        match local_ipv4() {
+            Some((name, ip)) => format!("{name} {ip}"),
+            None => "N/A".into(),
+        }
+    } else { String::new() };
+
+    // ── opt-in modules (off by default) ─────────────────
+    // Cheap collectors run inline.
+    let datetime      = if show.datetime      { modules::datetime() } else { String::new() };
+    let editor        = if show.editor        { modules::editor() } else { String::new() };
+    let dns           = if show.dns           { modules::dns() } else { String::new() };
+    let host          = if show.host          { modules::host() } else { String::new() };
+    let chassis       = if show.chassis       { modules::chassis() } else { String::new() };
+    let bootmgr       = if show.bootmgr       { modules::bootmgr() } else { String::new() };
+    let cpu_cache     = if show.cpu_cache     { modules::cpu_cache() } else { String::new() };
+    let login_manager = if show.login_manager { modules::login_manager() } else { String::new() };
+    let brightness    = if show.brightness    { modules::brightness() } else { String::new() };
+    let diskio        = if show.diskio        { modules::diskio() } else { String::new() };
+    let netio         = if show.netio         { modules::netio() } else { String::new() };
+    let physmem       = if show.physmem       { modules::physmem() } else { String::new() };
+    let gpu_mem       = if show.gpu_mem       { modules::gpu_mem() } else { String::new() };
+    let btrfs         = if show.btrfs         { modules::btrfs() } else { String::new() };
+    let users         = if show.users         { modules::users() } else { String::new() };
+    let wifi          = if show.wifi          { modules::wifi() } else { String::new() };
+    let cursor        = if show.cursor        { modules::cursor() } else { String::new() };
+    let term_size     = if show.term_size     { modules::term_size() } else { String::new() };
+    let camera        = if show.camera        { modules::camera() } else { String::new() };
+    let mouse         = if show.mouse         { modules::mouse() } else { String::new() };
+    let keyboard      = if show.keyboard      { modules::keyboard() } else { String::new() };
+    let tpm           = if show.tpm           { modules::tpm() } else { String::new() };
+    let monitor       = if show.monitor       { modules::monitor() } else { String::new() };
+
+    // The slow collectors — subprocess spawns (`glxinfo`, `playerctl`, `vainfo`,
+    // `hciconfig`, …), network fetches and `/proc` walks — run concurrently, so
+    // `--all` costs ~max(collector) instead of the sum. Results are cached.
+    let cpu_start = std::time::Instant::now();
+    let cpu0      = show.cpu_usage.then(modules::cpu_snapshot);
+    let (wallpaper, media, public_ip, weather, opengl, vulkan, codec, bluetooth,
+         physical_disk, top_processes, term_theme, de_wm_ver) =
+        std::thread::scope(|s| {
+        let wallpaper = show.wallpaper.then(|| s.spawn(modules::wallpaper));
+        let media     = show.media.then(|| s.spawn(modules::media));
+        let public_ip = show.public_ip.then(|| s.spawn(|| {
+            crate::cache::get_or_compute_swr("public_ip", 3600, ||
+                net::public_ip().unwrap_or_else(|| "N/A".into()))
+        }));
+        let weather   = show.weather.then(|| s.spawn(|| {
+            crate::cache::get_or_compute_swr("weather", 900, ||
+                net::weather("").unwrap_or_else(|| "N/A".into()))
+        }));
+        let opengl    = show.opengl.then(|| s.spawn(|| {
+            crate::cache::get_or_compute("opengl", 86400, modules::opengl)
+        }));
+        let vulkan    = show.vulkan.then(|| s.spawn(|| {
+            crate::cache::get_or_compute("vulkan", 86400, modules::vulkan)
+        }));
+        let codec     = show.codec.then(|| s.spawn(|| {
+            crate::cache::get_or_compute("codec", 86400, modules::codec)
+        }));
+        let bluetooth = show.bluetooth.then(|| s.spawn(|| {
+            crate::cache::get_or_compute("bluetooth", 86400, modules::bluetooth)
+        }));
+        let physical_disk = show.physical_disk.then(|| s.spawn(modules::physical_disk));
+        let top_processes = show.top_processes.then(|| s.spawn(modules::top_processes));
+        let term_theme = show.term_theme.then(|| s.spawn(|| {
+            crate::cache::get_or_compute_ttl("term_theme", 300, modules::term_theme)
+        }));
+        let de_wm_ver = show.de_wm_ver.then(|| s.spawn(modules::de_wm_version));
+        (
+            wallpaper.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            media.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            public_ip.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            weather.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            opengl.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            vulkan.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            codec.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            bluetooth.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            physical_disk.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            top_processes.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            term_theme.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            de_wm_ver.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+        )
+    });
+
+    // CPU usage spans the work above; only pad the window if it finished fast.
+    let cpu_usage = match cpu0 {
+        None => String::new(),
+        Some(None) => "N/A".into(),
+        Some(Some((idle0, total0))) => {
+            // 60 ms ≈ 6 USER_HZ ticks (HZ=100), enough for a stable reading
+            // while keeping the warm `--all` path well under 100 ms.
+            const MIN_MS: u64 = 60;
+            if let Some(rest) = std::time::Duration::from_millis(MIN_MS)
+                .checked_sub(cpu_start.elapsed())
+            {
+                std::thread::sleep(rest);
+            }
+            match modules::cpu_snapshot() {
+                Some((idle1, total1)) => modules::cpu_usage_between(idle0, total0, idle1, total1),
+                None => "N/A".into(),
             }
         }
-        if result.is_empty() { "N/A".into() } else { result }
-    } else { String::new() };
+    };
 
     SysInfo { os, kernel, uptime_secs, uptime, res, pkgs, shell, de_wm, term,
               cpu, gpu, gpu_temp, battery, disk, load, locale, mem_used, mem_total,
               ip, ssh, ports,
               init, cpu_temp, processes, container, session,
               swap, sound, gpu_driver, bios, board, disk_type,
-              pkg_updates, theme, icons, term_font, de_wm_ver, init_ver, local_ip }
+              pkg_updates, theme, icons, term_font, de_wm_ver, init_ver, local_ip,
+              os_id, os_id_like,
+              datetime, editor, dns, host, chassis, bootmgr, cpu_cache, login_manager,
+              brightness, cpu_usage, diskio, netio, physmem, gpu_mem, btrfs, wifi,
+              users, wallpaper, media, public_ip, weather, opengl, vulkan,
+              cursor, term_size, term_theme, codec, bluetooth, camera, mouse,
+              keyboard, tpm, physical_disk, top_processes, monitor }
 }
 
 

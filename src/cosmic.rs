@@ -8,10 +8,7 @@ use crate::config::*;
 
 // ── Moon phase ─────────────────────────────────────────────
 fn moon_phase() -> &'static str {
-    let uptime_secs: u64 = {
-        let mut si: libc::sysinfo = unsafe { std::mem::zeroed() };
-        if unsafe { libc::sysinfo(&mut si) } == 0 { si.uptime as u64 } else { 0 }
-    };
+    let uptime_secs = crate::info::system_uptime_secs();
     let boot_approx = std::fs::metadata("/proc/1")
         .and_then(|m| m.created()).map(|t| {
             use std::time::SystemTime;
@@ -57,8 +54,8 @@ pub fn run(out_lines: &[String], _logo_name: &str, _cfg: &Config, args: &super::
     };
 
     let seed: u64 = {
-        let mut si: libc::sysinfo = unsafe { std::mem::zeroed() };
-        if unsafe { libc::sysinfo(&mut si) } == 0 { si.uptime as u64 } else { 12345 }
+        let secs = crate::info::system_uptime_secs();
+        if secs == 0 { 12345 } else { secs }
     };
     let mut rng = seed;
 
@@ -86,21 +83,21 @@ pub fn run(out_lines: &[String], _logo_name: &str, _cfg: &Config, args: &super::
 
         write!(buf, "\x1b[K  {B}{MAUVE}\u{25cf}  arcfetch  {OVL}\u{00B7}\u{00B7}\u{00B7}  COSMIC MODE  [{moon}]  {OVL}[{lbl}]{R}",
             B=BOLD, MAUVE=MAUVE, OVL=OVERLAY0, R=RESET, moon=moon, lbl=lbl).ok();
-        write!(buf, "\x1b[K\n").ok();
+        writeln!(buf, "\x1b[K").ok();
         write!(buf, "\x1b[K  {OVL}{s}{R}", OVL=OVERLAY0, s="\u{2500}".repeat(62), R=RESET).ok();
-        write!(buf, "\x1b[K\n").ok();
+        writeln!(buf, "\x1b[K").ok();
 
-        if shooting.is_none() && rng_next(&mut rng) % 60 == 0 {
+        if shooting.is_none() && rng_next(&mut rng).is_multiple_of(60) {
             let sx = rng_next(&mut rng) as f64 % COLS as f64;
             let sy = rng_next(&mut rng) as f64 % ROWS as f64;
             let angle = (rng_next(&mut rng) % 3 + 1) as f64 * 0.3 + 0.2;
             shooting = Some((sx, sy, angle, 12 + rng_next(&mut rng) % 8));
         }
 
-        for r in 0..ROWS {
+        for (r, star_row) in stars.iter().enumerate() {
             write!(buf, "\x1b[K").ok();
             let mut sl = [' '; COLS];
-            for (c, &sb) in stars[r].iter().enumerate() {
+            for (c, &sb) in star_row.iter().enumerate() {
                 if sb > 0 {
                     let t = ((frame.wrapping_add(r as u64 * 7).wrapping_add(c as u64 * 13)) % 8) as u8;
                     sl[c] = star_char(sb.saturating_sub(t / 3));
@@ -116,7 +113,7 @@ pub fn run(out_lines: &[String], _logo_name: &str, _cfg: &Config, args: &super::
             let ss: String = sl.iter().collect();
             write!(buf, "  {OVL}{ss}{R}  ", OVL=OVERLAY0, ss=ss, R=RESET).ok();
             if let Some(inf) = out_lines.get(r) { write!(buf, "{}", inf).ok(); }
-            write!(buf, "\x1b[K\n").ok();
+            writeln!(buf, "\x1b[K").ok();
         }
 
         write!(buf, "\x1b[K  {OVL}phase  {moon}", OVL=OVERLAY0, moon=moon).ok();

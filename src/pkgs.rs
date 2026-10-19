@@ -71,7 +71,7 @@ fn count_sqlite(path: &str, table: &str) -> Option<usize> {
     count_btree(&data, ps, root)
 }
 
-fn page<'a>(data: &'a [u8], ps: u32, n: u32) -> Option<&'a [u8]> {
+fn page(data: &[u8], ps: u32, n: u32) -> Option<&[u8]> {
     if n == 0 { return None; }
     let start = (n as usize - 1) * ps as usize;
     if start + ps as usize > data.len() { return None; }
@@ -84,9 +84,9 @@ fn page<'a>(data: &'a [u8], ps: u32, n: u32) -> Option<&'a [u8]> {
 
 fn varint(data: &[u8]) -> Option<(u64, usize)> {
     let mut v = 0u64;
-    for i in 0..9.min(data.len()) {
-        v = (v << 7) | (data[i] & 0x7F) as u64;
-        if data[i] & 0x80 == 0 { return Some((v, i + 1)); }
+    for (i, &byte) in data.iter().enumerate().take(9) {
+        v = (v << 7) | (byte & 0x7F) as u64;
+        if byte & 0x80 == 0 { return Some((v, i + 1)); }
     }
     None
 }
@@ -121,7 +121,7 @@ fn read_int(data: &[u8], pos: &mut usize, t: u64) -> Option<u64> {
 }
 
 fn read_text(data: &[u8], pos: &mut usize, t: u64) -> Option<String> {
-    if t < 13 || t % 2 == 0 { return None; }
+    if t < 13 || t.is_multiple_of(2) { return None; }
     let len = ((t - 13) / 2) as usize;
     if *pos + len > data.len() { return None; }
     let s = String::from_utf8(data[*pos..*pos + len].to_vec()).ok()?;
