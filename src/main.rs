@@ -15,7 +15,7 @@ use std::{env, thread};
 use std::f64::consts::PI;
 use std::io::{Write, stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use config::*;
 
@@ -1853,6 +1853,73 @@ fn pid_is_ours(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// The terminal's current line discipline, or `None` when fd 1 is not a tty.
+fn tty_termios() -> Option<libc::termios> {
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    (unsafe { libc::tcgetattr(1, &mut t) } == 0).then_some(t)
+}
+
+fn termios_eq(a: &libc::termios, b: &libc::termios) -> bool {
+    a.c_iflag == b.c_iflag
+        && a.c_oflag == b.c_oflag
+        && a.c_cflag == b.c_cflag
+        && a.c_lflag == b.c_lflag
+        && a.c_line == b.c_line
+        && a.c_cc == b.c_cc
+}
+
+/// Decides when the shell's line editor owns the terminal, by remembering the
+/// line discipline the shell sets up at its prompt. A foreground command makes
+/// the shell hand the terminal over and changes that mode, so a change means
+/// the pin must give the terminal back. This also catches programs the shell
+/// runs in its own process group, which `tcgetpgrp()` cannot see (fzf-tab runs
+/// fzf that way). A background child does not touch the mode, so prompt
+/// helpers and completions no longer make the pin pause and repaint.
+struct TerminalWatch {
+    shell_pgid: i32,
+    prompt_mode: Option<libc::termios>,
+    settle: Option<Instant>,
+    was_shell: bool,
+}
+
+impl TerminalWatch {
+    fn new(shell_pgid: i32) -> Self {
+        Self { shell_pgid, prompt_mode: None, settle: None, was_shell: false }
+    }
+
+    /// `None` once the tty is gone; otherwise `true` while the pin may draw.
+    fn holds(&mut self) -> Option<bool> {
+        let foreground = unsafe { libc::tcgetpgrp(1) };
+        if foreground < 0 {
+            return None;
+        }
+        let shell_fg = foreground == self.shell_pgid;
+        let now = Instant::now();
+        if shell_fg && !self.was_shell {
+            // The shell just took the terminal back. Give the line editor a
+            // moment to install its own mode before we remember it.
+            self.settle = Some(now + Duration::from_millis(60));
+        }
+        if !shell_fg {
+            self.settle = None;
+        } else if self.settle.is_some_and(|t| now >= t) {
+            self.prompt_mode = tty_termios();
+            self.settle = None;
+        }
+        self.was_shell = shell_fg;
+
+        if !shell_fg {
+            return Some(false);
+        }
+        let taken = match (self.prompt_mode, tty_termios()) {
+            (Some(prompt), Some(now)) => !termios_eq(&prompt, &now),
+            // Mode not learned yet: stay out of the way until it is.
+            _ => true,
+        };
+        Some(!taken)
+    }
+}
+
 fn wait_for_exit(pid: i32) {
     for _ in 0..50 {
         if unsafe { libc::kill(pid, 0) } != 0 { return; }
@@ -2044,10 +2111,12 @@ fn pane_frame(
 /// The terminal's scroll region is set below the pane, so the shell's prompt
 /// and all command output scroll under it and never push the fetch away. The
 /// animation runs in a child in its own process group (but the shell's
-/// session), so it can tell when a foreground command owns the terminal.
-/// While a command runs the child stops painting and drops origin mode so
-/// TUIs (fzf, vim, less, …) can use absolute cursor addressing; the region
-/// and origin mode are restored when the shell prompt comes back.
+/// session), so it can tell when a foreground job owns the terminal. While a
+/// command runs the child stops painting and drops origin mode so TUIs (fzf,
+/// vim, less, …) can use absolute cursor addressing; the region and origin
+/// mode are restored when the shell prompt comes back. Programs the shell runs
+/// in its own process group (fzf-tab) are caught by the change they make to the
+/// terminal's line discipline, so job control and widgets both work.
 fn run_background(
     mode: PanelMode,
     logo_name: &str,
@@ -2092,6 +2161,7 @@ fn run_background(
     if shell_pgid < 0 {
         shell_pgid = shell_pid;
     }
+    let mut watch = TerminalWatch::new(shell_pgid);
 
     // Clear the screen, confine scrolling to the rows below the pane, and home
     // the cursor there. The shell's next prompt lands at scroll_top.
@@ -2167,11 +2237,9 @@ fn run_background(
             break;
         }
 
-        let foreground = unsafe { libc::tcgetpgrp(1) };
-        if foreground < 0 {
+        let Some(holds) = watch.holds() else {
             break;
-        }
-        let holds = foreground == shell_pgid;
+        };
 
         // A command just took the terminal. Keep the pane's rows reserved,
         // but drop origin mode so a TUI (fzf, vim, less, …) can use absolute
@@ -2301,9 +2369,10 @@ fn run_background(
             if !RUNNING.load(Ordering::Relaxed) {
                 break;
             }
-            let fg = unsafe { libc::tcgetpgrp(1) };
-            if fg < 0 || (fg == shell_pgid) != holds {
-                break;
+            match watch.holds() {
+                Some(now_holds) if now_holds != holds => break,
+                None => break,
+                _ => {}
             }
         }
     }
