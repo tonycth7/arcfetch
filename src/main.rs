@@ -1869,61 +1869,129 @@ fn stop_background() {
     }
 }
 
-/// Build one frame for the pinned pane.
+/// Clip a line to `max` visible cells, keeping ANSI escapes intact.
+fn truncate_visible(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max * 2 + 16));
+    let mut vis = 0usize;
+    let mut esc = false;
+    for ch in s.chars() {
+        if ch == '\x1b' {
+            esc = true;
+            out.push(ch);
+            continue;
+        }
+        if esc {
+            out.push(ch);
+            if ch.is_ascii_alphabetic() {
+                esc = false;
+            }
+            continue;
+        }
+        if vis >= max {
+            break;
+        }
+        out.push(ch);
+        vis += 1;
+    }
+    out.push_str(RESET);
+    out
+}
+
+/// Height of the art itself, before the info column is considered.
+fn art_height(mode: PanelMode, first_lines: Option<&[String]>, rows: usize) -> usize {
+    match mode {
+        PanelMode::Blackhole => (rows * 55 / 100).max(1),
+        PanelMode::Animate(_) => first_lines.map(|l| l.len()).unwrap_or(1).max(1),
+    }
+}
+
+/// Pane rows: the taller of art and info, capped so the shell keeps four rows.
+fn pin_height(art_h: usize, info_len: usize, rows: usize) -> usize {
+    let usable = rows.saturating_sub(5).max(1);
+    art_h.max(info_len).min(usable).max(1)
+}
+
+/// Build one frame for the pinned pane: art on the left, info on the right,
+/// with the same two-space indent and gap as the normal one-shot render.
 fn pane_frame(
     mode: PanelMode,
     logo_name: &str,
     custom: &Option<Vec<String>>,
     cfg: &Config,
-    pane_cols: usize,
+    info: &[String],
+    cols: usize,
+    art_cols: usize,
+    art_h: usize,
     pane_h: usize,
     frame: u64,
 ) -> Vec<String> {
-    match mode {
-        PanelMode::Blackhole => panel_blackhole(pane_cols, pane_h, frame),
+    let art: Vec<String> = match mode {
+        PanelMode::Blackhole => panel_blackhole(art_cols, art_h.min(pane_h), frame),
         PanelMode::Animate(effect) => {
-            let mut block = match custom {
-                Some(lines) => lines.clone(),
-                None => panel_logo(
-                    logo_name,
-                    frame as usize,
-                    parse_effect(effect),
-                    &cfg.colors.logo,
-                ),
-            };
-            block.truncate(pane_h);
-            block
+            let effect = parse_effect(effect);
+            match custom {
+                Some(lines) => {
+                    let widths: Vec<usize> = lines.iter().map(|l| visible_chars(l)).collect();
+                    let w = widths.iter().max().copied().unwrap_or(36);
+                    let last = cfg.colors.logo.len().saturating_sub(1);
+                    lines
+                        .iter()
+                        .enumerate()
+                        .map(|(i, raw)| {
+                            let anim = logos::animate_line(raw, i, frame as usize, effect);
+                            let mut s = String::new();
+                            for (col, ch) in anim.chars().enumerate() {
+                                let phase = logos::color_wave_phase(i, col, frame as usize);
+                                let idx = ((phase * last as f32).round() as usize).min(last);
+                                s.push_str(&cfg.colors.logo[idx]);
+                                s.push(ch);
+                            }
+                            s.push_str(RESET);
+                            s.push_str(&" ".repeat(w.saturating_sub(widths[i])));
+                            s
+                        })
+                        .collect()
+                }
+                None => panel_logo(logo_name, frame as usize, effect, &cfg.colors.logo),
+            }
         }
+    };
+
+    let art_w = art.iter().map(|l| visible_chars(l)).max().unwrap_or(art_cols);
+    let mut block = Vec::with_capacity(pane_h);
+    for i in 0..pane_h {
+        let a = art.get(i).map(String::as_str).unwrap_or("");
+        let pad = art_w.saturating_sub(visible_chars(a));
+        let inf = info.get(i).map(String::as_str).unwrap_or("");
+        let mut line = String::with_capacity(2 + art_w + 2 + inf.len());
+        line.push_str("  ");
+        line.push_str(a);
+        line.push_str(RESET);
+        if pad > 0 {
+            line.push_str(&" ".repeat(pad));
+        }
+        line.push_str("  ");
+        line.push_str(inf);
+        block.push(truncate_visible(&line, cols));
     }
+    block
 }
 
-/// Rows the pinned pane may claim on a terminal of `rows` rows.
-fn pane_height(mode: PanelMode, first_lines: Option<&[String]>, rows: usize) -> usize {
-    // Leave room for the gap row and at least four rows of shell.
-    let usable = rows.saturating_sub(5).max(1);
-    match mode {
-        PanelMode::Blackhole => (rows * 55 / 100).min(usable).max(1),
-        PanelMode::Animate(_) => first_lines
-            .map(|l| l.len())
-            .unwrap_or(1)
-            .min(usable)
-            .max(1),
-    }
-}
-
-/// Put the animation in a pinned pane above the shell and return immediately.
+/// Put the fetch in a pinned pane above the shell and return immediately.
 ///
 /// The terminal's scroll region is set below the pane, so the shell's prompt
-/// and all command output scroll under it and never push the art away. The
+/// and all command output scroll under it and never push the fetch away. The
 /// animation runs in a child in its own process group (but the shell's
-/// session), so it can tell when a full-screen program owns the terminal and
-/// pause instead of painting over it. The shell itself is untouched: aliases,
-/// completion and starship keep working.
+/// session), so it can tell when a foreground command owns the terminal.
+/// While a command runs the child stops painting and drops origin mode so
+/// TUIs (fzf, vim, less, …) can use absolute cursor addressing; the region
+/// and origin mode are restored when the shell prompt comes back.
 fn run_background(
     mode: PanelMode,
     logo_name: &str,
     custom: &Option<Vec<String>>,
     cfg: &Config,
+    info: &[String],
     duration: Option<u64>,
     no_color: bool,
 ) {
@@ -1931,6 +1999,9 @@ fn run_background(
     if cols < 20 || rows < 8 {
         return;
     }
+
+    let info_len = info.len();
+    let info_w = info.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
 
     // A frame at tick 0 gives the logo its natural height.
     let first_lines = match mode {
@@ -1941,8 +2012,12 @@ fn run_background(
         PanelMode::Blackhole => None,
     };
 
-    let pane_h = pane_height(mode, first_lines.as_deref(), rows);
-    let pane_cols = cols.min(120);
+    let art_h = art_height(mode, first_lines.as_deref(), rows);
+    let pane_h = pin_height(art_h, info_len, rows);
+    let art_cols = match mode {
+        PanelMode::Blackhole => cols.saturating_sub(info_w + 6).clamp(20, 46),
+        PanelMode::Animate(_) => cols,
+    };
     let scroll_top = (pane_h + 2) as u16;
     let bottom = rows as u16;
 
@@ -1994,6 +2069,9 @@ fn run_background(
         libc::signal(libc::SIGTERM, sigint_handler as *const () as libc::sighandler_t);
     }
     RUNNING.store(true, Ordering::Relaxed);
+    // Remember the pid path now: once the session dies the tty may be gone,
+    // but the file still has to be cleaned up.
+    let pid_path = bg_pid_path();
 
     let start = std::time::Instant::now();
     let limit = match duration {
@@ -2003,8 +2081,9 @@ fn run_background(
 
     let mut cur_cols = cols;
     let mut cur_rows = rows;
+    let mut cur_art_h = art_h;
     let mut cur_pane_h = pane_h;
-    let mut cur_pane_cols = pane_cols;
+    let mut cur_art_cols = art_cols;
     let mut cur_scroll_top = scroll_top;
     let mut painted_h = 0usize;
     let mut held = true;
@@ -2012,17 +2091,32 @@ fn run_background(
     let mut frame: u64 = 0;
 
     loop {
-        if !RUNNING.load(Ordering::Relaxed) { break; }
+        if !RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
         if let Some(lim) = limit {
-            if start.elapsed() >= lim { break; }
+            if start.elapsed() >= lim {
+                break;
+            }
         }
 
         // The shell that owns the pin went away: take the region with us.
-        if unsafe { libc::kill(shell_pid, 0) } != 0 { break; }
+        if unsafe { libc::kill(shell_pid, 0) } != 0 {
+            break;
+        }
 
         let foreground = unsafe { libc::tcgetpgrp(1) };
-        if foreground < 0 { break; }
+        if foreground < 0 {
+            break;
+        }
         let holds = foreground == shell_pgid;
+
+        // A command just took the terminal. Keep the pane's rows reserved,
+        // but drop origin mode so a TUI (fzf, vim, less, …) can use absolute
+        // cursor addressing. It is restored when the shell comes back.
+        if !holds && held {
+            write_tty(b"\x1b7\x1b[?6l\x1b8");
+        }
 
         if holds {
             // A resize drops the scroll region. Put it back before painting.
@@ -2030,12 +2124,17 @@ fn run_background(
             if (w, h) != (cur_cols, cur_rows) {
                 cur_cols = w;
                 cur_rows = h;
-                cur_pane_cols = w.min(120);
+                cur_art_cols = match mode {
+                    PanelMode::Blackhole => w.saturating_sub(info_w + 6).clamp(20, 46),
+                    PanelMode::Animate(_) => w,
+                };
                 // Keep the pane height, and with it the shell's prompt row,
                 // stable across ordinary resizes. Only shrink when the
-                // terminal can no longer hold the pane above the shell.
-                if cur_scroll_top > h as u16 {
-                    cur_pane_h = pane_height(mode, first_lines.as_deref(), h);
+                // terminal can no longer hold the pane above the shell with
+                // four rows to spare.
+                if cur_pane_h > h.saturating_sub(5).max(1) {
+                    cur_art_h = art_height(mode, first_lines.as_deref(), h);
+                    cur_pane_h = pin_height(cur_art_h, info_len, h);
                     cur_scroll_top = (cur_pane_h + 2).min(h) as u16;
                 }
                 let mut out = stdout().lock();
@@ -2068,21 +2167,21 @@ fn run_background(
             }
 
             let block = pane_frame(
-                mode, logo_name, custom, cfg, cur_pane_cols, cur_pane_h, frame,
+                mode,
+                logo_name,
+                custom,
+                cfg,
+                info,
+                cur_cols,
+                cur_art_cols,
+                cur_art_h,
+                cur_pane_h,
+                frame,
             );
             let block: Vec<String> = if no_color {
                 block.iter().map(|l| strip_ansi(l)).collect()
             } else {
                 block
-            };
-
-            // Logos are centred in the pane; the blackhole fills it.
-            let left = match mode {
-                PanelMode::Animate(_) => {
-                    let w = block.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
-                    cur_cols.saturating_sub(w) / 2
-                }
-                PanelMode::Blackhole => cur_cols.saturating_sub(cur_pane_cols) / 2,
             };
 
             // Never clear below the top of the new scroll region: that is the
@@ -2105,9 +2204,6 @@ fn run_background(
             let visible = block.len().min(cur_pane_h);
             for (y, line) in block.iter().take(visible).enumerate() {
                 scr.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
-                if left > 0 {
-                    scr.push_str(&" ".repeat(left));
-                }
                 scr.push_str(line);
             }
             // If the frame got shorter, erase the rows it used to occupy.
@@ -2121,8 +2217,12 @@ fn run_background(
             scr.push_str("\x1b[?2026l");
 
             let mut out = stdout().lock();
-            if out.write_all(scr.as_bytes()).is_err() { break; }
-            if out.flush().is_err() { break; }
+            if out.write_all(scr.as_bytes()).is_err() {
+                break;
+            }
+            if out.flush().is_err() {
+                break;
+            }
             drop(out);
 
             painted_h = cur_pane_h;
@@ -2130,18 +2230,32 @@ fn run_background(
         }
 
         held = holds;
-        thread::sleep(Duration::from_millis(70));
+        // Sleep in small slices so a command taking the terminal is noticed
+        // before it starts drawing, not up to a whole frame later.
+        let mut waited = 0u64;
+        while waited < 70 {
+            thread::sleep(Duration::from_millis(5));
+            waited += 5;
+            if !RUNNING.load(Ordering::Relaxed) {
+                break;
+            }
+            let fg = unsafe { libc::tcgetpgrp(1) };
+            if fg < 0 || (fg == shell_pgid) != holds {
+                break;
+            }
+        }
     }
 
     // Leave the shell a normal terminal again. A timer expiry leaves the last
-    // frame as a static picture; an explicit --stop takes it away too.
-    if !RUNNING.load(Ordering::Relaxed) && held {
+    // frame as a static picture; an explicit --stop takes it away, even when
+    // the stop command itself currently owns the terminal.
+    if !RUNNING.load(Ordering::Relaxed) {
         clear_pane(cur_pane_h);
     } else {
         reset_pin();
     }
 
-    if let Some(path) = bg_pid_path() {
+    if let Some(path) = pid_path {
         if let Ok(text) = std::fs::read_to_string(&path) {
             if text.trim() == std::process::id().to_string() {
                 let _ = std::fs::remove_file(&path);
@@ -2302,7 +2416,7 @@ fn main() {
             run_blackhole(&out_lines, args.duration);
         } else {
             let no_custom: Option<Vec<String>> = None;
-            run_background(PanelMode::Blackhole, "arch", &no_custom, &cfg, args.duration, args.no_color);
+            run_background(PanelMode::Blackhole, "arch", &no_custom, &cfg, &out_lines, args.duration, args.no_color);
         }
         return;
     }
@@ -2425,7 +2539,7 @@ fn main() {
             stop_background();
             run_animate(&out_lines, &logo_name, &custom_lines, &cfg, &args, eff, args.duration);
         } else {
-            run_background(PanelMode::Animate(eff), &logo_name, &custom_lines, &cfg, args.duration, args.no_color);
+            run_background(PanelMode::Animate(eff), &logo_name, &custom_lines, &cfg, &out_lines, args.duration, args.no_color);
         }
         return;
     }
