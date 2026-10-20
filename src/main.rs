@@ -986,6 +986,7 @@ struct Args {
     scheme:       Option<String>,
     animate:      Option<String>,
     list_logos:   bool,
+    list_schemes: bool,
     no_intro:     bool,
     foreground:   bool,
     stop:         bool,
@@ -1018,6 +1019,7 @@ fn parse_args() -> Args {
         scheme: None,
         animate: None,
         list_logos: false,
+        list_schemes: false,
         no_intro: false,
         foreground: false,
         stop: false,
@@ -1071,6 +1073,7 @@ fn parse_args() -> Args {
                 }
             }
             Long("list-logos") | Long("logos") => a.list_logos = true,
+            Long("list-schemes") | Long("schemes") => a.list_schemes = true,
             Long("no-animate") | Long("no-intro") => a.no_intro = true,
             Long("foreground") | Long("fg") => a.foreground = true,
             Long("stop") => a.stop = true,
@@ -1526,6 +1529,7 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}-t, --t <secs>{r}            {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo <name>{r}              switch logo {s}(arch|ubuntu|debian|fedora|nix|auto…){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--list-logos{r}              {s}show every logo name with a preview{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--list-schemes{r}            {s}show every colour scheme as a swatch strip{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo ?{r}                  {s}same as --list-logos{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo-file <path>{r}         {s}ASCII art or image (kitty protocol){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--preset <n>{r}               {s}full|minimal|hacker|science{r}", b=b, g=g, r=r, s=s);
@@ -1599,6 +1603,33 @@ fn logo_line_color<'a>(logo_name: &str, i: usize, cfg: &'a Config, color_overrid
 // ═══════════════════════════════════════════════════════════
 //  logo catalogue
 // ═══════════════════════════════════════════════════════════
+
+/// `--list-schemes` — preview every built-in palette as a swatch strip.
+fn print_schemes() {
+    let depth = config::ColorDepth::detect();
+    println!();
+    println!("  {BOLD}{BLUE}arcfetch schemes{R}  {OVL}use: arcfetch --scheme <name>{R}",
+        BOLD = BOLD, BLUE = BLUE, OVL = OVERLAY0, R = RESET);
+    println!();
+    for &name in config::SCHEMES {
+        if name == "auto" { continue; }
+        let Some(c) = config::scheme(name) else { continue };
+        let swatches = [
+            &c.accent, &c.labels[1], &c.labels[2], &c.labels[3],
+            &c.labels[4], &c.labels[5], &c.labels[6], &c.values,
+        ];
+        let mut line = format!("    {GREEN}{:<12}{R} ", name, GREEN = GREEN, R = RESET);
+        for col in swatches {
+            line.push_str(col);
+            line.push_str("███");
+        }
+        line.push_str(RESET);
+        println!("{}", config::downgrade_str(&line, depth));
+    }
+    println!();
+    println!("  {OVL}auto{R} picks latte/mocha from the terminal background.", OVL = OVERLAY0, R = RESET);
+    println!();
+}
 
 fn print_logos() {
     let names = logos::all_names();
@@ -2148,6 +2179,7 @@ fn main() {
     if args.help     { print_help(&cfg_path);          return; }
     if args.show_cfg { print_config_help(&cfg_path); write_sample_config(&cfg_path); return; }
     if args.list_logos { print_logos(); return; }
+    if args.list_schemes { print_schemes(); return; }
     if args.stop { stop_background(); return; }
 
     // mutual exclusion for display modes

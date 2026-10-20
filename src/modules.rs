@@ -5,6 +5,7 @@
 //! be determined. Nothing here is allowed to panic.
 
 use std::{env, fs, path::Path, process::Command, thread, time::Duration};
+use std::os::unix::fs::PermissionsExt;
 
 // ── Small helpers ────────────────────────────────────────
 
@@ -174,25 +175,34 @@ pub fn datetime() -> String {
     }
 }
 
-/// Basename of `$VISUAL`, else `$EDITOR`.
+/// Basename of `$VISUAL` / `$EDITOR` / `$SUDO_EDITOR`, falling back to a
+/// well-known editor that is actually installed.
 #[allow(dead_code)]
 pub fn editor() -> String {
-    let raw = env::var("VISUAL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| env::var("EDITOR").ok().filter(|s| !s.is_empty()));
-    match raw {
-        Some(s) => {
-            let first = s.split_whitespace().next().unwrap_or(&s);
-            let base = first.rsplit('/').next().unwrap_or(first);
-            if base.is_empty() {
-                "N/A".into()
-            } else {
-                base.to_string()
-            }
+    let raw = ["VISUAL", "EDITOR", "SUDO_EDITOR"]
+        .iter()
+        .find_map(|v| env::var(v).ok().filter(|s| !s.trim().is_empty()));
+    if let Some(s) = raw {
+        let first = s.split_whitespace().next().unwrap_or(&s);
+        let base = first.rsplit('/').next().unwrap_or(first);
+        if !base.is_empty() {
+            return base.to_string();
         }
-        None => "N/A".into(),
     }
+    for ed in ["nvim", "vim", "hx", "helix", "micro", "nano", "emacs"] {
+        if on_path(ed) { return ed.to_string(); }
+    }
+    "N/A".into()
+}
+
+/// Whether `bin` is an executable file on `$PATH`.
+fn on_path(bin: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else { return false };
+    env::split_paths(&path).any(|dir| {
+        fs::metadata(dir.join(bin))
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
 }
 
 /// Nameservers from `/etc/resolv.conf`, joined `", "`.
