@@ -90,6 +90,54 @@ fn visible_chars(s: &str) -> usize {
     n
 }
 
+fn is_box_style(s: &str) -> bool {
+    matches!(s.to_ascii_lowercase().as_str(),
+        "round" | "square" | "double" | "heavy" | "dashed" | "ascii" | "none")
+}
+
+/// Wrap an already-rendered fetch in a border. Only called when `--box` is set,
+/// so the default render path is untouched.
+fn boxify(body: &str, style: &str, col: &str) -> String {
+    let (tl, tr, bl, br, h, v) = match style.to_ascii_lowercase().as_str() {
+        "square" => ('┌', '┐', '└', '┘', '─', '│'),
+        "double" => ('╔', '╗', '╚', '╝', '═', '║'),
+        "heavy"  => ('┏', '┓', '┗', '┛', '━', '┃'),
+        "dashed" => ('╭', '╮', '╰', '╯', '╌', '╎'),
+        "ascii"  => ('+', '+', '+', '+', '-', '|'),
+        _        => ('╭', '╮', '╰', '╯', '─', '│'),
+    };
+    fn edge(out: &mut String, l: char, r: char, fill: char, width: usize, col: &str) {
+        let paint = !col.is_empty();
+        if paint { out.push_str(col); }
+        out.push_str("  "); out.push(l);
+        for _ in 0..width + 2 { out.push(fill); }
+        out.push(r);
+        if paint { out.push_str(RESET); }
+        out.push('\n');
+    }
+    let lines: Vec<&str> = body.trim_matches('\n').split('\n')
+        .map(|l| l.strip_prefix("  ").unwrap_or(l)).collect();
+    let width = lines.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
+    let mut out = String::with_capacity(body.len() + (width + 6) * (lines.len() + 2) + 32);
+    out.push('\n');
+    edge(&mut out, tl, tr, h, width, col);
+    let paint = !col.is_empty();
+    for l in &lines {
+        if paint { out.push_str(col); }
+        out.push_str("  "); out.push(v); out.push(' ');
+        out.push_str(l);
+        if paint { out.push_str(RESET); }          // stop content colour before padding
+        for _ in visible_chars(l)..width { out.push(' '); }
+        out.push(' ');
+        if paint { out.push_str(col); }
+        out.push(v);
+        if paint { out.push_str(RESET); }
+        out.push('\n');
+    }
+    edge(&mut out, bl, br, h, width, col);
+    out
+}
+
 // ── Kitty image protocol ────────────────────────────────
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -984,6 +1032,7 @@ struct Args {
     structure:    Option<String>,
     watch:        bool,
     scheme:       Option<String>,
+    box_style:    Option<String>,
     animate:      Option<String>,
     list_logos:   bool,
     list_schemes: bool,
@@ -1017,6 +1066,7 @@ fn parse_args() -> Args {
         structure: None,
         watch: false,
         scheme: None,
+        box_style: None,
         animate: None,
         list_logos: false,
         list_schemes: false,
@@ -1028,6 +1078,7 @@ fn parse_args() -> Args {
     // lexopt cannot peek, so pre-scan for the space-separated `--mandelbrot <n>` form.
     let mut mandel_space: Option<u32> = None;
     let mut animate_space: Option<String> = None;
+    let mut box_space: Option<String> = None;
     {
         let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
         for w in argv.windows(2) {
@@ -1037,6 +1088,10 @@ fn parse_args() -> Args {
                 }
             } else if w[0] == "--animate" {
                 if let Some(s) = w[1].to_str() { animate_space = Some(s.to_string()); }
+            } else if w[0] == "--box" {
+                if let Some(s) = w[1].to_str() {
+                    if is_box_style(s) { box_space = Some(s.to_string()); }
+                }
             }
         }
     }
@@ -1109,6 +1164,12 @@ fn parse_args() -> Args {
                 if let Ok(v) = parser.value() {
                     a.scheme = Some(v.to_string_lossy().into_owned());
                 }
+            }
+            Long("box") => {
+                a.box_style = Some(parser.optional_value()
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .or_else(|| box_space.clone())
+                    .unwrap_or_else(|| "round".into()));
             }
             Long("animate") => {
                 a.animate = Some(parser.optional_value()
@@ -1537,6 +1598,7 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}--accent <color>{r}           name | #RRGGBB | rgb(r,g,b) | colorN", b=b, g=g, r=r);
     println!("    {b}{g}--color <spec>{r}             logo colour: name | hex | random", b=b, g=g, r=r);
     println!("    {b}{g}--scheme <name>{r}            palette: {s}{}{r}", config::SCHEMES.join("|"), b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--box [style]{r}              {s}frame output (round|square|double|heavy|dashed|ascii){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--no-color{r}                 plain text (pipe-friendly)", b=b, g=g, r=r);
     println!("    {b}{g}--all{r}                      {s}enable every optional field{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}-s, --structure <list>{r}     {s}show only listed fields (comma-sep){r}", b=b, g=g, r=r, s=s);
@@ -1606,22 +1668,22 @@ fn logo_line_color<'a>(logo_name: &str, i: usize, cfg: &'a Config, color_overrid
 
 /// `--list-schemes` — preview every built-in palette as a swatch strip.
 fn print_schemes() {
+    use std::fmt::Write as _;
     let depth = config::ColorDepth::detect();
     println!();
     println!("  {BOLD}{BLUE}arcfetch schemes{R}  {OVL}use: arcfetch --scheme <name>{R}",
         BOLD = BOLD, BLUE = BLUE, OVL = OVERLAY0, R = RESET);
+    println!("  {OVL}17 slots: rosewater flamingo pink mauve red maroon peach yellow{R}",
+        OVL = OVERLAY0, R = RESET);
+    println!("  {OVL}           green teal sky sapphire blue lavender text subtext1 overlay0{R}",
+        OVL = OVERLAY0, R = RESET);
     println!();
     for &name in config::SCHEMES {
         if name == "auto" { continue; }
-        let Some(c) = config::scheme(name) else { continue };
-        let swatches = [
-            &c.accent, &c.labels[1], &c.labels[2], &c.labels[3],
-            &c.labels[4], &c.labels[5], &c.labels[6], &c.values,
-        ];
+        let Some(p) = config::scheme_rgb(name) else { continue };
         let mut line = format!("    {GREEN}{:<12}{R} ", name, GREEN = GREEN, R = RESET);
-        for col in swatches {
-            line.push_str(col);
-            line.push_str("███");
+        for (r, g, b) in p {
+            let _ = write!(line, "\x1b[38;2;{};{};{}m███", r, g, b);
         }
         line.push_str(RESET);
         println!("{}", config::downgrade_str(&line, depth));
@@ -2617,6 +2679,13 @@ fn main() {
                 let _ = writeln!(out, "  {}{}{:pad$}{}  {}",
                     lc, ll, "", RESET, inf, pad = pad);
             }
+        }
+    }
+
+    if let Some(ref style) = args.box_style {
+        if !style.eq_ignore_ascii_case("none") {
+            let border = if args.no_color { "" } else { cfg.colors.accent.as_str() };
+            out = boxify(&out, style, border);
         }
     }
 
