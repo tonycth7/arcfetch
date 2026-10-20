@@ -20,7 +20,7 @@ No tests, no CI, no linter/formatter config. `cargo test` always passes (no test
 - `src/net.rs` — std-only HTTP/1.0 client (64 KiB cap, timeouts) for `public_ip` / `weather`
 - `src/config.rs` — Catppuccin Mocha palette, hand-rolled TOML subset parser (no `toml` crate), `config_path()` resolves `$XDG_CONFIG_HOME/arcfetch/config.toml`; `Show::enable_all` / `clear_fields` / `select` back `--all` and `-s`
 - `src/pkgs.rs` — pacman/dpkg/rpm/nix/apk/portage/xbps/bedrock count; contains hand-rolled read-only SQLite B-tree reader
-- `src/cache.rs` — two-tier: `/dev/shm/arcfetch/` (same-boot) + `~/.cache/arcfetch/` (persistent, TTL-gated)
+- `src/cache.rs` — two-tier: `/dev/shm/arcfetch/` (same-boot) + `~/.cache/arcfetch/` (persistent, TTL-gated); a fresh persistent hit is promoted into tmpfs for the rest of the boot
 - `src/logos.rs` — 40+ distro logo constants; `from_name`, `all_names`, `detect(id, id_like)`
 - `src/mandelbrot.rs`, `src/cosmic.rs` — display modes
 

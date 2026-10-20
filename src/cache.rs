@@ -30,7 +30,12 @@ pub fn get(key: &str, ttl_secs: u64) -> Option<String> {
     let age = now_secs().saturating_sub(modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
     if age > ttl_secs { return None; }
 
-    fs::read_to_string(&cache_path).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    let v = fs::read_to_string(&cache_path).ok()?.trim().to_string();
+    if v.is_empty() { return None; }
+    // Promote into tmpfs so the rest of this boot skips the persistent stat+read.
+    let _ = fs::create_dir_all(CACHE_DIR);
+    let _ = fs::write(&shm_path, &v);
+    Some(v)
 }
 
 pub fn set(key: &str, value: &str) {
@@ -132,23 +137,38 @@ fn spawn_refresh() {
 
 #[allow(dead_code)]
 fn get_fresh(key: &str, ttl_secs: u64) -> Option<String> {
-    for path in [
-        format!("{CACHE_DIR}/{key}"),
-        format!("{}/{key}", persistent_dir()),
-    ] {
-        let Ok(meta) = fs::metadata(&path) else { continue };
-        let Ok(modified) = meta.modified() else { continue };
-        let age = now_secs()
-            .saturating_sub(modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
-        if age > ttl_secs {
-            continue;
-        }
-        if let Ok(v) = fs::read_to_string(&path) {
-            let v = v.trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
+    let shm_path = format!("{CACHE_DIR}/{key}");
+
+    // Tier 1: /dev/shm/arcfetch/ — TTL enforced here too.
+    if let Ok(meta) = fs::metadata(&shm_path) {
+        if let Ok(modified) = meta.modified() {
+            let age = now_secs()
+                .saturating_sub(modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
+            if age <= ttl_secs {
+                if let Ok(v) = fs::read_to_string(&shm_path) {
+                    let v = v.trim().to_string();
+                    if !v.is_empty() { return Some(v); }
+                }
             }
         }
     }
-    None
+
+    // Tier 2: ~/.cache/arcfetch/ — promote into tmpfs for the rest of this boot,
+    // preserving the original mtime so the TTL is not stretched.
+    let cache_path = format!("{}/{key}", persistent_dir());
+    let meta = fs::metadata(&cache_path).ok()?;
+    let modified = meta.modified().ok()?;
+    let age = now_secs()
+        .saturating_sub(modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs());
+    if age > ttl_secs { return None; }
+    let v = fs::read_to_string(&cache_path).ok()?.trim().to_string();
+    if v.is_empty() { return None; }
+    let _ = fs::create_dir_all(CACHE_DIR);
+    if let Ok(mut f) = fs::File::create(&shm_path) {
+        use std::io::Write;
+        if f.write_all(v.as_bytes()).is_ok() {
+            let _ = f.set_modified(modified);
+        }
+    }
+    Some(v)
 }
