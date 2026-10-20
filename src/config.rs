@@ -338,134 +338,34 @@ pub fn downgrade_str(s: &str, depth: ColorDepth) -> String {
 
 // ── Colour schemes ───────────────────────────────────────
 
-pub type Rgb = (u8, u8, u8);
-
-/// RGB triplets for a named scheme, in palette order:
-/// rosewater, flamingo, pink, mauve, red, maroon, peach, yellow, green,
-/// teal, sky, sapphire, blue, lavender, text, subtext1, overlay0.
-pub fn scheme_rgb(name: &str) -> Option<[Rgb; 17]> {
-    let v: [Rgb; 17] = match name.trim().to_ascii_lowercase().as_str() {
-        "mocha" | "catppuccin" | "catppuccin-mocha" => [
-            (245,224,220),(242,205,205),(245,194,231),(203,166,247),(243,139,168),
-            (235,160,172),(250,179,135),(249,226,175),(166,227,161),(148,226,213),
-            (137,220,235),(116,199,236),(137,180,250),(180,190,254),(205,214,244),
-            (186,194,222),(108,112,134),
-        ],
-        "latte" | "catppuccin-latte" => [
-            (220,138,120),(221,120,120),(234,118,203),(136,57,239),(210,15,57),
-            (230,69,83),(254,100,11),(223,142,29),(64,160,43),(23,146,153),
-            (4,165,229),(32,159,181),(30,102,245),(114,135,253),(76,79,105),
-            (92,95,119),(156,160,176),
-        ],
-        "frappe" | "frappé" | "catppuccin-frappe" => [
-            (242,213,207),(238,190,190),(244,184,228),(202,158,230),(231,130,132),
-            (234,153,156),(239,159,118),(229,200,144),(166,209,137),(129,200,190),
-            (153,209,219),(133,193,220),(140,170,238),(186,187,241),(198,208,245),
-            (181,191,226),(115,121,148),
-        ],
-        "macchiato" | "catppuccin-macchiato" => [
-            (244,219,214),(240,198,198),(245,189,230),(198,160,246),(237,135,150),
-            (238,153,160),(245,169,127),(238,212,159),(166,218,149),(139,213,202),
-            (145,215,227),(125,196,228),(138,173,244),(183,189,248),(202,211,245),
-            (184,192,224),(110,115,141),
-        ],
-        "nord" => [
-            (216,222,233),(208,135,112),(180,142,173),(180,142,173),(191,97,106),
-            (191,97,106),(208,135,112),(235,203,139),(163,190,140),(143,188,187),
-            (136,192,208),(129,161,193),(94,129,172),(129,161,193),(236,239,244),
-            (216,222,233),(76,86,106),
-        ],
-        "dracula" => [
-            (248,248,242),(255,121,198),(255,121,198),(189,147,249),(255,85,85),
-            (255,85,85),(255,184,108),(241,250,140),(80,250,123),(139,233,253),
-            (139,233,253),(98,114,164),(189,147,249),(189,147,249),(248,248,242),
-            (248,248,242),(98,114,164),
-        ],
-        "gruvbox" | "gruvbox-dark" => [
-            (235,219,178),(211,134,155),(211,134,155),(211,134,155),(251,73,52),
-            (204,36,29),(254,128,25),(250,189,47),(184,187,38),(142,192,124),
-            (131,165,152),(69,133,136),(131,165,152),(211,134,155),(235,219,178),
-            (213,196,161),(146,131,116),
-        ],
-        "tokyo" | "tokyo-night" | "tokyonight" => [
-            (247,118,142),(255,0,124),(187,154,247),(187,154,247),(247,118,142),
-            (219,75,75),(255,158,100),(224,175,104),(158,206,106),(115,218,202),
-            (125,207,255),(42,195,222),(122,162,247),(187,154,247),(192,202,245),
-            (169,177,214),(86,95,137),
-        ],
-        "solarized" | "solarized-dark" => [
-            (238,232,213),(211,54,130),(211,54,130),(108,113,196),(220,50,47),
-            (203,75,22),(203,75,22),(181,137,0),(133,153,0),(42,161,152),
-            (42,161,152),(38,139,210),(38,139,210),(108,113,196),(238,232,213),
-            (147,161,161),(88,110,117),
-        ],
-        // Rosé Pine (main): rose, love, gold, pine, foam, iris, text, subtle, muted
-        "rose-pine" | "rosepine" | "rose_pine" => [
-            (235,188,186),(235,188,186),(235,111,146),(196,167,231),(235,111,146),
-            (235,111,146),(246,193,119),(246,193,119),(49,116,143),(156,207,216),
-            (156,207,216),(49,116,143),(156,207,216),(196,167,231),(224,222,244),
-            (144,140,170),(110,106,134),
-        ],
-        "onedark" | "one-dark" | "atom" => [
-            (171,178,191),(224,108,117),(198,120,221),(198,120,221),(224,108,117),
-            (224,108,117),(209,154,102),(229,192,123),(152,195,121),(86,182,194),
-            (86,182,194),(97,175,239),(97,175,239),(198,120,221),(171,178,191),
-            (171,178,191),(92,99,112),
-        ],
-        // Kanagawa Wave: fujiWhite, sakuraPink, oniViolet, waveRed, autumnRed,
-        // surimiOrange, carpYellow, springGreen, waveAqua2, spring/crystal blue
-        "kanagawa" => [
-            (220,215,186),(210,126,153),(210,126,153),(149,127,184),(228,104,118),
-            (195,64,67),(255,160,102),(230,195,132),(152,187,108),(122,168,159),
-            (127,180,202),(126,156,216),(126,156,216),(156,171,202),(220,215,186),
-            (200,192,147),(114,113,105),
-        ],
-        "everforest" => [
-            (211,198,170),(230,126,128),(230,126,128),(214,153,182),(230,126,128),
-            (230,126,128),(230,152,117),(219,188,127),(167,192,128),(131,192,146),
-            (127,187,179),(127,187,179),(127,187,179),(214,153,182),(211,198,170),
-            (211,198,170),(133,146,137),
-        ],
-        // Ayu Dark (official): fg, red, purple, orange, yellow, green, cyan, blue
-        "ayu" | "ayu-dark" => [
-            (191,189,182),(240,113,120),(240,113,120),(210,166,255),(240,113,120),
-            (217,87,87),(255,143,64),(255,180,84),(170,217,76),(149,230,203),
-            (149,230,203),(57,186,230),(89,194,255),(210,166,255),(191,189,182),
-            (191,189,182),(98,106,115),
-        ],
-        _ => return None,
-    };
-    Some(v)
-}
-
-/// Build a full [`Colors`] from a named scheme.
+/// Build a full [`Colors`] from a verified upstream palette.
 ///
-/// `"auto"` picks a light/dark default (`latte`/`mocha`) from the terminal
-/// background, so the output stays legible on either kind of terminal.
+/// `"auto"` is a selector, not a palette: it queries the terminal background
+/// (OSC 11, `$COLORFGBG` fallback) and picks Latte for light or Mocha for
+/// dark/unavailable, so the choice stays deterministic.
 pub fn scheme(name: &str) -> Option<Colors> {
-    let name = if name.eq_ignore_ascii_case("auto") {
-        if crate::modules::term_is_light().unwrap_or(false) { "latte" } else { "mocha" }
+    let s = if name.eq_ignore_ascii_case("auto") {
+        crate::scheme::auto_for(crate::modules::term_is_light().unwrap_or(false))
     } else {
-        name
+        crate::scheme::find(name)?
     };
-    let p = scheme_rgb(name)?;
-    let c = |i: usize| {
-        let (r, g, b) = p[i];
+    let c = |role: &str| {
+        let (r, g, b) = s.rgb(role);
         format!("\x1b[38;2;{};{};{}m", r, g, b)
     };
     Some(Colors {
-        accent:   c(12),
-        username: c(3),
-        hostname: c(12),
-        labels:   [c(12), c(11), c(10), c(9), c(8), c(7), c(6)],
-        values:   c(15),
-        sep:      c(16),
-        bar:      c(12),
-        logo:     [c(12), c(11), c(10), c(9), c(8), c(7), c(6), c(12), c(14)],
+        accent:   c(s.roles.accent),
+        username: c(s.roles.purple),
+        hostname: c(s.roles.blue),
+        labels:   [c(s.roles.blue), c(s.roles.cyan), c(s.roles.teal), c(s.roles.green), c(s.roles.yellow), c(s.roles.orange), c(s.roles.red)],
+        values:   c(s.roles.subtext),
+        sep:      c(s.roles.overlay),
+        bar:      c(s.roles.blue),
+        logo:     [c(s.roles.blue), c(s.roles.cyan), c(s.roles.teal), c(s.roles.green), c(s.roles.yellow), c(s.roles.orange), c(s.roles.red), c(s.roles.accent), c(s.roles.purple)],
     })
 }
 
-/// Scheme names accepted by [`scheme`], for help text.
+/// Scheme names accepted by [`scheme`], for help text. `auto` is a selector.
 pub const SCHEMES: &[&str] = &[
     "auto", "mocha", "latte", "frappe", "macchiato", "nord", "dracula",
     "gruvbox", "tokyo-night", "solarized-dark", "rose-pine",
@@ -1048,4 +948,50 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
     }
 
     Config { colors, show, preset, logo, animation }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheme_uses_the_canonical_palette() {
+        let c = scheme("mocha").unwrap();
+        assert_eq!(c.accent, "\x1b[38;2;137;180;250m");   // blue #89b4fa
+        assert_eq!(c.username, "\x1b[38;2;203;166;247m"); // mauve #cba6f7
+        assert_eq!(c.values, "\x1b[38;2;186;194;222m");   // subtext1 #bac2de
+    }
+
+    #[test]
+    fn scheme_aliases_and_invalid_names() {
+        assert_eq!(scheme("catppuccin").unwrap().accent, scheme("mocha").unwrap().accent);
+        assert_eq!(scheme("tokyonight").unwrap().accent, scheme("tokyo-night").unwrap().accent);
+        assert_eq!(scheme("atom").unwrap().accent, scheme("onedark").unwrap().accent);
+        assert!(scheme("no-such-scheme").is_none());
+    }
+
+    #[test]
+    fn scheme_names_match_the_palette_module() {
+        assert_eq!(SCHEMES[0], "auto");
+        let names: Vec<&str> = crate::scheme::SCHEMES
+            .iter()
+            .map(|s| s.palette.name)
+            .collect();
+        assert_eq!(&SCHEMES[1..], names.as_slice());
+    }
+
+    #[test]
+    fn colour_depth_fallbacks_are_exact() {
+        let red = "\x1b[38;2;255;0;0m";
+        assert_eq!(downgrade_str(red, ColorDepth::True), red);
+        assert_eq!(downgrade_str(red, ColorDepth::Ansi256), "\x1b[38;5;196m");
+        assert_eq!(downgrade_str(red, ColorDepth::Ansi16), "\x1b[91m");
+    }
+
+    #[test]
+    fn preview_swatches_fall_back_without_truecolour() {
+        let sw = crate::scheme::swatch((255, 0, 0));
+        assert_eq!(downgrade_str(&sw, ColorDepth::Ansi256), "\x1b[38;5;196m██\x1b[0m");
+        assert_eq!(downgrade_str(&sw, ColorDepth::Ansi16), "\x1b[91m██\x1b[0m");
+    }
 }

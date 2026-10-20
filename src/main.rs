@@ -10,6 +10,7 @@ mod mandelbrot;
 mod modules;
 mod net;
 mod pkgs;
+mod scheme;
 
 use std::{env, thread};
 use std::f64::consts::PI;
@@ -41,6 +42,17 @@ fn row(label_color: &str, key: &str, val: &str) -> String {
     s.push_str(RESET); s.push(' ');
     s.push_str(label_color); s.push_str(val); s.push_str(RESET);
     s
+}
+
+/// Colour is off for `--no-color`, `NO_COLOR`, `CLICOLOR=0`, or a non-TTY
+/// unless `FORCE_COLOR` is set.
+fn colour_disabled(no_color: bool) -> bool {
+    let tty = unsafe { libc::isatty(1) } != 0;
+    let force = env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty());
+    no_color
+        || (!tty && !force)
+        || env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+        || env::var("CLICOLOR").ok().as_deref() == Some("0")
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -324,13 +336,13 @@ fn run_intro(
             let inf  = info.get(i).map(String::as_str).unwrap_or("");
 
             if args.no_color {
-                let _ = write!(frame, "  {}{}  {}\n", line, " ".repeat(pad), inf);
+                let _ = writeln!(frame, "  {}{}  {}", line, " ".repeat(pad), inf);
             } else if animated_logo && anim.wave {
                 let shown = wave_text(&line, i, tick as usize, &cfg.colors.logo);
-                let _ = write!(frame, "  {}{}  {}\n", shown, " ".repeat(pad), inf);
+                let _ = writeln!(frame, "  {}{}  {}", shown, " ".repeat(pad), inf);
             } else {
                 let lc = logo_line_color(logo_name, i, cfg, args.color.is_some());
-                let _ = write!(frame, "  {}{}{}{}  {}\n", lc, line, RESET, " ".repeat(pad), inf);
+                let _ = writeln!(frame, "  {}{}{}{}  {}", lc, line, RESET, " ".repeat(pad), inf);
             }
         }
 
@@ -1666,30 +1678,61 @@ fn logo_line_color<'a>(logo_name: &str, i: usize, cfg: &'a Config, color_overrid
 //  logo catalogue
 // ═══════════════════════════════════════════════════════════
 
-/// `--list-schemes` — preview every built-in palette as a swatch strip.
-fn print_schemes() {
+/// `--list-schemes` — preview every verified palette as role swatches.
+fn print_schemes(no_color: bool) {
     use std::fmt::Write as _;
-    let depth = config::ColorDepth::detect();
+    let color = !colour_disabled(no_color);
+    let depth = if color { config::ColorDepth::detect() } else { config::ColorDepth::Ansi16 };
+    let cols = term_size().0.max(40);
+    let per_row = (cols.saturating_sub(6) / 21).max(1);
+    let paint = |line: String| {
+        let line = if color {
+            config::downgrade_str(&line, depth)
+        } else {
+            strip_ansi(&line)
+        };
+        println!("{line}");
+    };
+
     println!();
-    println!("  {BOLD}{BLUE}arcfetch schemes{R}  {OVL}use: arcfetch --scheme <name>{R}",
-        BOLD = BOLD, BLUE = BLUE, OVL = OVERLAY0, R = RESET);
-    println!("  {OVL}17 slots: rosewater flamingo pink mauve red maroon peach yellow{R}",
-        OVL = OVERLAY0, R = RESET);
-    println!("  {OVL}           green teal sky sapphire blue lavender text subtext1 overlay0{R}",
-        OVL = OVERLAY0, R = RESET);
+    paint(format!(
+        "  {BOLD}{BLUE}arcfetch schemes{R}  {OVL}use: arcfetch --scheme <name>{R}",
+        BOLD = BOLD, BLUE = BLUE, OVL = OVERLAY0, R = RESET
+    ));
+    paint(format!(
+        "  {OVL}verified upstream palettes · role, swatch, exact hex{R}",
+        OVL = OVERLAY0, R = RESET
+    ));
     println!();
-    for &name in config::SCHEMES {
-        if name == "auto" { continue; }
-        let Some(p) = config::scheme_rgb(name) else { continue };
-        let mut line = format!("    {GREEN}{:<12}{R} ", name, GREEN = GREEN, R = RESET);
-        for (r, g, b) in p {
-            let _ = write!(line, "\x1b[38;2;{};{};{}m███", r, g, b);
+
+    for s in scheme::SCHEMES.iter().copied() {
+        paint(format!(
+            "  {BOLD}{GREEN}{}{R}  {OVL}· {}{R}",
+            s.palette.name,
+            s.palette.variant,
+            BOLD = BOLD, GREEN = GREEN, OVL = OVERLAY0, R = RESET
+        ));
+        for chunk in s.roles.all().chunks(per_row) {
+            let mut line = String::from("    ");
+            for (label, role) in chunk {
+                let rgb = s.rgb(role);
+                let _ = write!(line, " {label:<7} ");
+                if color {
+                    let _ = write!(line, "{}", scheme::swatch(rgb));
+                } else {
+                    line.push_str("██");
+                }
+                let _ = write!(line, " {}  ", scheme::hex(rgb));
+            }
+            paint(line);
         }
-        line.push_str(RESET);
-        println!("{}", config::downgrade_str(&line, depth));
+        println!();
     }
-    println!();
-    println!("  {OVL}auto{R} picks latte/mocha from the terminal background.", OVL = OVERLAY0, R = RESET);
+
+    paint(format!(
+        "  {OVL}auto{R} picks latte on a light terminal, mocha on dark or unknown backgrounds.",
+        OVL = OVERLAY0, R = RESET
+    ));
     println!();
 }
 
@@ -1973,6 +2016,14 @@ fn pin_height(art_h: usize, info_len: usize, rows: usize) -> usize {
     art_h.max(info_len).min(usable).max(1)
 }
 
+/// Geometry for one pinned pane frame.
+struct PaneGeom {
+    cols: usize,
+    art_cols: usize,
+    art_h: usize,
+    pane_h: usize,
+}
+
 /// Build one frame for the pinned pane: art on the left, info on the right,
 /// with the same two-space indent and gap as the normal one-shot render.
 fn pane_frame(
@@ -1981,14 +2032,11 @@ fn pane_frame(
     custom: &Option<Vec<String>>,
     cfg: &Config,
     info: &[String],
-    cols: usize,
-    art_cols: usize,
-    art_h: usize,
-    pane_h: usize,
+    geom: PaneGeom,
     frame: u64,
 ) -> Vec<String> {
     let art: Vec<String> = match mode {
-        PanelMode::Blackhole => panel_blackhole(art_cols, art_h.min(pane_h), frame),
+        PanelMode::Blackhole => panel_blackhole(geom.art_cols, geom.art_h.min(geom.pane_h), frame),
         PanelMode::Animate(effect) => {
             let effect = parse_effect(effect);
             match custom {
@@ -2019,9 +2067,9 @@ fn pane_frame(
         }
     };
 
-    let art_w = art.iter().map(|l| visible_chars(l)).max().unwrap_or(art_cols);
-    let mut block = Vec::with_capacity(pane_h);
-    for i in 0..pane_h {
+    let art_w = art.iter().map(|l| visible_chars(l)).max().unwrap_or(geom.art_cols);
+    let mut block = Vec::with_capacity(geom.pane_h);
+    for i in 0..geom.pane_h {
         let a = art.get(i).map(String::as_str).unwrap_or("");
         let pad = art_w.saturating_sub(visible_chars(a));
         let inf = info.get(i).map(String::as_str).unwrap_or("");
@@ -2034,7 +2082,7 @@ fn pane_frame(
         }
         line.push_str("  ");
         line.push_str(inf);
-        block.push(truncate_visible(&line, cols));
+        block.push(truncate_visible(&line, geom.cols));
     }
     block
 }
@@ -2234,10 +2282,12 @@ fn run_background(
                 custom,
                 cfg,
                 info,
-                cur_cols,
-                cur_art_cols,
-                cur_art_h,
-                cur_pane_h,
+                PaneGeom {
+                    cols: cur_cols,
+                    art_cols: cur_art_cols,
+                    art_h: cur_art_h,
+                    pane_h: cur_pane_h,
+                },
                 frame,
             );
             let block: Vec<String> = if no_color {
@@ -2355,7 +2405,7 @@ fn main() {
     if args.help     { print_help(&cfg_path);          return; }
     if args.show_cfg { print_config_help(&cfg_path); write_sample_config(&cfg_path); return; }
     if args.list_logos { print_logos(); return; }
-    if args.list_schemes { print_schemes(); return; }
+    if args.list_schemes { print_schemes(args.no_color); return; }
     if args.stop { stop_background(); return; }
 
     // mutual exclusion for display modes
@@ -2403,10 +2453,7 @@ fn main() {
 
     // auto-disable colour when stdout is not a terminal; honour NO_COLOR / CLICOLOR / FORCE_COLOR
     let is_tty = unsafe { libc::isatty(1) } != 0;
-    let force_color = env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty());
-    if !is_tty && !force_color { args.no_color = true; }
-    if env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) { args.no_color = true; }
-    if env::var("CLICOLOR").ok().as_deref() == Some("0") { args.no_color = true; }
+    args.no_color = colour_disabled(args.no_color);
 
     // Down-sample colours to what the terminal can actually show (truecolor →
     // 256 → 16), so the tool stays legible on any terminal.
