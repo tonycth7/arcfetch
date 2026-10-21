@@ -10,7 +10,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Hard cap on how many response bytes we will ever buffer (64 KiB).
 const MAX_BODY: usize = 64 * 1024;
@@ -56,11 +56,12 @@ pub fn http_get(host: &str, port: u16, path: &str, timeout_ms: u64) -> Option<St
         env!("CARGO_PKG_VERSION")
     );
     stream.write_all(request.as_bytes()).ok()?;
-    // We half-close for writing so servers that wait on EOF make progress; if
-    // the platform refuses, the read timeout still protects us.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
 
-    // Read the response, never buffering more than MAX_BODY bytes.
+    // Read the response, never buffering more than MAX_BODY bytes. The timeout
+    // is a total deadline, not a per-read timeout, so a dribbling server can't
+    // stretch the fetch indefinitely.
+    let start = Instant::now();
+    let mut timed_out = false;
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK);
     let mut chunk = [0u8; READ_CHUNK];
     loop {
@@ -68,6 +69,9 @@ pub fn http_get(host: &str, port: u16, path: &str, timeout_ms: u64) -> Option<St
         if remaining == 0 {
             break;
         }
+        let left = timeout.saturating_sub(start.elapsed());
+        if left.is_zero() { timed_out = true; break; }
+        stream.set_read_timeout(Some(left)).ok()?;
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -79,24 +83,40 @@ pub fn http_get(host: &str, port: u16, path: &str, timeout_ms: u64) -> Option<St
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref e) if matches!(e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                timed_out = true;
+                break;
+            }
             Err(_) => break,
         }
+    }
+    if timed_out {
+        return None;
     }
 
     let text = String::from_utf8_lossy(&buf);
 
-    // A valid HTTP response must begin with a status line.
+    // A valid HTTP response must begin with a 2xx status line.
     if !text.starts_with("HTTP/") {
+        return None;
+    }
+    if !text.split_whitespace().nth(1).is_some_and(|s| s.starts_with('2')) {
         return None;
     }
 
     // Split headers from body on the first blank line. If there is none, the
-    // body is empty (headers only). Chunked bodies are returned raw, which is
-    // acceptable for this best-effort client.
-    let body = match text.split_once("\r\n\r\n") {
-        Some((_headers, body)) => body,
-        None => "",
-    };
+    // body is empty (headers only). We cannot decode chunked framing, so treat
+    // it as a failure rather than returning chunk-size lines as the value.
+    let (headers, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let chunked = headers.lines().any(|l| {
+        l.split_once(':').is_some_and(|(k, v)| {
+            k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    if chunked {
+        return None;
+    }
 
     Some(body.trim().to_string())
 }

@@ -1,0 +1,26 @@
+{
+    "logo": {
+        "type": "none"
+    },
+    "display": {
+        "color": "magenta"
+    },
+    "modules": [
+        {
+            "type": "theme",
+            "key": "T"
+        },
+        {
+            "type": "icons",
+            "key": "I"
+        },
+        {
+            "type": "terminalfont",
+            "key": "F"
+        },
+        {
+            "type": "cursor",
+            "key": "C"
+        }
+    ]
+}

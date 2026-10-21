@@ -1,0 +1,62 @@
+{
+    "logo": {
+        "type": "small"
+    },
+    "display": {
+        "separator": " ",
+        "key": {
+            "type": "both"
+        },
+        "bar": {
+            "border": {
+                "left": "",
+                "leftElapsed": "",
+                "right": "",
+                "rightElapsed": ""
+            },
+            "char": {
+                "total": "",
+                "elapsed": ""
+            },
+            "color": {
+                "total": null
+            }
+        },
+        "percent": {
+            "type": [
+                "bar",
+                "bar-monochrome"
+            ]
+        }
+    },
+    "modules": [
+        "title",
+        "separator",
+        {
+            "type": "memory",
+            "key": "MEM"
+        },
+        {
+            "type": "swap",
+            "key": "SWP"
+        },
+        {
+            "type": "disk",
+            "folders": "/",
+            "key": "DSK"
+        },
+        {
+            "type": "battery",
+            "key": "BAT"
+        },
+        {
+            "type": "brightness",
+            "key": "BGT"
+        },
+        {
+            "type": "colors",
+            "paddingLeft": 6,
+            "symbol": "circle"
+        }
+    ]
+}

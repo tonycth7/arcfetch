@@ -1,4 +1,4 @@
-use std::{env, fs};
+use std::{env, fs, path::Path};
 
 use crate::{modules, net};
 
@@ -165,7 +165,7 @@ fn cpu_brand() -> String {
             .replace("(R)", "").replace("(TM)", "")
             .split_ascii_whitespace().collect::<Vec<_>>().join(" ");
         // strip verbose suffixes like bfetch does
-        for kw in &["with Radeon Graphics", "with Graphics", "-Core", " Core"] {
+        for kw in &["with Radeon Graphics", "with Graphics"] {
             if let Some(pos) = s.find(kw) {
                 s.truncate(pos);
             }
@@ -446,7 +446,11 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
             os_raw.as_deref()
                 .and_then(|r| r.lines().find(|l| l.starts_with("PRETTY_NAME=")))
                 .map(|l| l[12..].trim_matches('"').to_string())
-                .unwrap_or_else(|| "Arch Linux".into())
+                .or_else(|| os_raw.as_deref()
+                    .and_then(|r| r.lines().find(|l| l.starts_with("NAME=")))
+                    .map(|l| l[5..].trim_matches('"').to_string()))
+                .or_else(|| (!os_id.is_empty()).then(|| os_id.clone()))
+                .unwrap_or_else(|| "Linux".into())
         })
     } else { String::new() };
 
@@ -560,7 +564,12 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     } else { String::new() };
 
     // env vars — pure memory, zero I/O — gated on show flags
-    let shell  = if show.shell  { env::var("SHELL").unwrap_or_default().rsplit('/').next().unwrap_or("sh").to_string() } else { String::new() };
+    let shell  = if show.shell  {
+        env::var("SHELL").ok()
+            .and_then(|s| s.rsplit('/').next().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "sh".into())
+    } else { String::new() };
     let term   = if show.term   { env::var("TERM_PROGRAM").or_else(|_| env::var("TERM")).unwrap_or_else(|_| "unknown".into()) } else { String::new() };
     let locale = if show.locale { env::var("LANG").unwrap_or_else(|_| "C".into()) } else { String::new() };
     let de_wm  = if show.de_wm {
@@ -622,10 +631,13 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         let ip = local_ipv4()
             .map(|(_, ip)| ip)
             .unwrap_or_else(|| "N/A".into());
-        // SSH: port 22 (0x0016) in LISTEN (0A) in /proc/net/tcp
+        let tcp = ["/proc/net/tcp", "/proc/net/tcp6"].iter()
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // SSH: port 22 (0x0016) in LISTEN (0A)
         let ssh = {
-            let tcp = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
-            let up  = tcp.lines().skip(1).any(|l| {
+            let up = tcp.lines().skip(1).any(|l| {
                 let c: Vec<&str> = l.split_whitespace().collect();
                 c.get(1).map(|a| a.ends_with(":0016")).unwrap_or(false)
                     && c.get(3).map(|s| *s == "0A").unwrap_or(false)
@@ -633,12 +645,9 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
             if up { "active".into() } else { "inactive".into() }
         };
         // ports — count listening TCP ports
-        let ports = {
-            let tcp = fs::read_to_string("/proc/net/tcp").unwrap_or_default();
-            tcp.lines().skip(1)
-                .filter(|l| l.split_whitespace().nth(3).map(|s| s == "0A").unwrap_or(false))
-                .count().to_string()
-        };
+        let ports = tcp.lines().skip(1)
+            .filter(|l| l.split_whitespace().nth(3).map(|s| s == "0A").unwrap_or(false))
+            .count().to_string();
         (ip, ssh, ports)
     } else {
         ("N/A".into(), "inactive".into(), "0".into())
@@ -735,10 +744,20 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or("").to_string();
         let dev_name = root_dev.rsplit('/').next().unwrap_or("");
-        // strip partition number (e.g. nvme0n1p3 -> nvme0n1, sda2 -> sda)
-        let base_dev = dev_name.trim_end_matches(|c: char| c.is_ascii_digit());
-        let base_dev = base_dev.trim_end_matches('p'); // for nvme0n1p3 -> nvme0n1
-        let rot_path = format!("/sys/block/{}/queue/rotational", base_dev);
+        // Whole disks (nvme0n1, md0) are already in /sys/block. Otherwise
+        // strip only the partition suffix: nvme0n1p3 -> nvme0n1, sda2 -> sda.
+        let base_dev = if Path::new(&format!("/sys/block/{dev_name}")).exists() {
+            dev_name.to_string()
+        } else {
+            let trimmed = dev_name.trim_end_matches(|c: char| c.is_ascii_digit());
+            let with_p = trimmed.strip_suffix('p').unwrap_or(trimmed);
+            if ["nvme", "mmcblk", "pmem", "md"].iter().any(|p| dev_name.starts_with(p)) {
+                with_p.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        let rot_path = format!("/sys/block/{base_dev}/queue/rotational");
         match slurp(&rot_path).trim() {
             "0" => {
                 if base_dev.starts_with("nvme") { "NVMe SSD".into() }
@@ -749,20 +768,9 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         }
     } else { String::new() };
 
-    // pkg_updates — pacman updates count (quick dir mtime check)
-    let pkg_updates = if show.pkg_updates {
-        let sync_dir = "/var/lib/pacman/sync";
-        if let Ok(d) = fs::read_dir(sync_dir) {
-            let db_files: Vec<_> = d.flatten()
-                .filter(|e| e.file_name().to_string_lossy().ends_with(".db"))
-                .collect();
-            if !db_files.is_empty() {
-                // check local vs sync by counting pacman -Qu equivalent
-                // simply count .db files as package repos
-                format!("{} repos", db_files.len())
-            } else { "0".into() }
-        } else { "N/A".into() }
-    } else { String::new() };
+    // pkg_updates — pending pacman updates, cached for an hour. It runs with
+    // the other slow collectors below, so its `pacman -Qu` does not add to the
+    // warm `--all` latency.
 
     // theme — GTK theme from settings.ini
     let theme = if show.theme {
@@ -818,23 +826,7 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     let init_ver = if show.init_ver {
         let comm = slurp("/proc/1/comm").trim().to_string();
         match comm.as_str() {
-            "systemd" => {
-                let raw = slurp("/etc/os-release");
-                raw.lines()
-                    .find(|l| l.starts_with("VERSION_ID="))
-                    .map(|l| l[11..].trim_matches('"').to_string())
-                    .or_else(|| {
-                        // try reading systemd version from binary
-                        for p in &["/usr/lib/systemd/systemd", "/usr/bin/systemd"] {
-                            if fs::metadata(p).is_ok() {
-                                // just show "systemd" without version if we can't get it
-                                return Some("systemd".into());
-                            }
-                        }
-                        None
-                    })
-                    .unwrap_or_else(|| "systemd".into())
-            }
+            "systemd" => "systemd".into(),
             other => other.to_string(),
         }
     } else { String::new() };
@@ -878,18 +870,26 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     // `--all` costs ~max(collector) instead of the sum. Results are cached.
     let cpu_start = std::time::Instant::now();
     let cpu0      = show.cpu_usage.then(modules::cpu_snapshot);
-    let (wallpaper, media, public_ip, weather, opengl, vulkan, codec, bluetooth,
-         physical_disk, top_processes, term_theme, de_wm_ver) =
+    let (pkg_updates, wallpaper, media, public_ip, weather, opengl, vulkan, codec,
+         bluetooth, physical_disk, top_processes, term_theme, de_wm_ver) =
         std::thread::scope(|s| {
+        let pkg_updates = show.pkg_updates.then(|| s.spawn(|| {
+            if Path::new("/var/lib/pacman/sync").is_dir() {
+                crate::cache::get_or_compute_ttl("pkg_updates", 3600, || {
+                    match modules::run_timeout("pacman", &["-Qu"], 1500) {
+                        Some(s) => s.lines().filter(|l| !l.trim().is_empty()).count().to_string(),
+                        None => "N/A".into(),
+                    }
+                })
+            } else { "N/A".into() }
+        }));
         let wallpaper = show.wallpaper.then(|| s.spawn(modules::wallpaper));
         let media     = show.media.then(|| s.spawn(modules::media));
         let public_ip = show.public_ip.then(|| s.spawn(|| {
-            crate::cache::get_or_compute_swr("public_ip", 3600, ||
-                net::public_ip().unwrap_or_else(|| "N/A".into()))
+            crate::cache::get_or_compute_swr("public_ip", 3600, net::public_ip)
         }));
         let weather   = show.weather.then(|| s.spawn(|| {
-            crate::cache::get_or_compute_swr("weather", 900, ||
-                net::weather("").unwrap_or_else(|| "N/A".into()))
+            crate::cache::get_or_compute_swr("weather", 900, || net::weather(""))
         }));
         let opengl    = show.opengl.then(|| s.spawn(|| {
             crate::cache::get_or_compute("opengl", 86400, modules::opengl)
@@ -910,6 +910,7 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         }));
         let de_wm_ver = show.de_wm_ver.then(|| s.spawn(modules::de_wm_version));
         (
+            pkg_updates.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
             wallpaper.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
             media.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
             public_ip.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),

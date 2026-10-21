@@ -1,0 +1,20 @@
+{
+    "logo": {
+        "type": "small"
+    },
+    "display": {
+        "size": {
+            "binaryPrefix": "si"
+        }
+    },
+    "modules": [
+        "vulkan",
+        "opengl",
+        "memory",
+        {
+            "type": "disk",
+            "folders": "/:/home:/boot:/efi"
+        },
+        "localip"
+    ]
+}

@@ -26,10 +26,11 @@
 //   name = arch      # built-in: arch | ascii | tux | nix | gentoo | mini | auto
 //   file = ~/.config/arcfetch/logo.txt   # custom ASCII file (overrides name)
 //
-//   [template]
-//   preset = full    # full | minimal | hacker | science
+// A fastfetch-style JSONC config (config.jsonc or --config <file>) is also
+// accepted. TOML wins when both config.toml and config.jsonc exist.
 
-use std::{env, fs};
+use std::{env, fs, path::Path};
+use crate::jsonc;
 
 // ── Catppuccin Mocha — 24-bit true-colour ────────────────
 pub const ROSEWATER: &str = "\x1b[38;2;245;224;220m";
@@ -102,8 +103,8 @@ pub fn resolve(name: &str) -> String {
     // #RRGGBB or #RGB
     if let Some(hex) = name.strip_prefix('#') {
         let rgb = match hex.len() {
-            6 => (hex_byte(&hex[0..2]), hex_byte(&hex[2..4]), hex_byte(&hex[4..6])),
-            3 => {
+            6 if hex.is_ascii() => (hex_byte(&hex[0..2]), hex_byte(&hex[2..4]), hex_byte(&hex[4..6])),
+            3 if hex.is_ascii() => {
                 let f = |i: usize| hex_byte(&hex[i..i + 1]).map(|v| v.saturating_mul(17));
                 (f(0), f(1), f(2))
             }
@@ -154,6 +155,34 @@ pub fn resolve(name: &str) -> String {
     if let Some(n) = named { return format!("\x1b[38;5;{}m", n); }
 
     BLUE.into()
+}
+
+/// Fastfetch colour syntax: `31`, `90`, `#red`, `#@196`, `#ff0000`.
+pub fn ansi_code(n: u8) -> String {
+    match n {
+        0..=7   => format!("\x1b[{}m", 30 + n),
+        8..=15  => format!("\x1b[{}m", 90 + n - 8),
+        30..=37 | 90..=97 => format!("\x1b[{}m", n),
+        _       => format!("\x1b[38;5;{}m", n),
+    }
+}
+
+/// Resolve a colour value used in a JSONC `display`/module block.
+pub fn resolve_config_color(spec: &str) -> String {
+    let s = spec.trim();
+    if let Some(n) = s.strip_prefix("#@").and_then(|v| v.parse::<u8>().ok()) {
+        return format!("\x1b[38;5;{}m", n);
+    }
+    if let Some(rest) = s.strip_prefix('#') {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(n) = rest.parse::<u8>() { return ansi_code(n); }
+        }
+        return resolve(s);
+    }
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = s.parse::<u8>() { return ansi_code(n); }
+    }
+    resolve(s)
 }
 
 // ── Terminal colour depth ────────────────────────────────
@@ -655,81 +684,86 @@ pub const FIELD_KEYS: &[&str] = &[
 ];
 
 impl Show {
-    fn apply_preset(&mut self, preset: &str) {
-        *self = Show {
-            header: Header::Both,
-            os: false, kernel: false, uptime: false, uptime_long: false,
-            res: false, pkgs: false, shell: false, de_wm: false, term: false,
-            cpu: false, gpu: false, gpu_temp: false, battery: false,
-            memory: false, disk: false, load: false, locale: false,
-            ip: false, ssh: false, ports: false,
-            swatches: false,
-            init: false, cpu_temp: false, processes: false,
-            container: false, session: false,
-            swap: false, sound: false, gpu_driver: false,
-            bios: false, board: false, disk_type: false,
-            pkg_updates: false, theme: false, icons: false,
-            term_font: false, de_wm_ver: false, init_ver: false,
-            local_ip: false, color_bar: false,
-            datetime: false, editor: false, dns: false, host: false,
-            chassis: false, bootmgr: false, cpu_cache: false, login_manager: false,
-            brightness: false, cpu_usage: false, diskio: false, netio: false,
-            physmem: false, gpu_mem: false, btrfs: false, wifi: false,
-            users: false, wallpaper: false, media: false, public_ip: false,
-            weather: false, opengl: false, vulkan: false,
-            cursor: false, term_size: false, term_theme: false, codec: false,
-            bluetooth: false, camera: false, mouse: false, keyboard: false,
-            tpm: false, physical_disk: false, top_processes: false,
-            monitor: false,
-        };
-        match preset.trim() {
-            "minimal" => {
-                self.os = true; self.kernel = true;
-                self.uptime = true; self.memory = true;
-                self.battery = true;
-                self.swatches = true;
-            }
-            "hacker" => {
-                self.kernel = true; self.uptime = true;
-                self.cpu = true; self.gpu = true; self.gpu_temp = true;
-                self.memory = true; self.disk = true; self.load = true;
-                self.ip = true; self.ssh = true; self.ports = true;
-                self.swatches = true;
-            }
-            "science" => {
-                self.os = true; self.kernel = true; self.cpu = true;
-                self.memory = true; self.disk = true; self.uptime = true;
-                self.swatches = false;
-            }
-            _ => {
-                // "full" or anything else
-                *self = Show {
-                    header: Header::Both,
-                    os: true, kernel: true, uptime: true, uptime_long: false,
-                    res: true, pkgs: true, shell: true, de_wm: true, term: true,
-                    cpu: true, gpu: true, gpu_temp: false, battery: true,
-                    memory: true, disk: true, load: true, locale: true,
-                    ip: false, ssh: false, ports: false,
-                    swatches: true,
-                    init: true, cpu_temp: true, processes: true,
-                    container: false, session: true,
-                    swap: true, sound: true, gpu_driver: true,
-                    bios: false, board: false, disk_type: true,
-                    pkg_updates: false, theme: true, icons: false,
-                    term_font: false, de_wm_ver: false, init_ver: true,
-                    local_ip: true, color_bar: false,
-                    datetime: false, editor: false, dns: false, host: false,
-                    chassis: false, bootmgr: false, cpu_cache: false, login_manager: false,
-                    brightness: false, cpu_usage: false, diskio: false, netio: false,
-                    physmem: false, gpu_mem: false, btrfs: false, wifi: false,
-                    users: false, wallpaper: false, media: false, public_ip: false,
-                    weather: false, opengl: false, vulkan: false,
-                    cursor: true, term_size: true, term_theme: true, codec: false,
-                    bluetooth: false, camera: true, mouse: true, keyboard: true,
-                    tpm: true, physical_disk: true, top_processes: false,
-                    monitor: true,
-                };
-            }
+    /// Turn on the collector needed by a fastfetch-style module type.
+    pub fn enable_module(&mut self, kind: &str) {
+        let k = kind.trim().to_ascii_lowercase().replace(['-', '_'], "");
+        match k.as_str() {
+            "title" | "header" => self.header = Header::Both,
+            "os" => self.os = true,
+            "kernel" => self.kernel = true,
+            "uptime" => self.uptime = true,
+            "packages" | "pkgs" => self.pkgs = true,
+            "shell" => self.shell = true,
+            "de" | "wm" | "desktop" => self.de_wm = true,
+            "terminal" | "term" => self.term = true,
+            "cpu" => self.cpu = true,
+            "gpu" => self.gpu = true,
+            "gputemp" => self.gpu_temp = true,
+            "battery" => self.battery = true,
+            "memory" | "mem" => self.memory = true,
+            "disk" => self.disk = true,
+            "load" | "loadavg" => self.load = true,
+            "locale" => self.locale = true,
+            "localip" => self.local_ip = true,
+            "ip" => self.ip = true,
+            "ssh" => self.ssh = true,
+            "ports" => self.ports = true,
+            "init" | "initsystem" => self.init = true,
+            "cputemp" => self.cpu_temp = true,
+            "processes" => self.processes = true,
+            "container" => self.container = true,
+            "session" => self.session = true,
+            "swap" => self.swap = true,
+            "sound" => self.sound = true,
+            "gpudriver" => self.gpu_driver = true,
+            "bios" => self.bios = true,
+            "board" => self.board = true,
+            "disktype" => self.disk_type = true,
+            "pkgsupdates" | "pkgupdates" => self.pkg_updates = true,
+            "theme" => self.theme = true,
+            "icons" => self.icons = true,
+            "terminalfont" | "termfont" => self.term_font = true,
+            "dewmver" => self.de_wm_ver = true,
+            "initver" => self.init_ver = true,
+            "datetime" => self.datetime = true,
+            "editor" => self.editor = true,
+            "dns" => self.dns = true,
+            "host" => self.host = true,
+            "chassis" => self.chassis = true,
+            "bootmgr" => self.bootmgr = true,
+            "cpucache" => self.cpu_cache = true,
+            "loginmanager" => self.login_manager = true,
+            "brightness" => self.brightness = true,
+            "cpuusage" => self.cpu_usage = true,
+            "diskio" => self.diskio = true,
+            "netio" => self.netio = true,
+            "physmem" => self.physmem = true,
+            "gpumem" => self.gpu_mem = true,
+            "btrfs" => self.btrfs = true,
+            "wifi" => self.wifi = true,
+            "users" => self.users = true,
+            "wallpaper" => self.wallpaper = true,
+            "media" => self.media = true,
+            "publicip" => self.public_ip = true,
+            "weather" => self.weather = true,
+            "opengl" => self.opengl = true,
+            "vulkan" => self.vulkan = true,
+            "cursor" => self.cursor = true,
+            "terminalsize" | "termsize" => self.term_size = true,
+            "terminaltheme" | "termtheme" => self.term_theme = true,
+            "codec" => self.codec = true,
+            "bluetooth" => self.bluetooth = true,
+            "camera" => self.camera = true,
+            "mouse" => self.mouse = true,
+            "keyboard" => self.keyboard = true,
+            "tpm" => self.tpm = true,
+            "physicaldisk" => self.physical_disk = true,
+            "topprocesses" => self.top_processes = true,
+            "monitor" => self.monitor = true,
+            "res" => self.res = true,
+            "swatches" => self.swatches = true,
+            "colorbar" => self.color_bar = true,
+            _ => {}
         }
     }
 
@@ -836,12 +870,111 @@ impl Show {
 
 // ── Logo ─────────────────────────────────────────────────
 
-#[derive(Default)]
 pub struct Logo {
     pub name: Option<String>,  // built-in logo name (arch, ascii, tux, nix, gentoo, mini, auto)
     pub file: Option<String>,  // custom ASCII file path (overrides name if set)
+    pub color: Option<String>, // uniform logo colour (same syntax as --color)
+    pub data: Option<String>,  // inline `data` / `data-raw` logo
+    pub position: String,      // left | right | top
+    pub padding_top: usize,
+    pub padding_right: usize,
 }
 
+impl Default for Logo {
+    fn default() -> Self {
+        Self {
+            name: None, file: None, color: None, data: None,
+            position: "left".into(), padding_top: 0, padding_right: 2,
+        }
+    }
+}
+
+// ── JSONC display/module settings ───────────────────────
+
+pub struct Display {
+    pub separator: Option<String>,
+    pub separator_color: Option<String>,
+    pub key_color: Option<String>,
+    pub constants: Vec<String>,
+    pub key_width: Option<usize>,
+    pub key_padding_left: usize,
+    pub bar_width: usize,
+    pub bar_elapsed: String,
+    pub bar_total: String,
+}
+
+impl Default for Display {
+    fn default() -> Self {
+        Self {
+            separator: None,
+            separator_color: None,
+            key_color: None,
+            constants: Vec::new(),
+            key_width: None,
+            key_padding_left: 0,
+            bar_width: 14,
+            bar_elapsed: "\u{2588}".into(),
+            bar_total: "\u{2591}".into(),
+        }
+    }
+}
+
+pub struct Module {
+    pub kind: String,
+    pub key: Option<String>,
+    pub format: Option<String>,
+    pub key_color: Option<String>,
+    pub output_color: Option<String>,
+    pub key_icon: Option<String>,
+    pub padding_left: usize,
+    pub key_width: Option<usize>,
+    pub text: Option<String>,   // command module
+    pub symbol: Option<String>, // colors module
+}
+
+// ── Layout ───────────────────────────────────────────────
+
+pub struct Layout {
+    /// Border style: none | round | square | double | heavy | dashed | ascii.
+    pub box_style: String,
+    /// Border colour; `None` follows the accent, `Some("")` means uncoloured.
+    pub box_color: Option<String>,
+    /// Left margin in columns.
+    pub indent: usize,
+    /// Spaces between the logo and the info column.
+    pub gap: usize,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self { box_style: "none".into(), box_color: None, indent: 2, gap: 2 }
+    }
+}
+
+impl Layout {
+    fn set(&mut self, key: &str, val: &str) {
+        match key {
+            "box" => match val.trim().to_ascii_lowercase().as_str() {
+                "true" | "on" | "yes" => self.box_style = "round".into(),
+                "false" | "off" | "no" | "none" => self.box_style = "none".into(),
+                "round" | "square" | "double" | "heavy" | "dashed" | "ascii" => {
+                    self.box_style = val.trim().to_ascii_lowercase();
+                }
+                other => eprintln!(
+                    "arcfetch: warning: unknown box style '{}' (try: round|square|double|heavy|dashed|ascii|none)",
+                    other),
+            },
+            "box_color" => match val.trim().to_ascii_lowercase().as_str() {
+                "none" | "off" | "false" => self.box_color = Some(String::new()),
+                "accent" | "default" | "auto" => self.box_color = None,
+                _ => self.box_color = Some(resolve(val)),
+            },
+            "indent" => self.indent = val.trim().parse::<usize>().unwrap_or(2).min(32),
+            "gap"    => self.gap    = val.trim().parse::<usize>().unwrap_or(2).min(32),
+            _ => {}
+        }
+    }
+}
 
 // ── Animation ────────────────────────────────────────────
 
@@ -872,26 +1005,112 @@ impl Default for Animation {
 pub struct Config {
     pub colors:    Colors,
     pub show:      Show,
-    pub preset:    Option<String>,
     pub logo:      Logo,
+    pub layout:    Layout,
     pub animation: Animation,
+    pub display:   Display,
+    pub modules:   Option<Vec<Module>>,
+    pub source:    String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            colors: Colors::default(),
+            show: Show::default(),
+            logo: Logo::default(),
+            layout: Layout::default(),
+            animation: Animation::default(),
+            display: Display::default(),
+            modules: None,
+            source: String::new(),
+        }
+    }
 }
 
 // ── File path ────────────────────────────────────────────
 
-pub fn config_path() -> String {
+fn config_dir() -> String {
     env::var("XDG_CONFIG_HOME")
-        .map(|p| format!("{}/arcfetch/config.toml", p))
+        .map(|p| format!("{}/arcfetch", p))
         .unwrap_or_else(|_|
             env::var("HOME")
-                .map(|h| format!("{}/.config/arcfetch/config.toml", h))
-                .unwrap_or_else(|_| "~/.config/arcfetch/config.toml".into())
+                .map(|h| format!("{}/.config/arcfetch", h))
+                .unwrap_or_else(|_| "~/.config/arcfetch".into())
         )
+}
+
+pub fn config_path() -> String {
+    format!("{}/config.toml", config_dir())
+}
+
+pub fn jsonc_path() -> String {
+    format!("{}/config.jsonc", config_dir())
+}
+
+/// Where `--preset <name>` looks for fastfetch-style examples.
+pub fn presets_dir() -> Option<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(p) = env::var("XDG_DATA_HOME") {
+        dirs.push(format!("{p}/arcfetch/presets/examples"));
+    }
+    if let Ok(h) = env::var("HOME") {
+        dirs.push(format!("{h}/.local/share/arcfetch/presets/examples"));
+        dirs.push(format!("{h}/.config/arcfetch/examples"));
+    }
+    dirs.push("/usr/share/arcfetch/presets/examples".into());
+    dirs.push("presets/examples".into());
+    dirs.push(format!("{}/presets/examples", env!("CARGO_MANIFEST_DIR")));
+    dirs.into_iter().map(std::path::PathBuf::from).find(|p| p.is_dir())
+}
+
+pub fn resolve_preset(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() { return None; }
+    let p = Path::new(name);
+    if p.is_file() { return Some(name.to_string()); }
+    let dir = presets_dir()?;
+    for candidate in [format!("{name}.jsonc"), format!("{name}.json"), name.to_string()] {
+        let path = dir.join(candidate);
+        if path.is_file() { return Some(path.to_string_lossy().into_owned()); }
+    }
+    None
+}
+
+pub fn preset_names() -> Vec<String> {
+    let Some(dir) = presets_dir() else { return Vec::new() };
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|rd| rd.flatten().filter_map(|e| {
+            let p = e.path();
+            let ext = p.extension()?.to_str()?;
+            if ext != "jsonc" && ext != "json" { return None; }
+            Some(p.file_stem()?.to_string_lossy().into_owned())
+        }).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 // ── Simple TOML-subset parser ────────────────────────────
 // Handles [section], key = value, # comments.
 // No arrays, no multiline — exactly what we need, zero deps.
+
+/// Index of a `#` that starts a comment: outside quotes and at the start of the
+/// line or after whitespace. Keeps `#` inside paths/hex values.
+fn comment_start(line: &str, from: usize) -> Option<usize> {
+    let mut quoted = false;
+    for (i, c) in line.char_indices() {
+        if i < from { continue; }
+        match c {
+            '"' => quoted = !quoted,
+            '#' if !quoted && (i == 0 || line.as_bytes()[i - 1].is_ascii_whitespace()) => {
+                return Some(i);
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Strip a trailing `# comment` without eating `#RRGGBB` colour values.
 fn strip_comment(line: &str) -> &str {
@@ -900,152 +1119,300 @@ fn strip_comment(line: &str) -> &str {
             let rest = &line[eq + 1..];
             let value_start = eq + 1 + (rest.len() - rest.trim_start().len());
             if line[value_start..].starts_with('#') {
-                // the first '#' begins a hex value; only a second '#' is a comment
-                if let Some(p) = line[value_start + 1..].find('#') {
-                    return &line[..value_start + 1 + p];
-                }
-                return line;
+                // the first '#' begins a hex value; only a later comment is removed
+                return comment_start(line, value_start + 1)
+                    .map(|p| &line[..p])
+                    .unwrap_or(line);
             }
-            line.find('#').map(|p| &line[..p]).unwrap_or(line)
+            comment_start(line, value_start)
+                .map(|p| &line[..p])
+                .unwrap_or(line)
         }
-        None => line.find('#').map(|p| &line[..p]).unwrap_or(line),
+        None => comment_start(line, 0).map(|p| &line[..p]).unwrap_or(line),
     }
 }
 
-pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
-    let mut colors = Colors::default();
-    let mut show   = Show::default();
-    let mut preset: Option<String> = None;
-    let mut logo   = Logo::default();
-    let mut animation = Animation::default();
-    let mut header_explicit = false;
+pub fn load(cli_accent: Option<&str>, preset: Option<&str>, config_file: Option<&str>) -> Config {
+    let mut cfg = Config::default();
 
-    // override accent from env var
-    let env_accent = env::var("ARCFETCH_ACCENT").ok();
-    let accent_override = cli_accent
+    // CLI --config wins over --preset; otherwise TOML wins over JSONC.
+    let explicit = config_file
         .map(String::from)
-        .or(env_accent);
+        .or_else(|| preset.and_then(resolve_preset).or_else(|| preset.map(String::from)));
 
-    // try reading config file
-    let path = config_path();
-    if let Ok(content) = fs::read_to_string(&path) {
-        let mut section = "";
-        for (lineno, raw_line) in content.lines().enumerate() {
-            // strip a trailing comment first, then trim; skip blanks
-            let line = strip_comment(raw_line).trim();
-            if line.is_empty() { continue; }
+    let path = explicit.or_else(|| {
+        for candidate in [config_path(), jsonc_path()] {
+            if Path::new(&candidate).is_file() { return Some(candidate); }
+        }
+        None
+    });
 
-            // section header: [name]
-            if let Some(rest) = line.strip_prefix('[') {
-                if let Some((name, _)) = rest.split_once(']') {
-                    let name = name.trim();
-                    if !name.is_empty() {
-                        section = name;
-                        continue;
+    if let Some(path) = path {
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                cfg.source = path.clone();
+                let is_json = path.ends_with(".jsonc")
+                    || path.ends_with(".json")
+                    || content.trim_start().starts_with('{');
+                if is_json {
+                    if let Err(e) = apply_jsonc(&mut cfg, &content) {
+                        eprintln!("arcfetch: warning: {path}: {e}");
                     }
+                } else {
+                    apply_toml(&mut cfg, &content);
                 }
-                eprintln!("arcfetch: warning: invalid section header at line {}: {}", lineno + 1, raw_line);
-                continue;
             }
+            Err(e) => eprintln!("arcfetch: warning: {path}: {e}"),
+        }
+    }
 
-            let Some((key, val)) = line.split_once('=') else {
-                eprintln!("arcfetch: warning: skipping unparseable line {}: {}", lineno + 1, raw_line);
-                continue;
-            };
-            let key = key.trim();
-            let val = val.trim();
+    // CLI / env accent wins over file
+    let accent_override = cli_accent.map(String::from).or_else(|| env::var("ARCFETCH_ACCENT").ok());
+    if let Some(a) = accent_override {
+        let ansi = resolve(&a);
+        cfg.colors.accent = ansi.clone();
+        cfg.colors.hostname = ansi;
+    }
 
-            match section {
-                "colors" => {
-                    let ansi = resolve(val);
-                    match key {
-                        "scheme"   => {
-                            match scheme(val) {
-                                Some(c) => colors = c,
-                                None => eprintln!(
-                                    "arcfetch: warning: unknown color scheme '{}' (try: {})",
-                                    val, SCHEMES.join(", ")),
-                            }
-                        }
-                        "accent"   => colors.accent   = ansi,
-                        "username" => colors.username  = ansi,
-                        "hostname" => colors.hostname  = ansi,
-                        "values"   => colors.values    = ansi,
-                        "sep"      => colors.sep        = ansi,
-                        "bar"      => colors.bar        = ansi,
-                        "c1"       => colors.labels[0]  = ansi,
-                        "c2"       => colors.labels[1]  = ansi,
-                        "c3"       => colors.labels[2]  = ansi,
-                        "c4"       => colors.labels[3]  = ansi,
-                        "c5"       => colors.labels[4]  = ansi,
-                        "c6"       => colors.labels[5]  = ansi,
-                        "c7"       => colors.labels[6]  = ansi,
-                        "logo1"    => colors.logo[0]    = ansi,
-                        "logo2"    => colors.logo[1]    = ansi,
-                        "logo3"    => colors.logo[2]    = ansi,
-                        "logo4"    => colors.logo[3]    = ansi,
-                        "logo5"    => colors.logo[4]    = ansi,
-                        "logo6"    => colors.logo[5]    = ansi,
-                        "logo7"    => colors.logo[6]    = ansi,
-                        "logo8"    => colors.logo[7]    = ansi,
-                        "logo9"    => colors.logo[8]    = ansi,
-                        _ => {}
-                    }
+    cfg
+}
+
+fn apply_toml(cfg: &mut Config, content: &str) {
+    let mut section = "";
+    for (lineno, raw_line) in content.lines().enumerate() {
+        let line = strip_comment(raw_line).trim();
+        if line.is_empty() { continue; }
+
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some((name, _)) = rest.split_once(']') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    section = name;
+                    continue;
                 }
-                "show" => {
-                    if key == "header" {
-                        header_explicit = true;
-                        show.header = match val {
-                            "user"     | "username" => Header::UserOnly,
-                            "host"     | "hostname" => Header::HostOnly,
-                            "none"     | "false"    => Header::None,
-                            _                       => Header::Both,
-                        };
-                    } else {
-                        let enabled = matches!(val, "true" | "yes" | "1" | "on");
-                        show.set_field(key, enabled);
-                    }
+            }
+            eprintln!("arcfetch: warning: invalid section header at line {}: {}", lineno + 1, raw_line);
+            continue;
+        }
+
+        let Some((key, val)) = line.split_once('=') else {
+            eprintln!("arcfetch: warning: skipping unparseable line {}: {}", lineno + 1, raw_line);
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        let val = val.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(val);
+
+        match section {
+            "colors" => {
+                let ansi = resolve(val);
+                match key {
+                    "scheme" => match scheme(val) {
+                        Some(c) => cfg.colors = c,
+                        None => eprintln!(
+                            "arcfetch: warning: unknown color scheme '{}' (try: {})",
+                            val, SCHEMES.join(", ")),
+                    },
+                    "accent" => cfg.colors.accent = ansi,
+                    "username" => cfg.colors.username = ansi,
+                    "hostname" => cfg.colors.hostname = ansi,
+                    "values" => cfg.colors.values = ansi,
+                    "sep" => cfg.colors.sep = ansi,
+                    "bar" => cfg.colors.bar = ansi,
+                    "c1" => cfg.colors.labels[0] = ansi,
+                    "c2" => cfg.colors.labels[1] = ansi,
+                    "c3" => cfg.colors.labels[2] = ansi,
+                    "c4" => cfg.colors.labels[3] = ansi,
+                    "c5" => cfg.colors.labels[4] = ansi,
+                    "c6" => cfg.colors.labels[5] = ansi,
+                    "c7" => cfg.colors.labels[6] = ansi,
+                    "logo1" => cfg.colors.logo[0] = ansi,
+                    "logo2" => cfg.colors.logo[1] = ansi,
+                    "logo3" => cfg.colors.logo[2] = ansi,
+                    "logo4" => cfg.colors.logo[3] = ansi,
+                    "logo5" => cfg.colors.logo[4] = ansi,
+                    "logo6" => cfg.colors.logo[5] = ansi,
+                    "logo7" => cfg.colors.logo[6] = ansi,
+                    "logo8" => cfg.colors.logo[7] = ansi,
+                    "logo9" => cfg.colors.logo[8] = ansi,
+                    _ => {}
                 }
-                "logo" => {
-                    match key {
-                        "name" => logo.name = Some(val.to_string()),
-                        "file" => logo.file = Some(val.to_string()),
-                        _ => {}
-                    }
+            }
+            "show" => {
+                if key == "header" {
+                    cfg.show.header = match val {
+                        "user" | "username" => Header::UserOnly,
+                        "host" | "hostname" => Header::HostOnly,
+                        "none" | "false" => Header::None,
+                        _ => Header::Both,
+                    };
+                } else {
+                    let enabled = matches!(val, "true" | "yes" | "1" | "on");
+                    cfg.show.set_field(key, enabled);
                 }
-                "animation" => {
-                    let on = matches!(val, "true" | "yes" | "1" | "on");
-                    match key {
-                        "enabled"  => animation.enabled  = on,
-                        "effect"   => animation.effect   = val.to_string(),
-                        "intro_ms" => animation.intro_ms = val.parse().unwrap_or(700),
-                        "wave"     => animation.wave     = on,
-                        _ => {}
-                    }
-                }
-                "template"
-                    if key == "preset" => { preset = Some(val.to_string()); }
+            }
+            "logo" => match key {
+                "name" => cfg.logo.name = Some(val.to_string()),
+                "file" => cfg.logo.file = Some(val.to_string()),
+                "color" => cfg.logo.color = match val.trim().to_ascii_lowercase().as_str() {
+                    "accent" | "default" | "auto" | "none" => None,
+                    _ => Some(resolve(val)),
+                },
                 _ => {}
+            },
+            "layout" => cfg.layout.set(key, val),
+            "animation" => {
+                let on = matches!(val, "true" | "yes" | "1" | "on");
+                match key {
+                    "enabled" => cfg.animation.enabled = on,
+                    "effect" => cfg.animation.effect = val.to_string(),
+                    "intro_ms" => cfg.animation.intro_ms = val.parse().unwrap_or(700),
+                    "wave" => cfg.animation.wave = on,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
+    let root = jsonc::parse(text)?;
+
+    if let Some(logo) = root.get("logo") {
+        match logo {
+            jsonc::Value::Null => cfg.logo.name = Some("none".into()),
+            jsonc::Value::Obj(_) => {
+                if let Some(t) = logo.get("type").and_then(jsonc::Value::as_str) {
+                    match t.trim().to_ascii_lowercase().as_str() {
+                        "none" => cfg.logo.name = Some("none".into()),
+                        "small" => cfg.logo.name = Some("mini".into()),
+                        "data" | "data-raw" | "raw" => cfg.logo.name = None,
+                        "file" => cfg.logo.file = logo.get("source").and_then(jsonc::Value::as_str).map(String::from),
+                        other => cfg.logo.name = Some(other.to_string()),
+                    }
+                }
+                if let Some(src) = logo.get("source").and_then(jsonc::Value::as_str) {
+                    match logo.get("type").and_then(jsonc::Value::as_str).unwrap_or("").to_ascii_lowercase().as_str() {
+                        "data" | "data-raw" | "raw" => cfg.logo.data = Some(src.to_string()),
+                        "file" => cfg.logo.file = Some(src.to_string()),
+                        _ if !src.contains('\n') => cfg.logo.file = Some(src.to_string()),
+                        _ => cfg.logo.data = Some(src.to_string()),
+                    }
+                }
+                if let Some(c) = logo.get("color").and_then(jsonc::Value::as_str) {
+                    cfg.logo.color = match c.trim().to_ascii_lowercase().as_str() {
+                        "accent" | "default" | "auto" | "none" => None,
+                        _ => Some(resolve_config_color(c)),
+                    };
+                }
+                if let Some(pos) = logo.get("position").and_then(jsonc::Value::as_str) {
+                    cfg.logo.position = pos.trim().to_ascii_lowercase();
+                }
+                if let Some(pad) = logo.get("padding") {
+                    cfg.logo.padding_top = pad.get("top").and_then(jsonc::Value::as_usize).unwrap_or(0);
+                    cfg.logo.padding_right = pad.get("right").and_then(jsonc::Value::as_usize).unwrap_or(2);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(d) = root.get("display") {
+        if let Some(v) = d.get("separator").and_then(jsonc::Value::as_str) {
+            cfg.display.separator = Some(v.to_string());
+        }
+        if let Some(color) = d.get("color") {
+            if let Some(v) = color.get("separator").and_then(jsonc::Value::as_str) {
+                cfg.display.separator_color = Some(resolve_config_color(v));
+            }
+            if let Some(v) = color.get("keys").and_then(jsonc::Value::as_str) {
+                cfg.display.key_color = Some(resolve_config_color(v));
+            }
+        }
+        if let Some(arr) = d.get("constants").and_then(jsonc::Value::as_array) {
+            cfg.display.constants = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        }
+        if let Some(key) = d.get("key") {
+            cfg.display.key_width = key.get("width").and_then(jsonc::Value::as_usize);
+            cfg.display.key_padding_left = key.get("paddingLeft").and_then(jsonc::Value::as_usize).unwrap_or(0);
+        }
+        if let Some(bar) = d.get("bar") {
+            cfg.display.bar_width = bar.get("width").and_then(jsonc::Value::as_usize).unwrap_or(14).clamp(1, 200);
+            if let Some(ch) = bar.get("char") {
+                if let Some(v) = ch.get("elapsed").and_then(jsonc::Value::as_str) { cfg.display.bar_elapsed = v.to_string(); }
+                if let Some(v) = ch.get("total").and_then(jsonc::Value::as_str) { cfg.display.bar_total = v.to_string(); }
             }
         }
     }
 
-    // CLI preset overrides file preset
-    if let Some(p) = cli_preset { preset = Some(p.to_string()); }
-
-    // apply preset (overrides [show] if set, but preserves explicit header)
-    if let Some(p) = &preset {
-        let saved_header = if header_explicit { Some(show.header.clone()) } else { None };
-        show.apply_preset(p);
-        if let Some(h) = saved_header { show.header = h; }
+    if let Some(arr) = root.get("modules").and_then(jsonc::Value::as_array) {
+        let mut mods = Vec::with_capacity(arr.len());
+        for item in arr {
+            let mut m = Module {
+                kind: String::new(), key: None, format: None,
+                key_color: None, output_color: None, key_icon: None,
+                padding_left: 0, key_width: None, text: None, symbol: None,
+            };
+            match item {
+                jsonc::Value::Str(s) => m.kind = s.trim().to_ascii_lowercase(),
+                jsonc::Value::Obj(_) => {
+                    let Some(kind) = item.get("type").and_then(jsonc::Value::as_str) else { continue };
+                    m.kind = kind.trim().to_ascii_lowercase();
+                    m.key = item.get("key").and_then(jsonc::Value::as_str).map(String::from);
+                    m.format = item.get("format").and_then(jsonc::Value::as_str).map(String::from);
+                    m.key_color = item.get("keyColor").and_then(jsonc::Value::as_str).map(resolve_config_color);
+                    m.output_color = item.get("outputColor").and_then(jsonc::Value::as_str).map(resolve_config_color);
+                    m.key_icon = item.get("keyIcon").and_then(jsonc::Value::as_str).map(String::from);
+                    m.padding_left = item.get("paddingLeft").and_then(jsonc::Value::as_usize).unwrap_or(0);
+                    m.key_width = item.get("keyWidth").and_then(jsonc::Value::as_usize);
+                    m.text = item.get("text").and_then(jsonc::Value::as_str).map(String::from);
+                    m.symbol = item.get("symbol").and_then(jsonc::Value::as_str).map(String::from);
+                }
+                _ => continue,
+            }
+            if !m.kind.is_empty() { mods.push(m); }
+        }
+        cfg.show.clear_fields();
+        cfg.show.header = Header::None;
+        for m in &mods { cfg.show.enable_module(&m.kind); }
+        cfg.modules = Some(mods);
     }
 
-    // CLI / env accent wins over file
-    if let Some(a) = accent_override {
-        let ansi = resolve(&a);
-        colors.accent   = ansi.clone();
-        colors.hostname = ansi;
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_ascii_hex_does_not_panic() {
+        assert_eq!(resolve("#aébcd"), BLUE);
+        assert!(resolve("#ff0000").contains("38;2;255;0;0"));
     }
 
-    Config { colors, show, preset, logo, animation }
+    #[test]
+    fn comments_keep_hashes_in_values_and_quotes() {
+        assert_eq!(strip_comment("file = /tmp/a#b"), "file = /tmp/a#b");
+        assert_eq!(strip_comment("accent = red # note").trim(), "accent = red");
+        assert_eq!(strip_comment("file = \"a # b\""), "file = \"a # b\"");
+        assert_eq!(strip_comment("accent = #ff0000 # red").trim(), "accent = #ff0000");
+    }
+
+    #[test]
+    fn layout_parses_and_clamps() {
+        let mut l = Layout::default();
+        l.set("box", "double");
+        l.set("box_color", "red");
+        l.set("indent", "0");
+        l.set("gap", "999");
+        assert_eq!(l.box_style, "double");
+        assert!(l.box_color.as_deref().is_some_and(|c| !c.is_empty()));
+        assert_eq!((l.indent, l.gap), (0, 32));
+
+        l.set("box", "true");
+        l.set("box_color", "none");
+        assert_eq!(l.box_style, "round");
+        assert_eq!(l.box_color.as_deref(), Some(""));
+    }
 }

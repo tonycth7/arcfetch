@@ -1,0 +1,35 @@
+{
+    "logo": {
+        "type": "small"
+    },
+    "display": {
+        "separator": "->   ",
+        "color": {
+            "separator": "red"
+        }
+    },
+    "modules": [
+        {
+            "key": "Distro      ",
+            "type": "os"
+        },
+        {
+            "key": "Shell       ",
+            "type": "shell"
+        },
+        {
+            "key": "Terminal    ",
+            "type": "terminal"
+        },
+        {
+            "key": "Backlight   ",
+            "type": "brightness"
+        },
+        "break",
+        {
+            "type": "colors",
+            "paddingLeft": 6,
+            "symbol": "circle"
+        }
+    ]
+}

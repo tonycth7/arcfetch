@@ -96,9 +96,9 @@ fn is_box_style(s: &str) -> bool {
         "round" | "square" | "double" | "heavy" | "dashed" | "ascii" | "none")
 }
 
-/// Wrap an already-rendered fetch in a border. Only called when `--box` is set,
-/// so the default render path is untouched.
-fn boxify(body: &str, style: &str, col: &str) -> String {
+/// Wrap an already-rendered fetch in a border. Only called when `--box` (or
+/// `[layout] box`) is set, so the default render path is untouched.
+fn boxify(body: &str, style: &str, col: &str, indent: usize) -> String {
     let (tl, tr, bl, br, h, v) = match style.to_ascii_lowercase().as_str() {
         "square" => ('┌', '┐', '└', '┘', '─', '│'),
         "double" => ('╔', '╗', '╚', '╝', '═', '║'),
@@ -107,25 +107,26 @@ fn boxify(body: &str, style: &str, col: &str) -> String {
         "ascii"  => ('+', '+', '+', '+', '-', '|'),
         _        => ('╭', '╮', '╰', '╯', '─', '│'),
     };
-    fn edge(out: &mut String, l: char, r: char, fill: char, width: usize, col: &str) {
+    fn edge(out: &mut String, l: char, r: char, fill: char, width: usize, col: &str, indent: &str) {
         let paint = !col.is_empty();
         if paint { out.push_str(col); }
-        out.push_str("  "); out.push(l);
+        out.push_str(indent); out.push(l);
         for _ in 0..width + 2 { out.push(fill); }
         out.push(r);
         if paint { out.push_str(RESET); }
         out.push('\n');
     }
+    let pad = " ".repeat(indent);
     let lines: Vec<&str> = body.trim_matches('\n').split('\n')
-        .map(|l| l.strip_prefix("  ").unwrap_or(l)).collect();
+        .map(|l| l.strip_prefix(&pad).unwrap_or(l)).collect();
     let width = lines.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
     let mut out = String::with_capacity(body.len() + (width + 6) * (lines.len() + 2) + 32);
     out.push('\n');
-    edge(&mut out, tl, tr, h, width, col);
+    edge(&mut out, tl, tr, h, width, col, &pad);
     let paint = !col.is_empty();
     for l in &lines {
         if paint { out.push_str(col); }
-        out.push_str("  "); out.push(v); out.push(' ');
+        out.push_str(&pad); out.push(v); out.push(' ');
         out.push_str(l);
         if paint { out.push_str(RESET); }          // stop content colour before padding
         for _ in visible_chars(l)..width { out.push(' '); }
@@ -135,7 +136,7 @@ fn boxify(body: &str, style: &str, col: &str) -> String {
         if paint { out.push_str(RESET); }
         out.push('\n');
     }
-    edge(&mut out, bl, br, h, width, col);
+    edge(&mut out, bl, br, h, width, col, &pad);
     out
 }
 
@@ -179,10 +180,6 @@ fn kitty_image(path: &str) -> Option<String> {
     Some(format!("\x1b_Ga=T,f={},c=31,r=19,d=A;{}\x1b\\", format, b64))
 }
 
-fn uptime_seed() -> usize {
-    info::system_uptime_secs() as usize
-}
-
 /// System hostname via `gethostname(2)`, or `"localhost"` on failure.
 fn hostname() -> String {
     let mut buf = [0 as libc::c_char; 256];
@@ -195,28 +192,6 @@ fn hostname() -> String {
     } else {
         "localhost".into()
     }
-}
-
-fn science_quote(seed: usize) -> &'static str {
-    const QUOTES: &[&str] = &[
-        "\"imagination is more important than knowledge\" — Einstein",
-        "\"if you can't explain it simply, you don't understand it\" — Feynman",
-        "\"we are made of star stuff\" — Sagan",
-        "\"the universe is under no obligation to make sense to you\" — Tyson",
-        "\"an expert is a person who has made all the mistakes\" — Bohr",
-        "\"what we know is a drop, what we don't know is an ocean\" — Newton",
-        "\"the important thing is not to stop questioning\" — Einstein",
-        "\"science is magic that works\" — Vonnegut",
-        "\"nature uses only the longest threads to weave her patterns\" — Feynman",
-        "\"the cosmos is within us. we are a way for the universe to know itself\" — Sagan",
-        "\"not only is the universe stranger than we think, it is stranger than we can think\" — Heisenberg",
-        "\"in physics, you don't have to go around making trouble for yourself — nature does it for you\" — Feynman",
-    ];
-    QUOTES[seed % QUOTES.len()]
-}
-
-fn science_logo(seed: usize) -> &'static str {
-    ["dna", "atom", "wave", "emc2", "pi"][seed % 5]
 }
 
 fn detect_auto_logo(si: &info::SysInfo) -> String {
@@ -306,6 +281,8 @@ fn run_intro(
     write!(buf, "\x1b[?25l").ok();
 
     let mut prev_nl = 0usize;
+    let indent = " ".repeat(cfg.layout.indent);
+    let gap = " ".repeat(cfg.layout.gap);
     for tick in 0..frames {
         if !RUNNING.load(Ordering::Relaxed) { break; }
         let base: Vec<String> = logos::from_name_frame(logo_name, (tick / 3) as usize)
@@ -325,13 +302,13 @@ fn run_intro(
             let inf  = info.get(i).map(String::as_str).unwrap_or("");
 
             if args.no_color {
-                let _ = write!(frame, "  {}{}  {}\n", line, " ".repeat(pad), inf);
+                let _ = writeln!(frame, "{indent}{}{}{gap}{}", line, " ".repeat(pad), inf);
             } else if animated_logo && anim.wave {
                 let shown = wave_text(&line, i, tick as usize, &cfg.colors.logo);
-                let _ = write!(frame, "  {}{}  {}\n", shown, " ".repeat(pad), inf);
+                let _ = writeln!(frame, "{indent}{}{}{gap}{}", shown, " ".repeat(pad), inf);
             } else {
                 let lc = logo_line_color(logo_name, i, cfg, args.color.is_some());
-                let _ = write!(frame, "  {}{}{}{}  {}\n", lc, line, RESET, " ".repeat(pad), inf);
+                let _ = writeln!(frame, "{indent}{}{}{}{}{gap}{}", lc, line, RESET, " ".repeat(pad), inf);
             }
         }
 
@@ -377,6 +354,8 @@ fn run_animate(
     // colour ramp for the wave; `logo` is a fixed 9-slot palette
     let ramp = &cfg.colors.logo;
     let last = ramp.len().saturating_sub(1);
+    let indent = " ".repeat(cfg.layout.indent);
+    let gap = " ".repeat(cfg.layout.gap);
 
     let out = stdout();
     let mut buf = out.lock();
@@ -406,7 +385,7 @@ fn run_animate(
             let anim = logos::animate_line(raw, i, t, effect);
             let pad  = logo_w.saturating_sub(widths.get(i).copied().unwrap_or(0));
             let inf  = info.get(i).map(String::as_str).unwrap_or("");
-            screen.push_str("  ");
+            screen.push_str(&indent);
             if args.no_color {
                 screen.push_str(&anim);
             } else {
@@ -418,7 +397,7 @@ fn run_animate(
                 }
                 screen.push_str(RESET);
             }
-            let _ = writeln!(screen, "{:pad$}  {inf}", "", pad = pad);
+            let _ = writeln!(screen, "{:pad$}{gap}{inf}", "", pad = pad);
         }
         buf.write_all(screen.as_bytes()).ok();
         buf.flush().ok();
@@ -430,10 +409,9 @@ fn run_animate(
     screen_leave(&mut buf);
 }
 
-fn build_info(si: &info::SysInfo, cfg: &Config, sci_seed: usize) -> (Vec<String>, bool) {
-    let c      = &cfg.colors;
-    let sh     = &cfg.show;
-    let is_sci = matches!(cfg.preset.as_deref(), Some("science"));
+fn build_info(si: &info::SysInfo, cfg: &Config) -> Vec<String> {
+    let c  = &cfg.colors;
+    let sh = &cfg.show;
     let mut lines: Vec<String> = Vec::with_capacity(22);
 
     // ── header ────────────────────────────────────────────
@@ -619,13 +597,398 @@ fn build_info(si: &info::SysInfo, cfg: &Config, sci_seed: usize) -> (Vec<String>
         ));
     }
 
-    // science quote — always last if science preset
-    if is_sci {
-        lines.push(String::new());
-        lines.push(format!("{OVL}{q}{R}", OVL=OVERLAY0, q=science_quote(sci_seed), R=RESET));
+    lines
+}
+
+// ═══════════════════════════════════════════════════════════
+//  JSONC module renderer
+// ═══════════════════════════════════════════════════════════
+
+fn norm(kind: &str) -> String {
+    kind.trim().to_ascii_lowercase().replace(['-', '_'], "")
+}
+
+fn user_host() -> (String, String) {
+    (
+        env::var("USER").or_else(|_| env::var("LOGNAME")).unwrap_or_else(|_| "user".into()),
+        hostname(),
+    )
+}
+
+fn title_lines(cfg: &Config) -> Vec<String> {
+    use config::Header;
+    let (user, host) = user_host();
+    let c = &cfg.colors;
+    match cfg.show.header {
+        Header::None => Vec::new(),
+        Header::Both => vec![
+            format!("{B}{uc}{u}{OVL}@{R}{B}{hc}{h}{R}",
+                B=BOLD, uc=&c.username, u=&user, OVL=OVERLAY0, R=RESET, hc=&c.hostname, h=&host),
+            format!("{B}{ac}{l}{R}", B=BOLD, ac=&c.accent,
+                l="\u{2500}".repeat(user.len() + 1 + host.len()), R=RESET),
+        ],
+        Header::UserOnly => vec![
+            format!("{B}{uc}{u}{R}", B=BOLD, uc=&c.username, u=&user, R=RESET),
+            format!("{B}{ac}{l}{R}", B=BOLD, ac=&c.accent, l="\u{2500}".repeat(user.len()), R=RESET),
+        ],
+        Header::HostOnly => vec![
+            format!("{B}{hc}{h}{R}", B=BOLD, hc=&c.hostname, h=&host, R=RESET),
+            format!("{B}{ac}{l}{R}", B=BOLD, ac=&c.accent, l="\u{2500}".repeat(host.len()), R=RESET),
+        ],
+    }
+}
+
+fn bar_cfg(used: u64, total: u64, cfg: &Config) -> String {
+    if total == 0 { return String::new(); }
+    let w = cfg.display.bar_width;
+    let fill = ((used as f64 / total as f64 * w as f64) as usize).min(w);
+    format!("{bar}{f}{OVL}{e}{R}",
+        bar=&cfg.colors.bar,
+        f=cfg.display.bar_elapsed.repeat(fill),
+        OVL=OVERLAY0,
+        e=cfg.display.bar_total.repeat(w - fill),
+        R=RESET)
+}
+
+fn module_value(kind: &str, si: &info::SysInfo, cfg: &Config) -> Option<(String, String)> {
+    macro_rules! v {
+        ($k:expr, $v:expr) => { Some(($k.to_string(), $v.clone())) };
+    }
+    match norm(kind).as_str() {
+        "os" => v!("os", si.os),
+        "kernel" => v!("kernel", si.kernel),
+        "uptime" => v!("uptime", si.uptime),
+        "res" => v!("res", si.res),
+        "pkgs" | "packages" => v!("pkgs", si.pkgs),
+        "shell" => v!("shell", si.shell),
+        "de" | "wm" | "desktop" => v!("de/wm", si.de_wm),
+        "terminal" | "term" => v!("term", si.term),
+        "cpu" => v!("cpu", si.cpu),
+        "gpu" => v!("gpu", si.gpu),
+        "gputemp" => v!("gpu °C", si.gpu_temp),
+        "battery" => v!("battery", si.battery),
+        "disk" => v!("disk", si.disk),
+        "load" | "loadavg" => v!("load", si.load),
+        "locale" => v!("locale", si.locale),
+        "memory" | "mem" => {
+            let bar = bar_cfg(si.mem_used, si.mem_total, cfg);
+            let val = if si.mem_total >= 1024 {
+                format!("{bar}{TEXT}  {u:.1}G / {t:.1}G{R}",
+                    TEXT=TEXT, u=si.mem_used as f64/1024.0, t=si.mem_total as f64/1024.0, R=RESET)
+            } else {
+                format!("{bar}{TEXT}  {u}M / {t}M{R}", TEXT=TEXT, u=si.mem_used, t=si.mem_total, R=RESET)
+            };
+            Some(("memory".into(), val))
+        }
+        "ip" => v!("ip", si.ip),
+        "ssh" => v!("ssh", si.ssh),
+        "ports" => v!("ports", si.ports),
+        "init" | "initsystem" => v!("init", si.init),
+        "cputemp" => v!("cpu °C", si.cpu_temp),
+        "processes" => v!("processes", si.processes),
+        "container" => v!("container", si.container),
+        "session" => v!("session", si.session),
+        "swap" => v!("swap", si.swap),
+        "sound" => v!("sound", si.sound),
+        "gpudriver" => v!("gpu driver", si.gpu_driver),
+        "bios" => v!("bios", si.bios),
+        "board" => v!("board", si.board),
+        "disktype" => v!("disk type", si.disk_type),
+        "pkgupdates" => v!("updates", si.pkg_updates),
+        "theme" => v!("theme", si.theme),
+        "icons" => v!("icons", si.icons),
+        "termfont" | "terminalfont" => v!("term font", si.term_font),
+        "dewmver" => v!("de/wm ver", si.de_wm_ver),
+        "initver" => v!("init ver", si.init_ver),
+        "localip" => v!("local ip", si.local_ip),
+        "datetime" => v!("datetime", si.datetime),
+        "editor" => v!("editor", si.editor),
+        "dns" => v!("dns", si.dns),
+        "host" => v!("host", si.host),
+        "chassis" => v!("chassis", si.chassis),
+        "bootmgr" => v!("bootmgr", si.bootmgr),
+        "cpucache" => v!("cpu cache", si.cpu_cache),
+        "loginmanager" => v!("login mgr", si.login_manager),
+        "brightness" => v!("brightness", si.brightness),
+        "cpuusage" => v!("cpu usage", si.cpu_usage),
+        "diskio" => v!("disk io", si.diskio),
+        "netio" => v!("net io", si.netio),
+        "physmem" => v!("phys mem", si.physmem),
+        "gpumem" => v!("gpu mem", si.gpu_mem),
+        "btrfs" => v!("btrfs", si.btrfs),
+        "wifi" => v!("wifi", si.wifi),
+        "users" => v!("users", si.users),
+        "wallpaper" => v!("wallpaper", si.wallpaper),
+        "media" => v!("media", si.media),
+        "publicip" => v!("public ip", si.public_ip),
+        "weather" => v!("weather", si.weather),
+        "opengl" => v!("opengl", si.opengl),
+        "vulkan" => v!("vulkan", si.vulkan),
+        "cursor" => v!("cursor", si.cursor),
+        "termsize" | "terminalsize" => v!("term size", si.term_size),
+        "termtheme" | "terminaltheme" => v!("term theme", si.term_theme),
+        "codec" => v!("codec", si.codec),
+        "bluetooth" => v!("bluetooth", si.bluetooth),
+        "camera" => v!("camera", si.camera),
+        "mouse" => v!("mouse", si.mouse),
+        "keyboard" => v!("keyboard", si.keyboard),
+        "tpm" => v!("tpm", si.tpm),
+        "physicaldisk" => v!("phy disk", si.physical_disk),
+        "topprocesses" => v!("top procs", si.top_processes),
+        "monitor" => v!("monitor", si.monitor),
+        "version" => v!("version", env!("CARGO_PKG_VERSION").to_string()),
+        _ => None,
+    }
+}
+
+fn format_color(spec: &str, key_color: &str) -> Option<String> {
+    if spec.is_empty() { return Some(RESET.into()); }
+    if spec == "keys" { return Some(key_color.to_string()); }
+    if let Some(n) = spec.strip_prefix('@').and_then(|v| v.parse::<u8>().ok()) {
+        return Some(format!("\x1b[38;5;{}m", n));
+    }
+    if spec.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = spec.parse::<u8>() {
+            // Fastfetch uses 1-9 for SGR attributes (bold, dim, …).
+            return Some(if n <= 9 { format!("\x1b[{n}m") } else { config::ansi_code(n) });
+        }
+    }
+    if let Some(name) = spec.strip_prefix("bright_") {
+        return Some(config::resolve(&format!("ansi_bright_{name}")));
+    }
+    Some(config::resolve_config_color(spec))
+}
+
+/// Parse a `{~start}` / `{~start,end}` slice token against the module value.
+fn value_slice(value: &str, spec: &str) -> String {
+    let mut it = spec.split(',');
+    let start = it.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+    let end = it.next().and_then(|s| s.parse::<usize>().ok());
+    value.chars().skip(start).take(end.map_or(usize::MAX, |e| e.saturating_sub(start))).collect()
+}
+
+fn format_field(
+    name: &str, kind: &str, key: &str, value: &str, icon: &str,
+    si: &info::SysInfo, cfg: &Config,
+) -> Option<String> {
+    let c = &cfg.colors;
+    let (user, host) = user_host();
+    match name {
+        "" | "value" | "1" => Some(value.to_string()),
+        "key" => Some(key.to_string()),
+        "icon" => Some(icon.to_string()),
+        "user-name" | "username" => Some(user),
+        "host-name" | "hostname" => Some(host),
+        "user-name-colored" => Some(format!("{}{}{}", c.username, user, RESET)),
+        "host-name-colored" => Some(format!("{}{}{}", c.hostname, host, RESET)),
+        "at-symbol-colored" => Some(format!("{}{}{}", OVERLAY0, "@", RESET)),
+        "sysname" => Some("Linux".into()),
+        "arch" => Some(std::env::consts::ARCH.into()),
+        "pretty-name" | "name" if norm(kind) == "os" => Some(si.os.clone()),
+        "id" => Some(si.os_id.clone()),
+        "id-like" => Some(si.os_id_like.clone()),
+        "version" if norm(kind) == "kernel" => Some(si.kernel.clone()),
+        "version" if norm(kind) == "os" => Some(si.kernel.clone()),
+        "name" => Some(value.to_string()),
+        "title" if norm(kind) == "media" => Some(value.to_string()),
+        "used" | "total" | "percentage" | "size-used" | "size-total" | "size-percentage" => {
+            let (used, total) = match norm(kind).as_str() {
+                "memory" | "mem" => (si.mem_used as f64 / 1024.0, si.mem_total as f64 / 1024.0),
+                "disk" => parse_pair(&si.disk),
+                "swap" => parse_pair(&si.swap),
+                _ => parse_pair(value),
+            };
+            let pct = if total > 0.0 { used / total * 100.0 } else { 0.0 };
+            let val = match name {
+                "used" => format!("{used:.1}"),
+                "total" => format!("{total:.1}"),
+                "percentage" => format!("{pct:.0}%"),
+                "size-used" => format!("{used:.1}G"),
+                "size-total" => format!("{total:.1}G"),
+                _ => format!("{pct:.0}%"),
+            };
+            Some(val)
+        }
+        "days" | "hours" | "minutes" | "seconds" => {
+            let s = si.uptime_secs;
+            let n = match name {
+                "days" => s / 86400,
+                "hours" => (s % 86400) / 3600,
+                "minutes" => (s % 3600) / 60,
+                _ => s % 60,
+            };
+            Some(n.to_string())
+        }
+        "ipv4" | "ip" if matches!(norm(kind).as_str(), "localip" | "publicip" | "ip") => {
+            if norm(kind) == "localip" { Some(si.local_ip.split_whitespace().last().unwrap_or("").into()) }
+            else { Some(value.to_string()) }
+        }
+        "ifname" if norm(kind) == "localip" => Some(si.local_ip.split_whitespace().next().unwrap_or("").into()),
+        "cores-logical" | "cores-physical" => {
+            Some(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.to_string())
+        }
+        "driver" => Some(si.gpu_driver.clone()),
+        _ => None,
+    }
+}
+
+fn parse_pair(s: &str) -> (f64, f64) {
+    let mut it = s.split('/').map(|v| {
+        v.trim().trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse::<f64>().unwrap_or(0.0)
+    });
+    (it.next().unwrap_or(0.0), it.next().unwrap_or(0.0))
+}
+
+fn format_template(
+    tpl: &str, kind: &str, key: &str, value: &str, icon: &str,
+    si: &info::SysInfo, cfg: &Config, key_color: &str,
+) -> String {
+    let mut out = String::with_capacity(tpl.len() + 32);
+    let b = tpl.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'{' { out.push(b[i] as char); i += 1; continue; }
+        let Some(rel) = tpl[i + 1..].find('}') else { out.push_str(&tpl[i..]); break; };
+        let end = i + 1 + rel;
+        let token = &tpl[i + 1..end];
+        i = end + 1;
+
+        if let Some(idx) = token.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
+            if let Some(c) = cfg.display.constants.get(idx.saturating_sub(1)) { out.push_str(c); }
+            continue;
+        }
+        if let Some(spec) = token.strip_prefix('#') {
+            if let Some(col) = format_color(spec, key_color) { out.push_str(&col); }
+            continue;
+        }
+        if let Some(field) = token.strip_prefix('?') {
+            if field.is_empty() { continue; }
+            let rest = &tpl[i..];
+            if let Some(rel) = rest.find("{?}") {
+                let inner = &rest[..rel];
+                let nonempty = format_field(field, kind, key, value, icon, si, cfg)
+                    .is_some_and(|v| !v.is_empty());
+                if nonempty {
+                    out.push_str(&format_template(inner, kind, key, value, icon, si, cfg, key_color));
+                }
+                i += rel + 3;
+            }
+            continue;
+        }
+        if let Some(spec) = token.strip_prefix('~') {
+            out.push_str(&value_slice(value, spec));
+            continue;
+        }
+        if token.is_empty() { out.push_str(value); continue; }
+        if let Some(v) = format_field(token, kind, key, value, icon, si, cfg) {
+            out.push_str(&v);
+        }
+        // Unknown placeholders (fastfetch-specific fields we don't collect) vanish
+        // instead of leaking literal `{...}` into the rendered output.
+    }
+    out
+}
+
+fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut usize) -> Vec<String> {
+    let kind = norm(&m.kind);
+    let icon = m.key_icon.as_deref().unwrap_or("");
+    let key_color = m.key_color.as_deref()
+        .or(cfg.display.key_color.as_deref())
+        .unwrap_or_else(|| cfg.colors.label(*li));
+
+    match kind.as_str() {
+        "break" => return vec![String::new()],
+        "separator" => {
+            let s = "\u{2500}".repeat(30);
+            return vec![format!("{}{}{}", cfg.display.separator_color.as_deref().unwrap_or(""), s, RESET)];
+        }
+        "custom" => {
+            let Some(f) = &m.format else { return Vec::new() };
+            return f.split('\n')
+                .map(|line| format_template(line, "custom", "", "", "", si, cfg, key_color))
+                .collect();
+        }
+        "title" => {
+            let lines = match &m.format {
+                Some(f) => vec![format_template(f, "title", "", "", icon, si, cfg, key_color)],
+                None => title_lines(cfg),
+            };
+            return lines;
+        }
+        "colors" => {
+            let sym = match m.symbol.as_deref().unwrap_or("") {
+                "circle" => "\u{25cf}",
+                _ => "\u{2588}\u{2588}",
+            };
+            let mut s = String::with_capacity(64);
+            for n in 0..16 {
+                s.push_str(&format!("\x1b[38;5;{n}m{sym}"));
+            }
+            s.push_str(RESET);
+            return vec![format!("{}{}", " ".repeat(m.padding_left + cfg.display.key_padding_left), s)];
+        }
+        "command" => {
+            let Some(cmd) = &m.text else { return Vec::new() };
+            let Some(raw) = modules::run_timeout("sh", &["-c", cmd], 1000) else { return Vec::new() };
+            let value = raw.trim();
+            if value.is_empty() { return Vec::new(); }
+            let key = m.key.clone().unwrap_or_default();
+            let value = match &m.format {
+                Some(f) => format_template(f, "command", &key, value, icon, si, cfg, key_color),
+                None => value.to_string(),
+            };
+            let row = row_cfg(&format!("{icon}{key}"), &value, key_color,
+                m.output_color.as_deref().unwrap_or(&cfg.colors.values), m, cfg);
+            *li += 1;
+            return row.split('\n').map(String::from).collect();
+        }
+        _ => {}
     }
 
-    (lines, is_sci)
+    let Some((default_key, value)) = module_value(&kind, si, cfg) else { return Vec::new() };
+    if value.is_empty() { return Vec::new(); }
+    let key = m.key.clone().unwrap_or(default_key);
+    let key = format!("{icon}{key}");
+    let value = match &m.format {
+        Some(f) => format_template(f, &kind, &key, &value, icon, si, cfg, key_color),
+        None => value,
+    };
+    let row = row_cfg(&key, &value, key_color,
+        m.output_color.as_deref().unwrap_or(&cfg.colors.values), m, cfg);
+    *li += 1;
+    row.split('\n').map(String::from).collect()
+}
+
+fn row_cfg(key: &str, val: &str, key_color: &str, val_color: &str, m: &config::Module, cfg: &Config) -> String {
+    let sep = cfg.display.separator.as_deref().unwrap_or(" ");
+    let sep = match &cfg.display.separator_color {
+        Some(c) => format!("{c}{sep}{RESET}"),
+        None => sep.to_string(),
+    };
+    let width = m.key_width.or(cfg.display.key_width).unwrap_or(9);
+    let pad = m.padding_left + cfg.display.key_padding_left;
+    let mut s = String::with_capacity(key.len() + val.len() + 32);
+    for _ in 0..pad { s.push(' '); }
+    s.push_str(BOLD);
+    s.push_str(key_color);
+    s.push_str(key);
+    for _ in visible_chars(key)..width { s.push(' '); }
+    s.push_str(RESET);
+    s.push_str(&sep);
+    s.push_str(val_color);
+    s.push_str(val);
+    s.push_str(RESET);
+    s
+}
+
+fn render_modules(si: &info::SysInfo, cfg: &Config) -> Vec<String> {
+    let Some(mods) = cfg.modules.as_deref() else { return Vec::new() };
+    let mut out = Vec::with_capacity(mods.len() + 4);
+    let mut li = 0usize;
+    for m in mods {
+        out.extend(render_module(m, si, cfg, &mut li));
+    }
+    out
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -952,8 +1315,13 @@ fn run_quantum(info_lines: &[String], logo_name: &str, custom_lines: &Option<Vec
                     let stripped = if ll.contains('\x1b') { strip_ansi(ll) } else { ll.to_string() };
                     writeln!(buf, "  {}{}  {}", stripped, " ".repeat(pad), inf).ok();
                 } else {
-                    writeln!(buf, "  {acc}{ll}{pad}{R}  {inf}",
-                        acc = &cfg.colors.accent, ll = ll,
+                    let lc = if args.color.is_some() {
+                        cfg.colors.accent.as_str()
+                    } else {
+                        cfg.logo.color.as_deref().unwrap_or(cfg.colors.accent.as_str())
+                    };
+                    writeln!(buf, "  {lc}{ll}{pad}{R}  {inf}",
+                        lc = lc, ll = ll,
                         pad = " ".repeat(pad), R = RESET, inf = inf).ok();
                 }
             }
@@ -1018,6 +1386,7 @@ struct Args {
     accent:       Option<String>,
     color:        Option<String>,
     preset:       Option<String>,
+    config_file:  Option<String>,
     no_color:     bool,
     blackhole:    bool,
     mandelbrot:   bool,
@@ -1037,6 +1406,7 @@ struct Args {
     animate:      Option<String>,
     list_logos:   bool,
     list_schemes: bool,
+    list_presets: bool,
     no_intro:     bool,
     foreground:   bool,
     stop:         bool,
@@ -1052,6 +1422,7 @@ fn parse_args() -> Args {
         accent: None,
         color: None,
         preset: None,
+        config_file: None,
         no_color: false,
         blackhole: false,
         mandelbrot: false,
@@ -1071,6 +1442,7 @@ fn parse_args() -> Args {
         animate: None,
         list_logos: false,
         list_schemes: false,
+        list_presets: false,
         no_intro: false,
         foreground: false,
         stop: false,
@@ -1080,6 +1452,7 @@ fn parse_args() -> Args {
     let mut mandel_space: Option<u32> = None;
     let mut animate_space: Option<String> = None;
     let mut box_space: Option<String> = None;
+    let mut config_space: Option<String> = None;
     {
         let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
         for w in argv.windows(2) {
@@ -1093,6 +1466,10 @@ fn parse_args() -> Args {
                 if let Some(s) = w[1].to_str() {
                     if is_box_style(s) { box_space = Some(s.to_string()); }
                 }
+            } else if w[0] == "--config" {
+                if let Some(s) = w[1].to_str() {
+                    if !s.starts_with('-') { config_space = Some(s.to_string()); }
+                }
             }
         }
     }
@@ -1104,8 +1481,16 @@ fn parse_args() -> Args {
             Short('V') | Long("version") => a.version = true,
             Long("blackhole")            => a.blackhole = true,
             Long("no-color")             => a.no_color = true,
-            Long("config")               => a.show_cfg = true,
-            Long("full")                 => a.preset = Some("full".into()),
+            Long("config") => {
+                if let Some(v) = parser.optional_value() {
+                    a.config_file = Some(v.to_string_lossy().into_owned());
+                } else if let Some(v) = config_space.clone() {
+                    a.config_file = Some(v);
+                } else {
+                    a.show_cfg = true;
+                }
+            }
+            Long("full")                 => a.all = true,
             Long("quantum")              => a.quantum = true,
             Long("cosmic")               => a.cosmic = true,
             Long("mandelbrot") => {
@@ -1130,6 +1515,7 @@ fn parse_args() -> Args {
             }
             Long("list-logos") | Long("logos") => a.list_logos = true,
             Long("list-schemes") | Long("schemes") => a.list_schemes = true,
+            Long("list-presets") | Long("presets") => a.list_presets = true,
             Long("no-animate") | Long("no-intro") => a.no_intro = true,
             Long("foreground") | Long("fg") => a.foreground = true,
             Long("stop") => a.stop = true,
@@ -1338,6 +1724,12 @@ fn print_config_help(cfg_path: &str) {
     println!("  {g}bar{r}      = blue       {s}# memory bar fill{r}", g=g, r=r, s=s);
     println!("  {s}  logo1..logo9{r}  {s}custom logo inline colors (default: c1..c7 + accent + text){r}", s=s, r=r);
     println!();
+    println!("  {b}{BLUE}[layout]{r}  {s}box and spacing for normal output{r}", b=b, BLUE=BLUE, r=r, s=s);
+    println!("  {g}box{r}       = none     {s}# none | round | square | double | heavy | dashed | ascii{r}", g=g, r=r, s=s);
+    println!("  {g}box_color{r} = accent   {s}# border colour; none = uncoloured{r}", g=g, r=r, s=s);
+    println!("  {g}indent{r}    = 2        {s}# left margin in columns{r}", g=g, r=r, s=s);
+    println!("  {g}gap{r}       = 2        {s}# spaces between logo and info{r}", g=g, r=r, s=s);
+    println!();
     println!("  {b}{BLUE}[show]{r}  {s}(true/false each field){r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  os=true  kernel=true  uptime=true  res=false  pkgs=true");
     println!("  shell=true  de_wm=true  term=true  cpu=true  gpu=true");
@@ -1356,6 +1748,7 @@ fn print_config_help(cfg_path: &str) {
     println!("  {b}{BLUE}[logo]{r}  {s}choose logo or custom ASCII file{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}name{r} = arch         {s}# arch | ascii | tux | nix | gentoo | mini | auto{r}", g=g, r=r, s=s);
     println!("  {g}file{r} = <path>       {s}# custom ASCII file (overrides name){r}", g=g, r=r, s=s);
+    println!("  {g}color{r} = <unset>     {s}# uniform logo colour (default = built-in palette){r}", g=g, r=r, s=s);
     println!("  {s}list every logo name from the CLI: arcfetch --list-logos{r}", s=s, r=r);
     println!();
     println!("  {b}{BLUE}[animation]{r}  {s}short intro on a real terminal{r}", b=b, BLUE=BLUE, r=r, s=s);
@@ -1364,8 +1757,6 @@ fn print_config_help(cfg_path: &str) {
     println!("  {g}intro_ms{r} = 700       {s}# 0 disables; animated logos auto-play{r}", g=g, r=r, s=s);
     println!("  {g}wave{r}     = true      {s}# colour-wave atom/dna/arcreactor{r}", g=g, r=r, s=s);
     println!();
-    println!("  {b}{BLUE}[template]{r}  {s}overrides [show] entirely{r}", b=b, BLUE=BLUE, r=r, s=s);
-    println!("  {g}preset{r} = full         {s}# full | minimal | hacker | science{r}", g=g, r=r, s=s);
     println!();
     println!("  {b}{TEAL}color names{r}  {s}or #RRGGBB hex{r}", b=b, TEAL=TEAL, r=r, s=s);
     println!("  {RW}rosewater{r}  {FL}flamingo{r}  {PK}pink{r}  {MV}mauve{r}  {RD}red{r}  {MR}maroon{r}",
@@ -1383,6 +1774,8 @@ fn print_config_help(cfg_path: &str) {
     println!("    c2 = lavender");
     println!("    [show]");
     println!("    res = false");
+    println!("    [layout]");
+    println!("    box = round");
     println!("    [logo]");
     println!("    name = arch");
     println!("    [template]");
@@ -1533,6 +1926,17 @@ physical_disk = false  # disks: model, size, type, temp
 top_processes = false  # top 5 processes by CPU
 monitor       = false  # EDID: name, resolution, Hz, size, PPI
 
+[layout]
+# box around the normal one-shot output:
+#   none | round | square | double | heavy | dashed | ascii
+box       = none
+# border colour (any colour spec above); none = uncoloured; default = accent
+box_color = accent
+# left margin in columns
+indent    = 2
+# spaces between the logo and the info column
+gap       = 2
+
 [logo]
 # logo name: arch | ascii | tux | nix | gentoo | mini | auto
 # or any built-in distro logo: ubuntu | debian | fedora | opensuse | manjaro |
@@ -1545,6 +1949,9 @@ monitor       = false  # EDID: name, resolution, Hz, size, PPI
 # custom ASCII file path (overrides name if set)
 # file = ~/.config/arcfetch/logo.txt
 
+# uniform logo colour; omit to keep each logo's built-in colours
+# color = blue
+
 [animation]
 # short intro played on a real terminal before the static render
 enabled  = true
@@ -1554,11 +1961,6 @@ effect   = none
 intro_ms = 700
 # colour-wave animated logos (atom/dna/arcreactor)
 wave     = true
-
-[template]
-# preset overrides [show] entirely
-# options: full | minimal | hacker | science
-# preset = full
 "#;
 
     match fs::write(path, sample) {
@@ -1653,6 +2055,8 @@ fn print_help(cfg_path: &str) {
 fn logo_line_color<'a>(logo_name: &str, i: usize, cfg: &'a Config, color_override: bool) -> &'a str {
     if color_override {
         cfg.colors.accent.as_str()
+    } else if let Some(ref color) = cfg.logo.color {
+        color
     } else {
         match logo_name {
             "mini" => cfg.colors.label(i),
@@ -2088,19 +2492,21 @@ fn pane_frame(
     };
 
     let art_w = art.iter().map(|l| visible_chars(l)).max().unwrap_or(art_cols);
+    let indent = " ".repeat(cfg.layout.indent);
+    let gap = " ".repeat(cfg.layout.gap);
     let mut block = Vec::with_capacity(pane_h);
     for i in 0..pane_h {
         let a = art.get(i).map(String::as_str).unwrap_or("");
         let pad = art_w.saturating_sub(visible_chars(a));
         let inf = info.get(i).map(String::as_str).unwrap_or("");
-        let mut line = String::with_capacity(2 + art_w + 2 + inf.len());
-        line.push_str("  ");
+        let mut line = String::with_capacity(indent.len() + art_w + gap.len() + inf.len());
+        line.push_str(&indent);
         line.push_str(a);
         line.push_str(RESET);
         if pad > 0 {
             line.push_str(&" ".repeat(pad));
         }
-        line.push_str("  ");
+        line.push_str(&gap);
         line.push_str(inf);
         block.push(truncate_visible(&line, cols));
     }
@@ -2404,8 +2810,8 @@ fn run_background(
 /// Repopulate the slow network caches in the background. Invoked by the
 /// detached child that [`cache::get_or_compute_swr`] spawns; produces no output.
 fn refresh_cache() {
-    crate::cache::set("public_ip", &net::public_ip().unwrap_or_else(|| "N/A".into()));
-    crate::cache::set("weather", &net::weather("").unwrap_or_else(|| "N/A".into()));
+    if let Some(ip) = net::public_ip() { crate::cache::set("public_ip", &ip); }
+    if let Some(w) = net::weather("") { crate::cache::set("weather", &w); }
 }
 
 fn main() {
@@ -2426,6 +2832,10 @@ fn main() {
     if args.show_cfg { print_config_help(&cfg_path); write_sample_config(&cfg_path); return; }
     if args.list_logos { print_logos(); return; }
     if args.list_schemes { print_schemes(); return; }
+    if args.list_presets {
+        for name in config::preset_names() { println!("{}", name); }
+        return;
+    }
     if args.stop { stop_background(); return; }
 
     // mutual exclusion for display modes
@@ -2436,7 +2846,7 @@ fn main() {
         return;
     }
 
-    let mut cfg = config::load(args.accent.as_deref(), args.preset.as_deref());
+    let mut cfg = config::load(args.accent.as_deref(), args.preset.as_deref(), args.config_file.as_deref());
 
     // --all enables every optional field; -s/--structure shows only the listed ones
     if args.all { cfg.show.enable_all(); }
@@ -2516,8 +2926,8 @@ fn main() {
     }
 
     // collect all sysinfo — only read network for hacker preset
-    let need_net = cfg.preset.as_deref() == Some("hacker")
-        || cfg.show.ip || cfg.show.ssh || cfg.show.ports;
+    let need_net = cfg.show.ip || cfg.show.ssh || cfg.show.ports
+        || cfg.show.public_ip || cfg.show.weather;
     let si = info::collect_all(need_net, &cfg.show);
 
     // --json: emit machine-readable output and exit
@@ -2526,11 +2936,12 @@ fn main() {
         return;
     }
 
-    // science seed — one /proc/uptime read for both quote & logo
-    let sci_seed = uptime_seed();
-
     // build info column
-    let (info_lines, is_science) = build_info(&si, &cfg, sci_seed);
+    let info_lines = if cfg.modules.is_some() {
+        render_modules(&si, &cfg)
+    } else {
+        build_info(&si, &cfg)
+    };
 
     // ── blackhole mode: consume info_lines into out_lines ──
     if args.blackhole {
@@ -2620,6 +3031,11 @@ fn main() {
         Some(mandelbrot::render(args.mandel_iter))
     } else if image_escape.is_some() {
         None
+    } else if let Some(ref data) = cfg.logo.data {
+        Some(data.lines().map(|line| {
+            // raw data already contains ANSI; keep as-is
+            line.to_string()
+        }).collect())
     } else if let Some(ref path) = args.logo_file {
         // explicit --logo-file path (text file)
         load_file(path).or_else(|| {
@@ -2639,14 +3055,23 @@ fn main() {
 
     let logo_name = {
         let base = if args.logo == "auto" { detect_auto_logo(&si) }
-                   else if !args.logo_explicit && cfg.preset.as_deref() == Some("minimal") { "mini".into() }
+                   else if cfg.logo.name.as_deref() == Some("none") { "none".into() }
                    else { args.logo.clone() };
-        if custom_lines.is_none() && is_science && !args.logo_explicit {
-            science_logo(sci_seed).to_string()
+        if cfg.logo.name.as_deref() == Some("none") {
+            "none".into()
         } else {
             base
         }
     };
+
+    // inline logo padding
+    let custom_lines = custom_lines.map(|mut lines| {
+        for _ in 0..cfg.logo.padding_top { lines.insert(0, String::new()); }
+        lines
+    });
+    let custom_lines = if custom_lines.is_none() && logo_name == "none" {
+        Some(Vec::new())
+    } else { custom_lines };
 
     // ── quantum mode: borrow info_lines directly ──
     if args.quantum {
@@ -2707,14 +3132,51 @@ fn main() {
         out.push_str(img);
         out.push('\n');
         // render info lines below the image, no logo needed
+        let indent = " ".repeat(cfg.layout.indent);
         for line in &out_lines {
-            let _ = writeln!(out, "  {}", line);
+            let _ = writeln!(out, "{indent}{}", line);
         }
         out.push('\n');
         unsafe { libc::write(1, out.as_ptr().cast::<core::ffi::c_void>(), out.len()); }
         return;
     }
 
+    let indent = " ".repeat(cfg.layout.indent);
+    let gap = " ".repeat(cfg.layout.gap);
+    if cfg.logo.position == "top" {
+        let logo_lines: Vec<String> = if let Some(ref lines) = custom_lines {
+            lines.clone()
+        } else {
+            logos::from_name(&logo_name).iter().map(|s| s.to_string()).collect()
+        };
+        for _ in 0..cfg.logo.padding_top { out.push('\n'); }
+        for (i, ll) in logo_lines.iter().enumerate() {
+            if args.no_color {
+                let stripped = if ll.contains('\x1b') { strip_ansi(ll) } else { ll.to_string() };
+                let _ = writeln!(out, "{indent}{}", stripped);
+            } else {
+                let lc = if custom_lines.is_some() {
+                    cfg.logo.color.as_deref().unwrap_or(cfg.colors.accent.as_str())
+                } else {
+                    logo_line_color(&logo_name, i, &cfg, args.color.is_some())
+                };
+                let _ = writeln!(out, "{indent}{}{}{}", lc, ll, RESET);
+            }
+        }
+        out.push('\n');
+        for line in &out_lines {
+            let _ = writeln!(out, "{indent}{}", line);
+        }
+        let box_style = args.box_style.as_deref().unwrap_or(&cfg.layout.box_style);
+        if !box_style.eq_ignore_ascii_case("none") {
+            let border = if args.no_color { "" } else { cfg.layout.box_color.as_deref().unwrap_or(cfg.colors.accent.as_str()) };
+            out = boxify(&out, box_style, border, cfg.layout.indent);
+        }
+        out.push('\n');
+        let out = if depth == config::ColorDepth::True { out } else { config::downgrade_str(&out, depth) };
+        unsafe { libc::write(1, out.as_ptr().cast::<core::ffi::c_void>(), out.len()); }
+        return;
+    }
     if let Some(ref lines) = custom_lines {
         // pre-compute visible widths for pre-processed lines (once, not per-frame)
         let logo_widths: Vec<usize> = lines.iter().map(|l| visible_chars(l)).collect();
@@ -2726,10 +3188,15 @@ fn main() {
             let inf  = out_lines.get(i).map(String::as_str).unwrap_or("");
             if args.no_color {
                 let stripped = if ll.contains('\x1b') { strip_ansi(ll) } else { ll.to_string() };
-                let _ = writeln!(out, "  {}{:pad$}  {}", stripped, "", inf, pad = pad);
+                let _ = writeln!(out, "{indent}{}{:pad$}{gap}{}", stripped, "", inf, pad = pad);
             } else {
-                let _ = writeln!(out, "  {}{}{:pad$}{}  {}",
-                    cfg.colors.accent, ll, "", RESET, inf, pad = pad);
+                let lc = if args.color.is_some() {
+                    cfg.colors.accent.as_str()
+                } else {
+                    cfg.logo.color.as_deref().unwrap_or(cfg.colors.accent.as_str())
+                };
+                let _ = writeln!(out, "{indent}{}{}{:pad$}{}{gap}{}",
+                    lc, ll, "", RESET, inf, pad = pad);
             }
         }
     } else {
@@ -2743,20 +3210,23 @@ fn main() {
             let pad  = logo_w.saturating_sub(logo_widths.get(i).copied().unwrap_or(0));
             let inf  = out_lines.get(i).map(String::as_str).unwrap_or("");
             if args.no_color {
-                let _ = writeln!(out, "  {}{:pad$}  {}", ll, "", inf, pad = pad);
+                let _ = writeln!(out, "{indent}{}{:pad$}{gap}{}", ll, "", inf, pad = pad);
             } else {
                 let lc = logo_line_color(&logo_name, i, &cfg, args.color.is_some());
-                let _ = writeln!(out, "  {}{}{:pad$}{}  {}",
+                let _ = writeln!(out, "{indent}{}{}{:pad$}{}{gap}{}",
                     lc, ll, "", RESET, inf, pad = pad);
             }
         }
     }
 
-    if let Some(ref style) = args.box_style {
-        if !style.eq_ignore_ascii_case("none") {
-            let border = if args.no_color { "" } else { cfg.colors.accent.as_str() };
-            out = boxify(&out, style, border);
-        }
+    let box_style = args.box_style.as_deref().unwrap_or(&cfg.layout.box_style);
+    if !box_style.eq_ignore_ascii_case("none") {
+        let border = if args.no_color {
+            ""
+        } else {
+            cfg.layout.box_color.as_deref().unwrap_or(cfg.colors.accent.as_str())
+        };
+        out = boxify(&out, box_style, border, cfg.layout.indent);
     }
 
     out.push('\n');

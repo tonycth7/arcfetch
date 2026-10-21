@@ -12,15 +12,15 @@ use std::os::unix::fs::PermissionsExt;
 /// Read a file to a trimmed `String`, empty on any error.
 #[allow(dead_code)]
 fn read_str(p: &str) -> String {
-    fs::read_to_string(p)
-        .map(|s| s.trim().to_string())
+    fs::read(p)
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
         .unwrap_or_default()
 }
 
 /// Read a path to a trimmed `String`, `None` on any error.
 #[allow(dead_code)]
 fn read_path(p: &Path) -> Option<String> {
-    fs::read_to_string(p).ok().map(|s| s.trim().to_string())
+    fs::read(p).ok().map(|b| String::from_utf8_lossy(&b).trim().to_string())
 }
 
 /// Little-endian u16 with bounds checking.
@@ -110,29 +110,65 @@ fn home() -> Option<String> {
     env::var("HOME").ok().filter(|s| !s.is_empty())
 }
 
-/// Run a command, killing it if it exceeds `ms`. Returns its stdout as text.
-fn run_timeout(program: &str, args: &[&str], ms: u64) -> Option<String> {
+/// Run a command, killing it (and its process group) if it exceeds `ms`.
+/// Returns its stdout as text.
+pub(crate) fn run_timeout(program: &str, args: &[&str], ms: u64) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+
     let mut child = Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()
         .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut stderr = child.stderr.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    // Drain stderr so a chatty command can't fill the pipe and block.
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+    });
+
+    let kill_group = |id: u32| {
+        // SAFETY: negative pid targets the child's process group; best effort.
+        let _ = unsafe { libc::kill(-(id as i32), libc::SIGKILL) };
+    };
     let deadline = std::time::Instant::now() + Duration::from_millis(ms);
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                let out = child.wait_with_output().ok()?;
-                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-            }
+            Ok(Some(_)) => break,
             Ok(None) if std::time::Instant::now() >= deadline => {
+                kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
             Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(_) => return None,
+            Err(_) => {
+                kill_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+
+    // A descendant may still hold the pipe after the direct child exits.
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    match rx.recv_timeout(left) {
+        Ok(buf) => Some(String::from_utf8_lossy(&buf).into_owned()),
+        Err(_) => {
+            kill_group(child.id());
+            None
         }
     }
 }
@@ -492,6 +528,12 @@ pub fn diskio() -> String {
         if f.len() < 10 {
             continue;
         }
+        let name = f[2];
+        // Skip partitions and stacked/virtual devices: the whole disk already
+        // carries their I/O, so summing both would double count.
+        if fs::metadata(format!("/sys/class/block/{name}/partition")).is_ok() { continue; }
+        if ["dm-", "md", "loop", "ram", "zram", "sr", "nbd", "fd"]
+            .iter().any(|p| name.starts_with(p)) { continue; }
         // field 6 → sectors read (idx 5), field 10 → sectors written (idx 9)
         let r: u64 = f.get(5).and_then(|x| x.parse().ok()).unwrap_or(0);
         let w: u64 = f.get(9).and_then(|x| x.parse().ok()).unwrap_or(0);
@@ -743,14 +785,7 @@ pub fn btrfs() -> String {
 /// SSID for an interface via `iw`, if present.
 #[allow(dead_code)]
 fn iw_ssid(iface: &str) -> Option<String> {
-    let out = Command::new("iw")
-        .args(["dev", iface, "link"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
+    let s = run_timeout("iw", &["dev", iface, "link"], 500)?;
     for line in s.lines() {
         if let Some(rest) = line.trim().strip_prefix("SSID:") {
             let v = rest.trim();
@@ -844,6 +879,7 @@ pub fn users() -> String {
 /// Scan a config file for a wallpaper line (hyprpaper / hyprland / sway).
 #[allow(dead_code)]
 fn find_wallpaper_conf(content: &str) -> Option<String> {
+    let mut preload = None;
     for raw in content.lines() {
         let l = raw.trim();
         if l.is_empty() || l.starts_with('#') {
@@ -854,7 +890,10 @@ fn find_wallpaper_conf(content: &str) -> Option<String> {
             if let Some(val) = l.split_once('=').map(|x| x.1) {
                 let val = val.rsplit(',').next().unwrap_or(val).trim().trim_matches('"');
                 if !val.is_empty() {
-                    return Some(val.to_string());
+                    if low.starts_with("wallpaper") {
+                        return Some(val.to_string());
+                    }
+                    preload.get_or_insert_with(|| val.to_string());
                 }
             }
         }
@@ -870,20 +909,13 @@ fn find_wallpaper_conf(content: &str) -> Option<String> {
             }
         }
     }
-    None
+    preload
 }
 
 /// GNOME wallpaper via gsettings, if available.
 #[allow(dead_code)]
 fn gsettings_wallpaper() -> Option<String> {
-    let out = Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.background", "picture-uri"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
+    let s = run_timeout("gsettings", &["get", "org.gnome.desktop.background", "picture-uri"], 500)?;
     let s = s.trim().trim_matches('\'').trim_matches('"');
     let s = s.strip_prefix("file://").unwrap_or(s);
     if s.is_empty() {
@@ -922,15 +954,14 @@ pub fn wallpaper() -> String {
 /// Best-effort now-playing via `playerctl`.
 #[allow(dead_code)]
 pub fn media() -> String {
-    if let Ok(out) = Command::new("playerctl")
-        .args(["metadata", "--format", "{{ artist }} - {{ title }}"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() && !s.contains("No players") && s != " - " {
-                return s;
-            }
+    if let Some(s) = run_timeout(
+        "playerctl",
+        &["metadata", "--format", "{{ artist }} - {{ title }}"],
+        800,
+    ) {
+        let s = s.trim();
+        if !s.is_empty() && !s.contains("No players") && s != " - " {
+            return s.to_string();
         }
     }
     "N/A".into()
@@ -1009,12 +1040,8 @@ fn vulkan_driver() -> Option<String> {
 #[allow(dead_code)]
 pub fn opengl() -> String {
     for arg in ["-B", ""] {
-        let mut cmd = Command::new("glxinfo");
-        if !arg.is_empty() {
-            cmd.arg(arg);
-        }
-        if let Ok(out) = cmd.output() {
-            let s = String::from_utf8_lossy(&out.stdout);
+        let args: &[&str] = if arg.is_empty() { &[] } else { &[arg] };
+        if let Some(s) = run_timeout("glxinfo", args, 1000) {
             for line in s.lines() {
                 if let Some(rest) = line.strip_prefix("OpenGL renderer string:") {
                     let v = rest.trim();
@@ -1088,10 +1115,15 @@ pub fn term_theme() -> String {
 fn term_theme_env() -> Option<String> {
     let fgbg = env::var("COLORFGBG").ok()?;
     let mut parts = fgbg.split(';').rev();
-    let bg = parts.next().and_then(|s| s.trim().parse::<usize>().ok())?;
-    let fg = parts.next().and_then(|s| s.trim().parse::<usize>().ok())?;
+    let bg = parts.next().and_then(|s| s.trim().parse::<usize>().ok());
+    let fg = parts.next().and_then(|s| s.trim().parse::<usize>().ok());
     let hex = |i: usize| ANSI_HEX.get(i % 16).copied().unwrap_or("#000000");
-    Some(format!("{} (FG) - {} (BG)", hex(fg), hex(bg)))
+    match (fg, bg) {
+        (Some(f), Some(b)) => Some(format!("{} (FG) - {} (BG)", hex(f), hex(b))),
+        (Some(f), None) => Some(format!("{} (FG)", hex(f))),
+        (None, Some(b)) => Some(format!("{} (BG)", hex(b))),
+        (None, None) => None,
+    }
 }
 
 /// Restores the tty's termios and closes it on drop.
@@ -1506,7 +1538,12 @@ pub fn physical_disk() -> String {
             else if rotational.trim() == "0" { "SSD" }
             else { "HDD" };
         let temp = disk_temp(&name).map(|t| format!(" - {t:.1}°C")).unwrap_or_default();
-        out.push(format!("{model}: {gib:.2} GiB [{kind}, Fixed]{temp}"));
+        let mount = if read_path(&p.join("removable")).as_deref() == Some("1") {
+            "Removable"
+        } else {
+            "Fixed"
+        };
+        out.push(format!("{model}: {gib:.2} GiB [{kind}, {mount}]{temp}"));
     }
     if out.is_empty() { "N/A".into() } else { out.join(", ") }
 }
@@ -1962,4 +1999,21 @@ fn preferred_refresh(edid: &[u8]) -> Option<f64> {
     let vb = d[6] as u64 | ((d[7] as u64 & 0x0f) << 8);
     let total = (ha + hb).saturating_mul(va + vb);
     if total == 0 { None } else { Some(pclk as f64 / total as f64) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_timeout_captures_stdout() {
+        assert_eq!(run_timeout("sh", &["-c", "printf hi"], 1000).as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn run_timeout_kills_slow_command() {
+        let start = std::time::Instant::now();
+        assert_eq!(run_timeout("sh", &["-c", "sleep 5"], 50), None);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 }
