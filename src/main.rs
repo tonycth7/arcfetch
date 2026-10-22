@@ -5,6 +5,7 @@ mod cache;
 mod config;
 mod cosmic;
 mod info;
+mod jsonc;
 mod logos;
 mod mandelbrot;
 mod modules;
