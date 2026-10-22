@@ -1,6 +1,7 @@
 // arcfetch — blazing-fast Arch Linux sysinfo 
 // arcfetch [-h] [-V] [--blackhole [--t N]] [--logo NAME] [--accent COLOR]
 //          [--no-color] [--config]
+mod anim;
 mod cache;
 mod config;
 mod cosmic;
@@ -11,6 +12,7 @@ mod mandelbrot;
 mod modules;
 mod net;
 mod pkgs;
+mod scheme;
 
 use std::{env, thread};
 use std::f64::consts::PI;
@@ -44,6 +46,17 @@ fn row(label_color: &str, key: &str, val: &str) -> String {
     s
 }
 
+/// Colour is off for `--no-color`, `NO_COLOR`, `CLICOLOR=0`, or a non-TTY
+/// unless `FORCE_COLOR` is set.
+fn colour_disabled(no_color: bool) -> bool {
+    let tty = unsafe { libc::isatty(1) } != 0;
+    let force = env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty());
+    no_color
+        || (!tty && !force)
+        || env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+        || env::var("CLICOLOR").ok().as_deref() == Some("0")
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut esc = false;
@@ -68,7 +81,7 @@ fn strip_ansi(s: &str) -> String {
 }
 
 /// Count visible characters (ignoring ANSI escape sequences).
-fn visible_chars(s: &str) -> usize {
+pub(crate) fn visible_chars(s: &str) -> usize {
     let mut n = 0;
     let mut esc = false;
     let mut osc = false;
@@ -158,7 +171,7 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-fn expand_path(path: &str) -> String {
+pub(crate) fn expand_path(path: &str) -> String {
     if path.starts_with('~') {
         if let Ok(home) = env::var("HOME") {
             path.replacen('~', &home, 1)
@@ -213,7 +226,8 @@ fn detect_auto_logo(si: &info::SysInfo) -> String {
 fn parse_effect(s: &str) -> logos::AnimEffect {
     match s.trim().to_ascii_lowercase().as_str() {
         // `frames`/`wave` add no glyph distortion — they let the native
-        // keyframes (atom/dna/arcreactor) and the colour wave speak for themselves.
+        // keyframes (atom/dna/arcreactor) and the generated aurora art speak
+        // for themselves.
         "none" | "off" | "frames" | "keyframes" | "wave" | "rainbow"
                                          => logos::AnimEffect::None,
         "scanline" | "scan" | "crt"      => logos::AnimEffect::Scanline,
@@ -224,25 +238,47 @@ fn parse_effect(s: &str) -> logos::AnimEffect {
 
 /// Enter the terminal's alternate screen buffer (used by full-screen modes).
 /// The user's shell stays untouched underneath and is restored on exit.
-fn screen_enter<W: Write>(buf: &mut W) {
+pub(crate) fn screen_enter<W: Write>(buf: &mut W) {
     write!(buf, "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l").ok();
     buf.flush().ok();
 }
 
 /// Leave the alternate screen buffer and restore the cursor.
-fn screen_leave<W: Write>(buf: &mut W) {
+pub(crate) fn screen_leave<W: Write>(buf: &mut W) {
     write!(buf, "{RESET}\x1b[?25h\x1b[?1049l").ok();
     buf.flush().ok();
 }
 
-/// Colour each character of `line` from a flowing palette wave.
-fn wave_text(line: &str, row: usize, tick: usize, palette: &[String]) -> String {
+/// Colour one row from the gradient, or fall back to a flowing palette wave.
+fn wave_text(
+    line: &str,
+    row: usize,
+    height: usize,
+    tick: usize,
+    palette: &[String],
+    anim: &config::Animation,
+) -> String {
+    if let Some(stop) = gradient_for_row(anim, row, height, tick) {
+        let mut s = String::with_capacity(line.len() + stop.len() + RESET.len());
+        s.push_str(stop);
+        s.push_str(line);
+        s.push_str(RESET);
+        return s;
+    }
     let last = palette.len().saturating_sub(1);
-    let mut s = String::with_capacity(line.len() * 8);
+    let mut s = String::with_capacity(line.len() * 4);
+    let mut prev = None;
     for (col, ch) in line.chars().enumerate() {
+        if ch == ' ' {
+            s.push(' ');
+            continue;
+        }
         let phase = logos::color_wave_phase(row, col, tick);
         let idx = ((phase * last as f32).round() as usize).min(last);
-        s.push_str(&palette[idx]);
+        if prev != Some(idx) {
+            s.push_str(&palette[idx]);
+            prev = Some(idx);
+        }
         s.push(ch);
     }
     s.push_str(RESET);
@@ -250,7 +286,7 @@ fn wave_text(line: &str, row: usize, tick: usize, palette: &[String]) -> String 
 }
 
 /// Short, self-overwriting intro played before the normal static render.
-/// Animated logos (atom/dna/arcreactor) cycle frames; others can shimmer.
+/// Animated logos cycle frames; others can shimmer.
 fn run_intro(
     info: &[String],
     logo_name: &str,
@@ -259,10 +295,10 @@ fn run_intro(
     anim: &config::Animation,
 ) {
     use std::fmt::Write as _;
-    const FRAME_MS: u64 = 70;
+    const FRAME_MS: u64 = 33;
 
     let frames = (anim.intro_ms / FRAME_MS).clamp(1, 24);
-    let animated_logo = matches!(logo_name, "atom" | "dna" | "arcreactor");
+    let animated_logo = logos::is_animated(logo_name);
     let effect = if animated_logo {
         logos::AnimEffect::None
     } else {
@@ -285,8 +321,7 @@ fn run_intro(
     let gap = " ".repeat(cfg.layout.gap);
     for tick in 0..frames {
         if !RUNNING.load(Ordering::Relaxed) { break; }
-        let base: Vec<String> = logos::from_name_frame(logo_name, (tick / 3) as usize)
-            .iter().map(|s| (*s).to_string()).collect();
+        let base: Vec<String> = logos::frame(logo_name, tick as usize, 4);
         let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
         let logo_w = widths.iter().max().copied().unwrap_or(36);
         let rows = base.len().max(info.len());
@@ -304,7 +339,7 @@ fn run_intro(
             if args.no_color {
                 let _ = writeln!(frame, "{indent}{}{}{gap}{}", line, " ".repeat(pad), inf);
             } else if animated_logo && anim.wave {
-                let shown = wave_text(&line, i, tick as usize, &cfg.colors.logo);
+                let shown = wave_text(&line, i, base.len(), tick as usize, &cfg.colors.logo, anim);
                 let _ = writeln!(frame, "{indent}{}{}{gap}{}", shown, " ".repeat(pad), inf);
             } else {
                 let lc = logo_line_color(logo_name, i, cfg, args.color.is_some());
@@ -326,16 +361,14 @@ fn run_intro(
 fn run_animate(
     info: &[String],
     logo_name: &str,
-    custom: &Option<Vec<String>>,
+    art: CustomArt,
     cfg: &Config,
     args: &Args,
     effect_name: &str,
     duration: Option<u64>,
 ) {
-    use std::fmt::Write;
-
-    const FRAME_MS: u64 = 70;
-    const DEFAULT_FRAMES: u64 = 45; // ≈3s
+    const FRAME_MS: u64 = 33;
+    const DEFAULT_FRAMES: u64 = 90; // ≈3s
 
     RUNNING.store(true, Ordering::Relaxed);
     unsafe {
@@ -351,9 +384,6 @@ fn run_animate(
         Some(n) => Some((n * 1000 / FRAME_MS).max(1)),
     };
 
-    // colour ramp for the wave; `logo` is a fixed 9-slot palette
-    let ramp = &cfg.colors.logo;
-    let last = ramp.len().saturating_sub(1);
     let indent = " ".repeat(cfg.layout.indent);
     let gap = " ".repeat(cfg.layout.gap);
 
@@ -367,37 +397,33 @@ fn run_animate(
         if let Some(max) = max_frames { if tick >= max { break; } }
         let t = tick as usize;
 
-        // current logo frame: animated logos cycle, everything else stays put
-        let base: Vec<String> = match custom {
-            Some(c) => c.clone(),
-            None => logos::from_name_frame(logo_name, t / 6)
-                .iter().map(|s| (*s).to_string()).collect(),
+        let owned;
+        let base: &[String] = if let Some(a) = art.anim {
+            a.frame(t, 1)
+        } else if let Some(c) = art.lines {
+            c
+        } else {
+            owned = logos::frame(logo_name, t, 4);
+            &owned
         };
-        let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
-        let logo_w = widths.iter().max().copied().unwrap_or(36);
-        let max_rows = base.len().max(info.len());
+        let art = panel_text(base, t, effect, &cfg.colors.logo, &cfg.animation, !args.no_color);
+        let art_w = art.iter().map(|l| visible_chars(l)).max().unwrap_or(36);
+        let max_rows = art.len().max(info.len());
 
-        // build the whole frame, then emit it in one write (avoids tearing)
+        // Build the whole frame, then emit it in one write. `\x1b[K` clears
+        // leftovers when a frame gets shorter, so no full-screen redraw.
         let mut screen = String::with_capacity(8192);
-        screen.push_str("\x1b[2J\x1b[H\n");
+        screen.push_str("\x1b[H\n");
         for i in 0..max_rows {
-            let raw  = base.get(i).map(String::as_str).unwrap_or("");
-            let anim = logos::animate_line(raw, i, t, effect);
-            let pad  = logo_w.saturating_sub(widths.get(i).copied().unwrap_or(0));
-            let inf  = info.get(i).map(String::as_str).unwrap_or("");
             screen.push_str(&indent);
-            if args.no_color {
-                screen.push_str(&anim);
+            if let Some(line) = art.get(i) {
+                screen.push_str(line);
             } else {
-                // per-character colour wave across the logo
-                for (col, ch) in anim.chars().enumerate() {
-                    let phase = logos::color_wave_phase(i, col, t);
-                    let idx   = ((phase * last as f32).round() as usize).min(last);
-                    let _ = write!(screen, "{}{}", ramp[idx], ch);
-                }
-                screen.push_str(RESET);
+                screen.push_str(&" ".repeat(art_w));
             }
-            let _ = writeln!(screen, "{:pad$}{gap}{inf}", "", pad = pad);
+            screen.push_str(&gap);
+            screen.push_str(info.get(i).map(String::as_str).unwrap_or(""));
+            screen.push_str("\x1b[K\n");
         }
         buf.write_all(screen.as_bytes()).ok();
         buf.flush().ok();
@@ -1428,9 +1454,11 @@ struct Args {
     scheme:       Option<String>,
     box_style:    Option<String>,
     animate:      Option<String>,
+    animation:    Option<String>,
     list_logos:   bool,
     list_schemes: bool,
     list_presets: bool,
+    list_animations: bool,
     no_intro:     bool,
     foreground:   bool,
     stop:         bool,
@@ -1464,9 +1492,11 @@ fn parse_args() -> Args {
         scheme: None,
         box_style: None,
         animate: None,
+        animation: None,
         list_logos: false,
         list_schemes: false,
         list_presets: false,
+        list_animations: false,
         no_intro: false,
         foreground: false,
         stop: false,
@@ -1485,7 +1515,9 @@ fn parse_args() -> Args {
                     if let Ok(n) = s.parse::<u32>() { mandel_space = Some(n); }
                 }
             } else if w[0] == "--animate" {
-                if let Some(s) = w[1].to_str() { animate_space = Some(s.to_string()); }
+                if let Some(s) = w[1].to_str() {
+                    if !s.starts_with('-') { animate_space = Some(s.to_string()); }
+                }
             } else if w[0] == "--box" {
                 if let Some(s) = w[1].to_str() {
                     if is_box_style(s) { box_space = Some(s.to_string()); }
@@ -1540,6 +1572,7 @@ fn parse_args() -> Args {
             Long("list-logos") | Long("logos") => a.list_logos = true,
             Long("list-schemes") | Long("schemes") => a.list_schemes = true,
             Long("list-presets") | Long("presets") => a.list_presets = true,
+            Long("list-animations") | Long("animations") => a.list_animations = true,
             Long("no-animate") | Long("no-intro") => a.no_intro = true,
             Long("foreground") | Long("fg") => a.foreground = true,
             Long("stop") => a.stop = true,
@@ -1588,6 +1621,11 @@ fn parse_args() -> Args {
                     .or_else(|| animate_space.clone())
                     .unwrap_or_else(|| "shimmer".into()));
             }
+            Long("animation") => {
+                if let Ok(v) = parser.value() {
+                    a.animation = Some(v.to_string_lossy().into_owned());
+                }
+            }
             Short('s') | Long("structure") => {
                 if let Ok(v) = parser.value() {
                     a.structure = Some(v.to_string_lossy().into_owned());
@@ -1595,6 +1633,9 @@ fn parse_args() -> Args {
             }
             _ => {}
         }
+    }
+    if a.animation.is_some() && a.animate.is_none() {
+        a.animate = Some("frames".into());
     }
     a
 }
@@ -1726,48 +1767,49 @@ fn print_json(si: &info::SysInfo, cfg: &Config) {
 
 fn print_config_help(cfg_path: &str) {
     let (b, r, s, g) = (BOLD, RESET, SUBTEXT1, GREEN);
+    let field = |key: &str, val: &str, desc: &str| {
+        println!("  {g}{key:<14}{r} = {val:<10} {s}# {desc}{r}",
+            g = g, r = r, key = key, val = val, s = s, desc = desc);
+    };
+
     println!();
     println!("  {b}{PEACH}config file{r}  {s}{cfg_path}{r}", b=b, PEACH=PEACH, r=r, s=s, cfg_path=cfg_path);
+    println!("  {s}TOML subset: [section] headers, key = value, # comments. Every key is optional.{r}", s=s, r=r);
+    println!("  {s}Unknown keys/sections are ignored. Booleans: true/yes/1/on enable; anything else disables.{r}", s=s, r=r);
+    println!("  {s}Relative paths are used from the current directory; ~ is expanded for logo files.{r}", s=s, r=r);
     println!();
-    println!("  {b}{BLUE}[colors]{r}", b=b, BLUE=BLUE, r=r);
-    println!("  {s}# 7 label slots (cycle through fields), accent, values, sep, bar{r}", s=s, r=r);
-    println!("  {g}scheme{r}   = auto       {s}# auto|{} (auto = light/dark from the terminal){r}", config::SCHEMES.join("|"), g=g, r=r, s=s);
-    println!("  {s}# values: catppuccin names | black/white/gray/orange | ansi_* | #RGB | #RRGGBB | rgb(r,g,b) | color0..255{r}", s=s, r=r);
-    println!("  {g}accent{r}   = blue       {s}# logo + hostname color{r}", g=g, r=r, s=s);
-    println!("  {g}username{r} = mauve      {s}# user part of user@host{r}", g=g, r=r, s=s);
-    println!("  {g}hostname{r} = blue", g=g, r=r);
-    println!("  {g}c1{r}       = blue       {s}# field label 1 (os, term, disk...){r}", g=g, r=r, s=s);
-    println!("  {g}c2{r}       = sapphire", g=g, r=r);
-    println!("  {g}c3{r}       = sky", g=g, r=r);
-    println!("  {g}c4{r}       = teal", g=g, r=r);
-    println!("  {g}c5{r}       = green", g=g, r=r);
-    println!("  {g}c6{r}       = yellow", g=g, r=r);
-    println!("  {g}c7{r}       = peach      {s}# repeats if more than 7 visible fields{r}", g=g, r=r, s=s);
-    println!("  {g}values{r}   = subtext1   {s}# all field values{r}", g=g, r=r, s=s);
-    println!("  {g}sep{r}      = overlay0   {s}# separator ────{r}", g=g, r=r, s=s);
-    println!("  {g}bar{r}      = blue       {s}# memory bar fill{r}", g=g, r=r, s=s);
-    println!("  {s}  logo1..logo9{r}  {s}custom logo inline colors (default: c1..c7 + accent + text){r}", s=s, r=r);
+
+    println!("  {b}{BLUE}[colors]{r}  {s}keys apply in file order — put scheme first if you use it{r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("scheme", "mocha", "palette preset; default mocha");
+    println!("  {s}              values: auto|mocha|latte|frappe|macchiato|nord|dracula|gruvbox|tokyo-night{r}", s=s, r=r);
+    println!("  {s}                      solarized-dark|rose-pine|onedark|kanagawa|everforest|ayu{r}", s=s, r=r);
+    println!("  {s}              auto = latte on a light terminal, mocha on dark/unknown; aliases: catppuccin,{r}", s=s, r=r);
+    println!("  {s}              tokyonight, atom, gruvbox-dark, solarized, rosepine, ayu-dark, …{r}", s=s, r=r);
+    field("accent", "blue", "default logo colour, header rule and box border");
+    field("username", "mauve", "user part of user@host");
+    field("hostname", "blue", "host part of user@host");
+    field("c1", "blue", "field-label colour 1");
+    field("c2", "sapphire", "field-label colour 2");
+    field("c3", "sky", "field-label colour 3");
+    field("c4", "teal", "field-label colour 4");
+    field("c5", "green", "field-label colour 5");
+    field("c6", "yellow", "field-label colour 6");
+    field("c7", "peach", "field-label colour 7; c1..c7 repeat after 7 visible fields");
+    field("values", "subtext1", "all field values");
+    field("sep", "overlay0", "parsed but not used by the current renderer");
+    field("bar", "blue", "memory bar fill");
+    field("logo1..logo9", "c1..c7, blue, text", "custom-logo $1..$9 colours");
+    println!("  {s}# colour specs (any colour key):{r}", s=s, r=r);
+    println!("  {s}#   catppuccin  rosewater flamingo pink mauve red maroon peach yellow green teal sky sapphire blue lavender text subtext1 overlay0{r}", s=s, r=r);
+    println!("  {s}#   extra       black white gray/grey silver navy lime aqua fuchsia purple/magenta cyan orange{r}", s=s, r=r);
+    println!("  {s}#   ANSI        ansi_black … ansi_bright_white (16 base colours){r}", s=s, r=r);
+    println!("  {s}#   numeric     #RGB | #RRGGBB | rgb(r,g,b) | color0..color255 | bare 0..255; unknown = blue{r}", s=s, r=r);
     println!();
     println!("  {b}{BLUE}[layout]{r}  {s}box and spacing for normal output{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}box{r}       = none     {s}# none | round | square | double | heavy | dashed | ascii{r}", g=g, r=r, s=s);
     println!("  {g}box_color{r} = accent   {s}# border colour; none = uncoloured{r}", g=g, r=r, s=s);
     println!("  {g}indent{r}    = 2        {s}# left margin in columns{r}", g=g, r=r, s=s);
     println!("  {g}gap{r}       = 2        {s}# spaces between logo and info{r}", g=g, r=r, s=s);
-    println!();
-    println!("  {b}{BLUE}[show]{r}  {s}(true/false each field){r}", b=b, BLUE=BLUE, r=r, s=s);
-    println!("  os=true  kernel=true  uptime=true  res=false  pkgs=true");
-    println!("  shell=true  de_wm=true  term=true  cpu=true  gpu=true");
-    println!("  memory=true  disk=false  load=false  locale=false");
-    println!("  swatches=false  color_bar=false");
-    println!("  swap=false  sound=false  gpu_driver=false  theme=false");
-    println!("  bios=false  board=false  disk_type=false  pkg_updates=false");
-    println!("  local_ip=false  init_ver=false  de_wm_ver=false");
-    println!("  {s}# opt-in modules (all false by default — or use --all):{r}", s=s, r=r);
-    println!("  {s}datetime editor dns host chassis bootmgr cpu_cache login_manager{r}", s=s, r=r);
-    println!("  {s}brightness cpu_usage diskio netio physmem gpu_mem btrfs wifi users{r}", s=s, r=r);
-    println!("  {s}wallpaper media public_ip weather opengl vulkan{r}", s=s, r=r);
-    println!("  {s}cursor term_size term_theme codec bluetooth camera mouse keyboard{r}", s=s, r=r);
-    println!("  {s}tpm physical_disk top_processes monitor{r}", s=s, r=r);
     println!();
     println!("  {b}{BLUE}rows{r}  {s}root keys: pick a layout, then override any row{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}info_style{r} = classic  {s}# classic | minimal | boxed | sections | tree | iconic | card | chips (card/chips = boxed){r}", g=g, r=r, s=s);
@@ -1781,19 +1823,134 @@ fn print_config_help(cfg_path: &str) {
     println!("  {g}separator{r} = \" \"  {g}labels{r} = true  {g}key_width{r} = 9  {g}bar_width{r} = 14", g=g, r=r);
     println!("  {s}labels = false prints values only (minimal/iconic styles do this){r}", s=s, r=r);
     println!();
-    println!("  {b}{BLUE}[logo]{r}  {s}choose logo or custom ASCII file{r}", b=b, BLUE=BLUE, r=r, s=s);
-    println!("  {g}name{r} = arch         {s}# arch | ascii | tux | nix | gentoo | mini | auto{r}", g=g, r=r, s=s);
-    println!("  {g}file{r} = <path>       {s}# custom ASCII file (overrides name){r}", g=g, r=r, s=s);
-    println!("  {g}color{r} = <unset>     {s}# uniform logo colour (default = built-in palette){r}", g=g, r=r, s=s);
-    println!("  {s}list every logo name from the CLI: arcfetch --list-logos{r}", s=s, r=r);
+    println!("  {b}{BLUE}[show]{r}  {s}per-field visibility; true/yes/1/on enables, anything else disables{r}", b=b, BLUE=BLUE, r=r, s=s);
+    println!("  {s}# --all enables every data field below except header, uptime_long, swatches and color_bar.{r}", s=s, r=r);
+    field("header", "both", "both | user/username | host/hostname | none/false");
+    println!("  {s}# core fields (on by default):{r}", s=s, r=r);
+    field("os", "true", "distro PRETTY_NAME from /etc/os-release");
+    field("kernel", "true", "kernel release from uname -r");
+    field("uptime", "true", "short uptime, e.g. 3d 4h 5m");
+    field("pkgs", "true", "installed package count (cached 1 h)");
+    field("shell", "true", "basename of $SHELL");
+    field("de_wm", "true", "$XDG_CURRENT_DESKTOP / $DESKTOP_SESSION / Hyprland / Sway / X11 / TTY");
+    field("term", "true", "$TERM_PROGRAM, fallback $TERM");
+    field("cpu", "true", "CPU brand, core count and max GHz (cached 24 h)");
+    field("gpu", "true", "GPU name from DRM/NVIDIA/PCI (cached 24 h)");
+    field("memory", "true", "used / total RAM with a 14-cell bar");
+    println!("  {s}# optional core fields:{r}", s=s, r=r);
+    field("uptime_long", "false", "true = 3 days, 4 hrs, 5 mins (only changes uptime)");
+    field("res", "false", "primary output resolution from /sys/class/drm");
+    field("gpu_temp", "false", "GPU hwmon temperature in °C, or N/A");
+    field("battery", "false", "BAT0/BAT1/BAT capacity + charging icon, or N/A");
+    field("disk", "false", "root filesystem used / total");
+    field("load", "false", "1, 5 and 15 minute load averages");
+    field("locale", "false", "$LANG");
+    println!("  {s}# network fields (collected together when any of ip/ssh/ports is on):{r}", s=s, r=r);
+    field("ip", "false", "primary interface IPv4 address");
+    field("ssh", "false", "port 22 listening: active / inactive");
+    field("ports", "false", "count of listening TCP ports");
+    println!("  {s}# extra rows:{r}", s=s, r=r);
+    field("swatches", "false", "14-dot Catppuccin palette row (fixed colours)");
+    field("color_bar", "false", "8-block neofetch-style colour bar");
+    field("init", "false", "PID 1 init name (systemd/OpenRC/runit/s6/…)");
+    field("cpu_temp", "false", "CPU package temperature from hwmon or ACPI, or N/A");
+    field("processes", "false", "number of processes in /proc");
+    field("container", "false", "Docker / Podman / Kubernetes / LXC / none");
+    field("session", "false", "$XDG_SESSION_TYPE, or tty");
+    println!("  {s}# fastfetch-inspired fields (off by default):{r}", s=s, r=r);
+    field("swap", "false", "swap used / total, or N/A");
+    field("sound", "false", "PipeWire / PulseAudio / ALSA");
+    field("gpu_driver", "false", "DRM driver and version (nvidia/amdgpu)");
+    field("bios", "false", "DMI BIOS version and date");
+    field("board", "false", "DMI motherboard vendor and model");
+    field("disk_type", "false", "SSD / NVMe SSD / HDD from the root device");
+    field("pkg_updates", "false", "pacman sync repos found (lightweight, not a full update check)");
+    field("theme", "false", "GTK theme from gtk-3.0/settings.ini (gtk2 fallback)");
+    field("icons", "false", "GTK icon theme");
+    field("term_font", "false", "terminal font from the environment or terminal config");
+    field("de_wm_ver", "false", "desktop environment / WM version (may spawn <wm> --version)");
+    field("init_ver", "false", "init version (systemd shows distro VERSION_ID)");
+    field("local_ip", "false", "interface + local IPv4 address");
+    println!("  {s}# opt-in modules (all off by default; or use --all):{r}", s=s, r=r);
+    field("datetime", "false", "local date and time");
+    field("editor", "false", "$VISUAL or $EDITOR");
+    field("dns", "false", "nameservers from /etc/resolv.conf");
+    field("host", "false", "DMI system vendor and product");
+    field("chassis", "false", "DMI chassis type (Laptop/Desktop/…)");
+    field("bootmgr", "false", "UEFI or BIOS");
+    field("cpu_cache", "false", "L1 / L2 / L3 cache sizes");
+    field("login_manager", "false", "display-manager.service");
+    field("brightness", "false", "backlight percentage");
+    field("cpu_usage", "false", "/proc/stat sample (at least 60 ms)");
+    field("diskio", "false", "totals from /proc/diskstats");
+    field("netio", "false", "totals from /proc/net/dev");
+    field("physmem", "false", "DIMM slots from DMI (root may be required)");
+    field("gpu_mem", "false", "VRAM used / total");
+    field("btrfs", "false", "btrfs volumes");
+    field("wifi", "false", "wireless interface, SSID and signal");
+    field("users", "false", "logged-in users");
+    field("wallpaper", "false", "current wallpaper (Hyprland/Sway/GNOME)");
+    field("media", "false", "now playing via playerctl");
+    field("public_ip", "false", "public IP (network; 1 h cache, stale-while-revalidate)");
+    field("weather", "false", "weather from wttr.in (network; 15 min cache)");
+    field("opengl", "false", "OpenGL renderer via glxinfo (24 h cache)");
+    field("vulkan", "false", "Vulkan drivers (24 h cache)");
+    field("cursor", "false", "cursor theme and size");
+    field("term_size", "false", "terminal columns x rows");
+    field("term_theme", "false", "terminal FG/BG from $COLORFGBG (5 min cache)");
+    field("codec", "false", "VA-API encoders/decoders via vainfo (24 h cache)");
+    field("bluetooth", "false", "Bluetooth radio and HCI version (24 h cache)");
+    field("camera", "false", "connected cameras");
+    field("mouse", "false", "pointing devices");
+    field("keyboard", "false", "keyboards");
+    field("tpm", "false", "TPM version");
+    field("physical_disk", "false", "disks: model, size, type and temperature");
+    field("top_processes", "false", "top 5 processes by CPU");
+    field("monitor", "false", "EDID: name, resolution, Hz, size and PPI");
     println!();
-    println!("  {b}{BLUE}[animation]{r}  {s}short intro on a real terminal{r}", b=b, BLUE=BLUE, r=r, s=s);
-    println!("  {g}enabled{r}  = true      {s}# false = always static{r}", g=g, r=r, s=s);
-    println!("  {g}effect{r}   = none      {s}# none | shimmer | scanline | boot{r}", g=g, r=r, s=s);
-    println!("  {g}intro_ms{r} = 700       {s}# 0 disables; animated logos auto-play{r}", g=g, r=r, s=s);
-    println!("  {g}wave{r}     = true      {s}# colour-wave atom/dna/arcreactor{r}", g=g, r=r, s=s);
+
+    println!("  {b}{BLUE}[logo]{r}  {s}pick a built-in logo or a custom file{r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("name", "arch", "built-in name; default arch (minimal preset uses mini; science picks random)");
+    println!("  {s}              names: arch, mini, ascii, tux, nix, gentoo, auto, atom, dna, arcreactor,{r}", s=s, r=r);
+    println!("  {s}                      aurora, bedrock, guix, ubuntu, debian, fedora, …{r}", s=s, r=r);
+    println!("  {s}              _small suffixes are compact variants; --list-logos prints every name{r}", s=s, r=r);
+    println!("  {s}              auto detects /etc/os-release ID/ID_LIKE; unknown IDs fall back to arch{r}", s=s, r=r);
+    field("file", "<path>", "custom ASCII or png/jpg/gif (kitty protocol); overrides name");
+    println!("  {s}              text files support $1..$9 = logo1..logo9, $R = reset, $$ = literal ${r}", s=s, r=r);    println!();
+
+    println!("  {b}{BLUE}[animation]{r}  {s}short intro on a real terminal (normal mode only){r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("enabled", "true", "false = always static; --no-animate also skips the intro");
+    field("effect", "none", "none|shimmer|scanline|boot");
+    println!("  {s}              aliases: off/frames/keyframes/wave/rainbow = none, scan/crt = scanline,{r}", s=s, r=r);
+    println!("  {s}                      bootreveal/reveal = boot, else shimmer{r}", s=s, r=r);
+    field("intro_ms", "700", "intro length; 0 disables; capped at 24 frames (~0.8 s)");
+    field("wave", "true", "colour-wave animated logos (atom, dna, arcreactor, aurora)");
+    field("gradient", "animfetch ramp", "vertical #RGB/#RRGGBB stops; [] = scheme palette wave");
+    field("gradient_scroll", "false", "let the gradient crawl through the art");
+    field("art_color", "own", "own = keep frame ANSI; theme = force the gradient");
+    println!("  {s}              authored ANSI in a frame keeps its own colours{r}", s=s, r=r);
+    println!("  {s}              the intro is skipped for custom/image logos, piped output and --no-animate{r}", s=s, r=r);
+    println!("  {s}              animated logos play their frames whenever the intro is enabled{r}", s=s, r=r);
+    println!("  {s}              custom frames: ~/.config/arcfetch/animations/<name>/01.txt, 02.txt, …{r}", s=s, r=r);
+    println!("  {s}              play them with: arcfetch --animation <name>   (list: --list-animations){r}", s=s, r=r);
     println!();
+
+    println!("  {b}{BLUE}[template]{r}  {s}preset overrides [show] entirely; explicit header is kept{r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("preset", "<unset>", "full|minimal|hacker|science; unset keeps [show]; unknown = full");
+    println!("  {s}  full     os kernel uptime res pkgs shell de_wm term cpu gpu battery memory disk load locale{r}", s=s, r=r);
+    println!("  {s}           swatches init cpu_temp processes session swap sound gpu_driver disk_type theme{r}", s=s, r=r);
+    println!("  {s}           init_ver local_ip cursor term_size term_theme camera mouse keyboard tpm physical_disk monitor{r}", s=s, r=r);
+    println!("  {s}  minimal  os kernel uptime memory battery swatches; logo becomes mini unless --logo is explicit{r}", s=s, r=r);
+    println!("  {s}  hacker   kernel uptime cpu gpu gpu_temp memory disk load ip ssh ports swatches{r}", s=s, r=r);
+    println!("  {s}  science  os kernel uptime cpu memory disk; random science logo + physicist quote{r}", s=s, r=r);
     println!();
+
+    println!("  {b}{TEAL}precedence{r}", b=b, TEAL=TEAL, r=r);
+    println!("  {s}[colors] keys apply in file order; --scheme replaces the palette; --accent/ARCFETCH_ACCENT{r}", s=s, r=r);
+    println!("  {s}then overrides accent + hostname; --color overrides the logo accent. A file accent does not set hostname.{r}", s=s, r=r);
+    println!("  {s}CLI --preset/--full overrides [template]; --all runs next, then -s/--structure wins.{r}", s=s, r=r);
+    println!();
+
     println!("  {b}{TEAL}color names{r}  {s}or #RRGGBB hex{r}", b=b, TEAL=TEAL, r=r, s=s);
     println!("  {RW}rosewater{r}  {FL}flamingo{r}  {PK}pink{r}  {MV}mauve{r}  {RD}red{r}  {MR}maroon{r}",
         RW=ROSEWATER, FL=FLAMINGO, PK=PINK, MV=MAUVE, RD=RED, MR=MAROON, r=r);
@@ -1801,6 +1958,7 @@ fn print_config_help(cfg_path: &str) {
         PE=PEACH, YW=YELLOW, GN=GREEN, TL=TEAL, SK=SKY,
         SP=SAPPHIRE, BL=BLUE, LV=LAVENDER, r=r);
     println!();
+
     println!("  {b}{SKY}quick start{r}", b=b, SKY=SKY, r=r);
     println!("    mkdir -p $(dirname {cfg_path})", cfg_path=cfg_path);
     println!("    cat > {cfg_path} << 'EOF'", cfg_path=cfg_path);
@@ -1841,7 +1999,7 @@ fn write_sample_config(cfg_path: &str) {
         }
     }
 
-    let sample = r#"# arcfetch config — ~/.config/arcfetch/config.toml
+    let sample = r##"# arcfetch config — ~/.config/arcfetch/config.toml
 # all values are optional — delete lines to use defaults
 
 # ── rows ─────────────────────────────────────────────────
@@ -1884,9 +2042,11 @@ fn write_sample_config(cfg_path: &str) {
 # command_timeout = 1.0
 
 [colors]
-# palette preset (uncomment to switch): auto | mocha | latte | frappe | macchiato |
-#   nord | dracula | gruvbox | tokyo-night | solarized-dark | rose-pine |
-#   onedark | kanagawa | everforest | ayu   (auto = light/dark from the terminal)
+# keys apply in file order — keep scheme first if you use it
+# palette preset (mocha is the default; uncomment to switch):
+#   auto | mocha | latte | frappe | macchiato | nord | dracula | gruvbox |
+#   tokyo-night | solarized-dark | rose-pine | onedark | kanagawa |
+#   everforest | ayu   (auto = light/dark from the terminal)
 # scheme = auto
 
 # every colour accepts: catppuccin names, black/white/gray/orange/purple/cyan,
@@ -1906,7 +2066,7 @@ sep    = overlay0
 bar    = blue
 
 # logo inline colors for custom logo files ($1..$9)
-# defaults: c1..c7 + accent + text
+# defaults: c1..c7 + blue + text
 logo1 = blue
 logo2 = sapphire
 logo3 = sky
@@ -1914,11 +2074,11 @@ logo4 = teal
 logo5 = green
 logo6 = yellow
 logo7 = peach
-logo8 = mauve
+logo8 = blue
 logo9 = text
 
 [show]
-# header: both | user | host | none
+# header: both | user/username | host/hostname | none/false
 header      = both
 
 os          = true
@@ -1947,6 +2107,13 @@ ports       = false
 swatches    = false   # color palette swatches row
 color_bar   = false   # neofetch-style 8-color bar (■■■■■■■■)
 
+# system fields (hidden by default)
+init        = false   # PID 1 init name (systemd/OpenRC/runit/s6/…)
+cpu_temp    = false   # CPU package temperature (hwmon or ACPI)
+processes   = false   # process count from /proc
+container   = false   # Docker / Podman / Kubernetes / LXC / none
+session     = false   # XDG session type (x11/wayland/tty)
+
 # fastfetch-inspired fields (all hidden by default)
 swap        = false   # swap usage
 sound       = false   # audio server (PipeWire/PulseAudio/ALSA)
@@ -1954,12 +2121,12 @@ gpu_driver  = false   # GPU driver name + version
 bios        = false   # BIOS version + date
 board       = false   # motherboard vendor + model
 disk_type   = false   # SSD / NVMe / HDD
-pkg_updates = false   # available package updates
+pkg_updates = false   # pacman sync repos found (not a full update count)
 theme       = false   # GTK theme name
 icons       = false   # icon theme name
 term_font   = false   # terminal font name
 de_wm_ver   = false   # desktop environment version
-init_ver    = false   # init system version
+init_ver    = false   # init version (systemd uses distro VERSION_ID)
 local_ip    = false   # interface + local IP
 
 # opt-in modules (all off by default; or just pass --all)
@@ -1972,7 +2139,7 @@ bootmgr       = false  # UEFI or BIOS
 cpu_cache     = false  # L1/L2/L3 cache sizes
 login_manager = false  # display-manager.service
 brightness    = false  # backlight %
-cpu_usage     = false  # /proc/stat sample (~200ms)
+cpu_usage     = false  # /proc/stat sample (at least 60 ms)
 diskio        = false  # /proc/diskstats totals
 netio         = false  # /proc/net/dev totals
 physmem       = false  # DIMM info (needs root for DMI)
@@ -2021,12 +2188,14 @@ indent    = 2
 gap       = 2
 
 [logo]
-# logo name: arch | ascii | tux | nix | gentoo | mini | auto
-# or any built-in distro logo: ubuntu | debian | fedora | opensuse | manjaro |
+# any built-in name from `arcfetch --list-logos`
+# logo name: arch (default) | mini | ascii | tux | nix | gentoo | auto |
+#   atom | dna | arcreactor | aurora | ubuntu | debian | fedora | opensuse | manjaro |
 #   endeavouros | cachyos | kali | alpine | void | pop | linuxmint | garuda |
 #   artix | rocky | almalinux | centos | steamos | raspbian | wsl | neon |
-#   deepin | mx | blackarch | redhat | zorin  (append _small for compact)
-# discover every built-in name: arcfetch --list-logos
+#   deepin | mx | blackarch | redhat | zorin | elementary | nobara | bazzite |
+#   bedrock | guix | macos | windows | freebsd | rust
+# append _small for compact variants where available
 # name = arch
 
 # custom ASCII file path (overrides name if set)
@@ -2039,13 +2208,30 @@ gap       = 2
 # short intro played on a real terminal before the static render
 enabled  = true
 # glyph effect: none | shimmer | scanline | boot
+# aliases: off/frames/keyframes/wave/rainbow = none, scan/crt = scanline,
+#          bootreveal/reveal = boot, else shimmer
 effect   = none
-# intro length in milliseconds (0 disables)
+# intro length in milliseconds (0 disables; capped at 24 frames, ~0.8 s)
 intro_ms = 700
-# colour-wave animated logos (atom/dna/arcreactor)
+# colour-wave animated logos (atom, dna, arcreactor, aurora)
 wave     = true
-"#;
 
+# vertical gradient for plain art; authored ANSI keeps its own colours.
+# any #RGB/#RRGGBB; [] falls back to the scheme's logo palette wave.
+gradient = ["#f5c95c", "#f17f5b", "#f45c82", "#b07cf4", "#74a4ff"]
+gradient_scroll = false
+# "own" keeps a frame's ANSI colours; "theme" forces the gradient on it
+art_color = "own"
+
+# custom frame animations: ~/.config/arcfetch/animations/<name>/01.txt, 02.txt, …
+# play with: arcfetch --animation <name>     list with: arcfetch --list-animations
+
+[template]
+# preset overrides [show] entirely; an explicit header is kept
+# options: full | minimal | hacker | science (unknown = full)
+# CLI --preset / --full overrides this
+# preset = full
+"##;
     match fs::write(path, sample) {
         Ok(_) => {
             println!("  {GREEN}created{R}  {S}{p}{R}",
@@ -2062,42 +2248,58 @@ wave     = true
 
 fn print_help(cfg_path: &str) {
     let (b, r, s, g) = (BOLD, RESET, SUBTEXT1, GREEN);
+    let flag = |syntax: &str, desc: &str| {
+        println!("    {b}{g}{syntax:<27}{r} {s}{desc}{r}",
+            b = b, g = g, syntax = syntax, r = r, s = s, desc = desc);
+    };
+
     println!();
     let ver = env!("CARGO_PKG_VERSION");
     println!("  {b}{MAUVE}arcfetch{r}  v{ver}  blazing-fast Arch sysinfo", b=b, MAUVE=MAUVE, ver=ver, r=r);
     println!();
     println!("  {b}{BLUE}usage{r}   arcfetch [OPTIONS]", b=b, BLUE=BLUE, r=r);
     println!();
-    println!("  {b}{SAPPHIRE}flags{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
-    println!("    {b}{g}-h, --help{r}                 this screen", b=b, g=g, r=r);
-    println!("    {b}{g}-V, --version{r}              version + E=mc² joke", b=b, g=g, r=r);
-    println!("    {b}{g}--config [file]{r}           {s}config ref + write sample; or use a config file{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--blackhole{r}                {MAUVE}M87 accretion disk, pinned above your shell{r}", b=b, g=g, r=r, MAUVE=MAUVE);
-    println!("    {b}{g}-t, --t <secs>{r}            {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--logo <name>{r}              switch logo {s}(arch|ubuntu|debian|fedora|nix|auto…){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--list-logos{r}              {s}show every logo name with a preview{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--list-schemes{r}            {s}show every colour scheme as a swatch strip{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--logo ?{r}                  {s}same as --list-logos{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--logo-file <path>{r}         {s}ASCII art or image (kitty protocol){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--preset <name|file>{r}       {s}load a JSONC preset (see --list-presets){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--list-presets{r}            {s}list JSONC presets shipped with arcfetch{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--full{r}                     {s}show all fields (overrides minimal default){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--accent <color>{r}           name | #RRGGBB | rgb(r,g,b) | colorN", b=b, g=g, r=r);
-    println!("    {b}{g}--color <spec>{r}             logo colour: name | hex | random", b=b, g=g, r=r);
-    println!("    {b}{g}--scheme <name>{r}            palette: {s}{}{r}", config::SCHEMES.join("|"), b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--box [style]{r}              {s}frame output (round|square|double|heavy|dashed|ascii){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--no-color{r}                 plain text (pipe-friendly)", b=b, g=g, r=r);
-    println!("    {b}{g}--all{r}                      {s}enable every optional field{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}-s, --structure <list>{r}     {s}show only listed fields (comma-sep){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--json{r}                     {s}machine-readable JSON output{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--watch{r}                    {s}refresh every second (Ctrl+C stops){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--mandelbrot [iter]{r}        {GREEN}Mandelbrot set as logo{r}", b=b, g=g, r=r, GREEN=GREEN);
-    println!("    {b}{g}--quantum{r}                  {MAUVE}wave-function collapse animation{r}", b=b, g=g, r=r, MAUVE=MAUVE);
-    println!("    {b}{g}--cosmic{r}                   {SKY}starfield + moon + shooting stars{r}", b=b, g=g, r=r, SKY=SKY);
-    println!("    {b}{g}--animate [effect]{r}         {s}animate any logo, pinned above your shell (shimmer|scanline|boot|frames){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--no-animate{r}              {s}skip the short intro in normal mode{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--foreground{r}             {s}blocking full-screen animation (alternate screen){r}", b=b, g=g, r=r, s=s);
+    println!("  {b}{SAPPHIRE}general{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
+    flag("-h, --help", "this screen");
+    flag("-V, --version", "version + E=mc² joke");
+    flag("--config [file]", "config reference + create sample; or load a TOML/JSONC file");
+    flag("--all", "enable every data field (header, uptime_long, swatches, color_bar unchanged)");
+    flag("-s, --structure <list>", "only listed data fields (comma/space); keeps header/swatches/color_bar");
+    flag("--preset <name|file>", "full|minimal|hacker|science or a JSONC preset; overrides [show]");
+    flag("--list-presets", "list JSONC presets shipped with arcfetch");
+    flag("--full", "alias for --preset full");
+    flag("--json", "flat JSON object of enabled fields (uptime always included); no colour");
+    flag("--watch", "clear and re-run every second; Ctrl+C stops");
+    flag("--no-color", "plain text; also NO_COLOR, CLICOLOR=0, or non-TTY unless FORCE_COLOR");
     println!();
+    println!("  {b}{SAPPHIRE}appearance{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
+    flag("--scheme <name>", "palette preset (default mocha); replaces the whole palette");
+    println!("    {s}   auto|mocha|latte|frappe|macchiato|nord|dracula|gruvbox|tokyo-night{r}", s=s, r=r);
+    println!("    {s}   solarized-dark|rose-pine|onedark|kanagawa|everforest|ayu{r}", s=s, r=r);
+    flag("--accent <color>", "colour spec (name/hex/rgb/colorN); accent + hostname; wins over scheme/config");
+    flag("--color <spec|random>", "logo/accent colour only; spec or random palette colour each run");
+    flag("--box [style]", "frame output: round (default)|square|double|heavy|dashed|ascii|none");
+    flag("--logo <name|?|list>", "built-in logo, auto, or list; default arch");
+    flag("--logo-file <path>", "ASCII text or kitty png/jpg/gif; overrides logo name; ~ expanded");
+    flag("--list-logos, --logos", "every built-in name with a preview");
+    flag("--list-schemes, --schemes", "every palette with role swatches and exact hex");
+    flag("--list-animations, --animations", "built-in and custom animation frame sets");
+    println!();
+    println!("  {b}{SAPPHIRE}display & animation{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
+    flag("--animate [effect]", "pin a live logo above the shell; shimmer (default)|scanline|boot|frames");
+    flag("--animation <name|path>", "play frames from ~/.config/arcfetch/animations/<name>/");
+    flag("--blackhole", "M87 accretion disk; requires a TTY; pinned unless --foreground");
+    flag("--quantum", "wave-function collapse; fixed 8 frames; --t ignored");
+    flag("--cosmic", "full-screen starfield + moon + shooting stars; ~6 s blocking");
+    flag("--mandelbrot [iter]", "static fractal logo; default 64 iterations");
+    flag("-t, --t <secs>", "duration for blackhole/cosmic/animate; 0 = until --stop/Ctrl+C");
+    flag("--no-animate, --no-intro", "skip the normal-mode intro");
+    flag("--foreground, --fg", "run blackhole/animate blocking on the alternate screen");
+    flag("--stop", "remove the pinned animation and reset the terminal");
+    println!("    {s}--animate pins a compact logo pane; --cosmic is a full-screen scene{r}", s=s, r=r);
+    println!("    {s}one display mode at a time; --t does not affect quantum, mandelbrot or normal mode{r}", s=s, r=r);
+    println!("    {s}background blackhole/animate run until --stop or --t N; --foreground defaults to ~3 s{r}", s=s, r=r);
+    println!("    {s}--blackhole and --animate need a TTY; piped output exits with an error{r}", s=s, r=r);    println!();
     println!("  {b}{TEAL}logos{r}", b=b, TEAL=TEAL, r=r);
 
     println!("    {b}{g}arch{r}         block {s}\u{259f}\u{2588}\u{2588}\u{2588}\u{2599}{r} (default)", b=b, g=g, r=r, s=s);
@@ -2106,33 +2308,37 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}tux{r}          Linux penguin", b=b, g=g, r=r);
     println!("    {b}{g}nix{r}          NixOS hexagonal snowflake", b=b, g=g, r=r);
     println!("    {b}{g}gentoo{r}       Gentoo G (fastfetch style)", b=b, g=g, r=r);
-    println!("    {b}{g}auto{r}         detect from {s}/etc/os-release{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}auto{r}         detect from {s}/etc/os-release (unknown falls back to arch){r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}atom{r}, {g}dna{r}, {g}arcreactor{r}, {g}aurora{r}  animated logos", b=b, g=g, r=r);
     println!("    {b}{g}custom{r}  {s}~/.config/arcfetch/logo.txt{r}", b=b, g=g, r=r, s=s);
-    println!("    {s}{n} built-in logos — try {g}--logo ubuntu{r}", s=s, n=logos::all_names().len(), g=g, r=r);
+    println!("    {s}{n} built-in names incl. distros, _small variants and mascots — try {g}--logo ubuntu{r}", s=s, n=logos::all_names().len(), g=g, r=r);
     println!();
     println!("  {b}{TEAL}presets{r}", b=b, TEAL=TEAL, r=r);
-    println!("    {g}full{r}      everything", g=g, r=r);
-    println!("    {g}minimal{r}   os kernel uptime memory battery", g=g, r=r);
-    println!("    {g}hacker{r}    cpu gpu mem disk load ip ssh ports", g=g, r=r);
-    println!("    {g}science{r}   os kernel cpu mem + random science logo + physicist quote", g=g, r=r);
+    println!("    {g}full{r}      os kernel uptime res pkgs shell de_wm term cpu gpu battery memory disk load locale", g=g, r=r);
+    println!("              swatches init cpu_temp processes session swap sound gpu_driver disk_type theme");
+    println!("              init_ver local_ip cursor term_size term_theme camera mouse keyboard tpm physical_disk monitor");
+    println!("    {g}minimal{r}   os kernel uptime memory battery swatches; logo becomes mini unless --logo is explicit", g=g, r=r);
+    println!("    {g}hacker{r}    kernel uptime cpu gpu gpu_temp memory disk load ip ssh ports swatches", g=g, r=r);
+    println!("    {g}science{r}   os kernel uptime cpu memory disk; random science logo + physicist quote", g=g, r=r);
     println!();
     println!("  {b}{PEACH}config{r}  {s}{cfg_path}{r}", b=b, PEACH=PEACH, r=r, s=s, cfg_path=cfg_path);
-    println!("    run {b}{g}arcfetch --config{r} for full config reference", b=b, g=g, r=r);
+    println!("    run {b}{g}arcfetch --config{r} for the full reference and a sample file", b=b, g=g, r=r);
+    println!("    {s}[colors] | [show] | [logo] | [animation] | [template] — all keys optional{r}", s=s, r=r);
     println!();
-    println!("  {b}{SKY}display modes{r}", b=b, SKY=SKY, r=r);
-    println!("    {g}--blackhole{r}   accretion disk, pinned above your shell", g=g, r=r);
-    println!("    {g}--mandelbrot{r}  fractal logo (math)", g=g, r=r);
-    println!("    {g}--quantum{r}     wave collapse (physics)", g=g, r=r);
-    println!("    {g}--cosmic{r}      starfield + moon + shooting stars (astronomy)", g=g, r=r);
-    println!("    {g}--animate{r}     procedural logo animation, pinned above your shell", g=g, r=r);
-    println!("    {g}--stop{r}        remove the pinned animation from this terminal", g=g, r=r);
-    println!("    {s}mutually exclusive — pick one{r}", s=s, r=r);
+    println!("  {b}{SKY}environment{r}", b=b, SKY=SKY, r=r);
+    println!("    {g}ARCFETCH_ACCENT{r}   {s}same as --accent (logo + hostname){r}", g=g, r=r, s=s);
+    println!("    {g}NO_COLOR{r}          {s}disable colour; CLICOLOR=0 does the same{r}", g=g, r=r, s=s);
+    println!("    {g}FORCE_COLOR{r}       {s}keep colour when stdout is piped{r}", g=g, r=r, s=s);
+    println!("    {g}XDG_CONFIG_HOME{r}   {s}base for arcfetch/config.toml (default ~/.config){r}", g=g, r=r, s=s);
     println!();
     println!("  {b}{OVERLAY0}shell startup (e.g. ~/.zshrc){r}", b=b, OVERLAY0=OVERLAY0, r=r);
     println!("    arcfetch                       {s}# minimal default (fast){r}", s=s, r=r);
-    println!("    arcfetch --full               {s}# show all fields{r}", s=s, r=r);
+    println!("    arcfetch --full               {s}# every preset field{r}", s=s, r=r);
+    println!("    arcfetch --scheme auto         {s}# follow the terminal light/dark background{r}", s=s, r=r);
     println!("    arcfetch --mandelbrot          {s}# fractal as logo{r}", s=s, r=r);
+    println!("    arcfetch --blackhole           {s}# pinned M87 disk; stop with arcfetch --stop{r}", s=s, r=r);
     println!("    arcfetch --logo nix --cosmic   {s}# cosmic + nix logo{r}", s=s, r=r);
+    println!("    arcfetch --animation pulse     {s}# your own frame animation{r}", s=s, r=r);
     println!();
 }
 
@@ -2155,30 +2361,61 @@ fn logo_line_color<'a>(logo_name: &str, i: usize, cfg: &'a Config, color_overrid
 //  logo catalogue
 // ═══════════════════════════════════════════════════════════
 
-/// `--list-schemes` — preview every built-in palette as a swatch strip.
-fn print_schemes() {
+/// `--list-schemes` — preview every verified palette as role swatches.
+fn print_schemes(no_color: bool) {
     use std::fmt::Write as _;
-    let depth = config::ColorDepth::detect();
+    let color = !colour_disabled(no_color);
+    let depth = if color { config::ColorDepth::detect() } else { config::ColorDepth::Ansi16 };
+    let cols = term_size().0.max(40);
+    let per_row = (cols.saturating_sub(6) / 21).max(1);
+    let paint = |line: String| {
+        let line = if color {
+            config::downgrade_str(&line, depth)
+        } else {
+            strip_ansi(&line)
+        };
+        println!("{line}");
+    };
+
     println!();
-    println!("  {BOLD}{BLUE}arcfetch schemes{R}  {OVL}use: arcfetch --scheme <name>{R}",
-        BOLD = BOLD, BLUE = BLUE, OVL = OVERLAY0, R = RESET);
-    println!("  {OVL}17 slots: rosewater flamingo pink mauve red maroon peach yellow{R}",
-        OVL = OVERLAY0, R = RESET);
-    println!("  {OVL}           green teal sky sapphire blue lavender text subtext1 overlay0{R}",
-        OVL = OVERLAY0, R = RESET);
+    paint(format!(
+        "  {BOLD}{BLUE}arcfetch schemes{R}  {OVL}use: arcfetch --scheme <name>{R}",
+        BOLD = BOLD, BLUE = BLUE, OVL = OVERLAY0, R = RESET
+    ));
+    paint(format!(
+        "  {OVL}verified upstream palettes · role, swatch, exact hex{R}",
+        OVL = OVERLAY0, R = RESET
+    ));
     println!();
-    for &name in config::SCHEMES {
-        if name == "auto" { continue; }
-        let Some(p) = config::scheme_rgb(name) else { continue };
-        let mut line = format!("    {GREEN}{:<12}{R} ", name, GREEN = GREEN, R = RESET);
-        for (r, g, b) in p {
-            let _ = write!(line, "\x1b[38;2;{};{};{}m███", r, g, b);
+
+    for s in scheme::SCHEMES.iter().copied() {
+        paint(format!(
+            "  {BOLD}{GREEN}{}{R}  {OVL}· {}{R}",
+            s.palette.name,
+            s.palette.variant,
+            BOLD = BOLD, GREEN = GREEN, OVL = OVERLAY0, R = RESET
+        ));
+        for chunk in s.roles.all().chunks(per_row) {
+            let mut line = String::from("    ");
+            for (label, role) in chunk {
+                let rgb = s.rgb(role);
+                let _ = write!(line, " {label:<7} ");
+                if color {
+                    let _ = write!(line, "{}", scheme::swatch(rgb));
+                } else {
+                    line.push_str("██");
+                }
+                let _ = write!(line, " {}  ", scheme::hex(rgb));
+            }
+            paint(line);
         }
-        line.push_str(RESET);
-        println!("{}", config::downgrade_str(&line, depth));
+        println!();
     }
-    println!();
-    println!("  {OVL}auto{R} picks latte/mocha from the terminal background.", OVL = OVERLAY0, R = RESET);
+
+    paint(format!(
+        "  {OVL}auto{R} picks latte on a light terminal, mocha on dark or unknown backgrounds.",
+        OVL = OVERLAY0, R = RESET
+    ));
     println!();
 }
 
@@ -2187,11 +2424,11 @@ fn print_logos() {
 
     let is_fun = |n: &str| matches!(
         n,
-        "ascii" | "tux" | "nix" | "gentoo" | "mini" | "dna" | "atom" | "wave"
-            | "emc2" | "pi" | "batman" | "batman_small" | "ironman" | "ironman_small"
-            | "arcreactor"
+        "ascii" | "tux" | "nix" | "gentoo" | "mini" | "dna" | "atom"
+            | "aurora" | "wave" | "emc2" | "pi" | "batman" | "batman_small" | "ironman"
+            | "ironman_small" | "arcreactor"
     );
-    let is_animated = |n: &str| matches!(n, "atom" | "dna" | "arcreactor");
+    let is_animated = logos::is_animated;
 
     println!();
     println!("  {BOLD}{BLUE}arcfetch logos{R}  {OVL}{n} available · use: arcfetch --logo <name>{R}",
@@ -2207,12 +2444,15 @@ fn print_logos() {
 
         for name in list {
             let art = logos::from_name(name);
-            let preview = art
-                .iter()
-                .filter(|l| !l.trim().is_empty())
-                .max_by_key(|l| visible_chars(l))
-                .map(|l| l.trim())
-                .unwrap_or("");
+            let preview = if matches!(*name, "aurora") {
+                art.last().map(|line| line.trim()).unwrap_or("")
+            } else {
+                art.iter()
+                    .filter(|l| !l.trim().is_empty())
+                    .max_by_key(|l| visible_chars(l))
+                    .map(|l| l.trim())
+                    .unwrap_or("")
+            };
             let preview: String = preview.chars().take(30).collect();
             let marker = if is_animated(name) {
                 format!(" {TEAL}[animated]{R}", TEAL = TEAL, R = RESET)
@@ -2232,6 +2472,32 @@ fn print_logos() {
     println!();
 }
 
+fn print_animations() {
+    println!();
+    println!("  {BOLD}{BLUE}arcfetch animations{R}", BOLD = BOLD, BLUE = BLUE, R = RESET);
+    println!();
+    println!("  {BOLD}{MAUVE}built-in{R}  {GREEN}atom{R}, {GREEN}dna{R}, {GREEN}arcreactor{R}, {GREEN}aurora{R}",
+        BOLD = BOLD, MAUVE = MAUVE, GREEN = GREEN, R = RESET);
+    println!("  {OVERLAY0}play: arcfetch --animate --logo aurora{R}", OVERLAY0 = OVERLAY0, R = RESET);
+    println!();
+
+    let custom = anim::Animation::list();
+    if custom.is_empty() {
+        println!("  {OVERLAY0}no custom animations yet{R}", OVERLAY0 = OVERLAY0, R = RESET);
+    } else {
+        println!("  {BOLD}{MAUVE}custom{R}", BOLD = BOLD, MAUVE = MAUVE, R = RESET);
+        for (name, frames) in custom {
+            println!("    {GREEN}{:<16}{R} {OVERLAY0}{frames} frame(s){R}",
+                name, OVERLAY0 = OVERLAY0, GREEN = GREEN, R = RESET);
+        }
+    }
+    println!();
+    println!("  {OVERLAY0}put frames in ~/.config/arcfetch/animations/<name>/{R}", OVERLAY0 = OVERLAY0, R = RESET);
+    println!("  {OVERLAY0}name them 01.txt, 02.txt, …; play with: arcfetch --animation <name>{R}",
+        OVERLAY0 = OVERLAY0, R = RESET);
+    println!();
+}
+
 // ═══════════════════════════════════════════════════════════
 //  background animation (top strip, shell stays usable)
 // ═══════════════════════════════════════════════════════════
@@ -2240,6 +2506,14 @@ fn print_logos() {
 enum PanelMode<'a> {
     Blackhole,
     Animate(&'a str),
+}
+
+/// Art source for the pinned/animate paths: a static custom logo or a frame
+/// directory loaded by [`anim::Animation`].
+#[derive(Clone, Copy)]
+struct CustomArt<'a> {
+    lines: &'a Option<Vec<String>>,
+    anim: Option<&'a anim::Animation>,
 }
 
 fn term_size() -> (usize, usize) {
@@ -2281,31 +2555,105 @@ fn panel_blackhole(cols: usize, rows: usize, frame: u64) -> Vec<String> {
     out
 }
 
-/// Build one logo frame with the colour wave.
+/// One vertical gradient stop for `row`, or `None` when the gradient is off.
+/// This is animfetch's model: plain art gets the ramp, authored ANSI keeps its
+/// own colours.
+fn gradient_for_row(
+    anim: &config::Animation,
+    row: usize,
+    height: usize,
+    tick: usize,
+) -> Option<&str> {
+    if anim.gradient.is_empty() {
+        return None;
+    }
+    let span = height.max(1);
+    let offset = if anim.gradient_scroll { tick } else { 0 };
+    let t = ((row + offset) % span) as f32 / span as f32;
+    let last = anim.gradient.len() - 1;
+    let idx = ((t * last as f32).round() as usize).min(last);
+    Some(&anim.gradient[idx])
+}
+
+/// Build one art frame, with the gradient (or palette wave) when `color` is
+/// set. Lines are padded to a common width so the info column never jitters.
+fn panel_text(
+    lines: &[String],
+    tick: usize,
+    effect: logos::AnimEffect,
+    palette: &[String],
+    anim: &config::Animation,
+    color: bool,
+) -> Vec<String> {
+    let widths: Vec<usize> = lines.iter().map(|l| visible_chars(l)).collect();
+    let w = widths.iter().max().copied().unwrap_or(36);
+    let last = palette.len().saturating_sub(1);
+
+    lines.iter().enumerate().map(|(i, raw)| {
+        let stripped;
+        // Frames may carry their own SGR colours (animfetch's `art_color =
+        // "own"`). Pass those through; `theme` strips them so the gradient wins.
+        let keep_ansi = color && (anim.art_color || !raw.contains('\x1b'));
+        let raw = if keep_ansi {
+            raw.as_str()
+        } else {
+            stripped = strip_ansi(raw);
+            stripped.as_str()
+        };
+        let authored = keep_ansi && raw.contains('\x1b');
+        let line = if authored {
+            raw.to_string()
+        } else {
+            logos::animate_line(raw, i, tick, effect)
+        };
+        let mut s = String::with_capacity(line.len() * 4 + 16);
+        if color {
+            if authored {
+                s.push_str(&line);
+                s.push_str(RESET);
+            } else if let Some(stop) = gradient_for_row(anim, i, lines.len(), tick) {
+                // One escape per row: cheap, and the vertical ramp reads the
+                // same way animfetch's does.
+                s.push_str(stop);
+                s.push_str(&line);
+                s.push_str(RESET);
+            } else {
+                // Fallback: one escape per run of the same palette slot, and
+                // never colour a space.
+                let mut prev = None;
+                for (col, ch) in line.chars().enumerate() {
+                    if ch == ' ' {
+                        s.push(' ');
+                        continue;
+                    }
+                    let phase = logos::color_wave_phase(i, col, tick);
+                    let idx = ((phase * last as f32).round() as usize).min(last);
+                    if prev != Some(idx) {
+                        s.push_str(&palette[idx]);
+                        prev = Some(idx);
+                    }
+                    s.push(ch);
+                }
+                s.push_str(RESET);
+            }
+        } else {
+            s.push_str(&line);
+        }
+        s.push_str(&" ".repeat(w.saturating_sub(widths[i])));
+        s
+    }).collect()
+}
+
+/// Build one logo frame with the gradient / palette wave.
 fn panel_logo(
     logo_name: &str,
     tick: usize,
     effect: logos::AnimEffect,
     palette: &[String],
+    anim: &config::Animation,
 ) -> Vec<String> {
-    let base = logos::from_name_frame(logo_name, tick / 6);
-    let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
-    let w = widths.iter().max().copied().unwrap_or(36);
-    let last = palette.len().saturating_sub(1);
-
-    base.iter().enumerate().map(|(i, raw)| {
-        let line = logos::animate_line(raw, i, tick, effect);
-        let mut s = String::new();
-        for (col, ch) in line.chars().enumerate() {
-            let phase = logos::color_wave_phase(i, col, tick);
-            let idx = ((phase * last as f32).round() as usize).min(last);
-            s.push_str(&palette[idx]);
-            s.push(ch);
-        }
-        s.push_str(RESET);
-        s.push_str(&" ".repeat(w.saturating_sub(widths[i])));
-        s
-    }).collect()
+    let base = logos::frame(logo_name, tick, 4);
+    panel_text(&base, tick, effect, palette, anim, true)
 }
 
 /// The terminal device this process is talking to, e.g. `/dev/pts/3`.
@@ -2529,57 +2877,44 @@ fn pin_height(art_h: usize, info_len: usize, rows: usize) -> usize {
     art_h.max(info_len).min(usable).max(1)
 }
 
+/// Geometry for one pinned pane frame.
+struct PaneGeom {
+    cols: usize,
+    art_cols: usize,
+    art_h: usize,
+    pane_h: usize,
+}
+
 /// Build one frame for the pinned pane: art on the left, info on the right,
 /// with the same two-space indent and gap as the normal one-shot render.
 fn pane_frame(
     mode: PanelMode,
     logo_name: &str,
-    custom: &Option<Vec<String>>,
+    art: CustomArt,
     cfg: &Config,
     info: &[String],
-    cols: usize,
-    art_cols: usize,
-    art_h: usize,
-    pane_h: usize,
+    geom: PaneGeom,
     frame: u64,
 ) -> Vec<String> {
     let art: Vec<String> = match mode {
-        PanelMode::Blackhole => panel_blackhole(art_cols, art_h.min(pane_h), frame),
+        PanelMode::Blackhole => panel_blackhole(geom.art_cols, geom.art_h.min(geom.pane_h), frame),
         PanelMode::Animate(effect) => {
             let effect = parse_effect(effect);
-            match custom {
-                Some(lines) => {
-                    let widths: Vec<usize> = lines.iter().map(|l| visible_chars(l)).collect();
-                    let w = widths.iter().max().copied().unwrap_or(36);
-                    let last = cfg.colors.logo.len().saturating_sub(1);
-                    lines
-                        .iter()
-                        .enumerate()
-                        .map(|(i, raw)| {
-                            let anim = logos::animate_line(raw, i, frame as usize, effect);
-                            let mut s = String::new();
-                            for (col, ch) in anim.chars().enumerate() {
-                                let phase = logos::color_wave_phase(i, col, frame as usize);
-                                let idx = ((phase * last as f32).round() as usize).min(last);
-                                s.push_str(&cfg.colors.logo[idx]);
-                                s.push(ch);
-                            }
-                            s.push_str(RESET);
-                            s.push_str(&" ".repeat(w.saturating_sub(widths[i])));
-                            s
-                        })
-                        .collect()
-                }
-                None => panel_logo(logo_name, frame as usize, effect, &cfg.colors.logo),
+            if let Some(a) = art.anim {
+                panel_text(a.frame(frame as usize, 1), frame as usize, effect, &cfg.colors.logo, &cfg.animation, true)
+            } else if let Some(lines) = art.lines {
+                panel_text(lines, frame as usize, effect, &cfg.colors.logo, &cfg.animation, true)
+            } else {
+                panel_logo(logo_name, frame as usize, effect, &cfg.colors.logo, &cfg.animation)
             }
         }
     };
 
-    let art_w = art.iter().map(|l| visible_chars(l)).max().unwrap_or(art_cols);
+    let art_w = art.iter().map(|l| visible_chars(l)).max().unwrap_or(geom.art_cols);
     let indent = " ".repeat(cfg.layout.indent);
     let gap = " ".repeat(cfg.layout.gap);
-    let mut block = Vec::with_capacity(pane_h);
-    for i in 0..pane_h {
+    let mut block = Vec::with_capacity(geom.pane_h);
+    for i in 0..geom.pane_h {
         let a = art.get(i).map(String::as_str).unwrap_or("");
         let pad = art_w.saturating_sub(visible_chars(a));
         let inf = info.get(i).map(String::as_str).unwrap_or("");
@@ -2592,7 +2927,7 @@ fn pane_frame(
         }
         line.push_str(&gap);
         line.push_str(inf);
-        block.push(truncate_visible(&line, cols));
+        block.push(truncate_visible(&line, geom.cols));
     }
     block
 }
@@ -2611,7 +2946,7 @@ fn pane_frame(
 fn run_background(
     mode: PanelMode,
     logo_name: &str,
-    custom: &Option<Vec<String>>,
+    art: CustomArt,
     cfg: &Config,
     info: &[String],
     duration: Option<u64>,
@@ -2627,9 +2962,12 @@ fn run_background(
 
     // A frame at tick 0 gives the logo its natural height.
     let first_lines = match mode {
-        PanelMode::Animate(effect) => Some(match custom {
-            Some(lines) => lines.clone(),
-            None => panel_logo(logo_name, 0, parse_effect(effect), &cfg.colors.logo),
+        PanelMode::Animate(effect) => Some(if let Some(a) = art.anim {
+            a.frame(0, 1).to_vec()
+        } else if let Some(lines) = art.lines {
+            lines.clone()
+        } else {
+            panel_logo(logo_name, 0, parse_effect(effect), &cfg.colors.logo, &cfg.animation)
         }),
         PanelMode::Blackhole => None,
     };
@@ -2712,6 +3050,11 @@ fn run_background(
     let mut held = true;
     let mut invalidate = true;
     let mut frame: u64 = 0;
+    let mut last_block: Vec<String> = Vec::new();
+    let frame_ms = match mode {
+        PanelMode::Blackhole => 50,
+        PanelMode::Animate(_) => 33,
+    };
 
     loop {
         if !RUNNING.load(Ordering::Relaxed) {
@@ -2790,13 +3133,15 @@ fn run_background(
             let block = pane_frame(
                 mode,
                 logo_name,
-                custom,
+                art,
                 cfg,
                 info,
-                cur_cols,
-                cur_art_cols,
-                cur_art_h,
-                cur_pane_h,
+                PaneGeom {
+                    cols: cur_cols,
+                    art_cols: cur_art_cols,
+                    art_h: cur_art_h,
+                    pane_h: cur_pane_h,
+                },
                 frame,
             );
             let block: Vec<String> = if no_color {
@@ -2819,18 +3164,28 @@ fn run_background(
                 for y in 0..clear_to {
                     scr.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
                 }
+                last_block.clear();
                 invalidate = false;
             }
 
             let visible = block.len().min(cur_pane_h);
+            // Row-level diff: static info rows and unchanged keyframes cost
+            // nothing, which keeps the pinned pane responsive at 30 fps.
             for (y, line) in block.iter().take(visible).enumerate() {
+                if last_block.get(y) == Some(line) {
+                    continue;
+                }
                 scr.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
                 scr.push_str(line);
             }
             // If the frame got shorter, erase the rows it used to occupy.
             for y in visible..clear_to {
-                scr.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
+                if last_block.get(y).is_some_and(|line| !line.is_empty()) {
+                    scr.push_str(&format!("\x1b[{};1H\x1b[2K", y + 1));
+                }
             }
+            last_block = block;
+            last_block.truncate(visible);
 
             scr.push_str(RESET);
             scr.push_str("\x1b[?6h");
@@ -2854,7 +3209,7 @@ fn run_background(
         // Sleep in small slices so a command taking the terminal is noticed
         // before it starts drawing, not up to a whole frame later.
         let mut waited = 0u64;
-        while waited < 70 {
+        while waited < frame_ms {
             thread::sleep(Duration::from_millis(5));
             waited += 5;
             if !RUNNING.load(Ordering::Relaxed) {
@@ -2915,11 +3270,12 @@ fn main() {
     if args.help     { print_help(&cfg_path);          return; }
     if args.show_cfg { print_config_help(&cfg_path); write_sample_config(&cfg_path); return; }
     if args.list_logos { print_logos(); return; }
-    if args.list_schemes { print_schemes(); return; }
+    if args.list_schemes { print_schemes(args.no_color); return; }
     if args.list_presets {
         for name in config::preset_names() { println!("{}", name); }
         return;
     }
+    if args.list_animations { print_animations(); return; }
     if args.stop { stop_background(); return; }
 
     // mutual exclusion for display modes
@@ -2967,10 +3323,7 @@ fn main() {
 
     // auto-disable colour when stdout is not a terminal; honour NO_COLOR / CLICOLOR / FORCE_COLOR
     let is_tty = unsafe { libc::isatty(1) } != 0;
-    let force_color = env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty());
-    if !is_tty && !force_color { args.no_color = true; }
-    if env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) { args.no_color = true; }
-    if env::var("CLICOLOR").ok().as_deref() == Some("0") { args.no_color = true; }
+    args.no_color = colour_disabled(args.no_color);
 
     // Down-sample colours to what the terminal can actually show (truecolor →
     // 256 → 16), so the tool stays legible on any terminal.
@@ -2980,6 +3333,7 @@ fn main() {
         config::ColorDepth::detect()
     };
     config::apply_depth(&mut cfg.colors, depth);
+    config::apply_depth_animation(&mut cfg.animation, depth);
 
     // --watch: re-run this binary every second, clearing the screen each time
     if args.watch {
@@ -2995,6 +3349,18 @@ fn main() {
         if is_tty { print!("\x1b[?25h"); let _ = stdout().flush(); }
         return;
     }
+
+    // --animation <name|path>: load user frames once; it implies --animate.
+    let custom_anim = match args.animation.as_deref() {
+        Some(name) => match anim::Animation::load(name) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("arcfetch: {e}");
+                return;
+            }
+        },
+        None => None,
+    };
 
     // apply logo from config (CLI overrides config)
     if !args.logo_explicit {
@@ -3043,7 +3409,8 @@ fn main() {
             run_blackhole(&out_lines, args.duration);
         } else {
             let no_custom: Option<Vec<String>> = None;
-            run_background(PanelMode::Blackhole, "arch", &no_custom, &cfg, &out_lines, args.duration, args.no_color);
+            let art = CustomArt { lines: &no_custom, anim: None };
+            run_background(PanelMode::Blackhole, "arch", art, &cfg, &out_lines, args.duration, args.no_color);
         }
         return;
     }
@@ -3065,35 +3432,9 @@ fn main() {
     let load_file = |path: &str| -> Option<Vec<String>> {
         let expanded = expand_path(path);
         std::fs::read_to_string(&expanded).ok().map(|raw| {
-            let colors = &cfg.colors;
-            raw.lines().map(|line| {
-                let bytes = line.as_bytes();
-                let mut out = String::with_capacity(bytes.len() + 64);
-                let mut i = 0;
-                while i < bytes.len() {
-                    if bytes[i] == b'$' && i + 1 < bytes.len() {
-                        let next = bytes[i + 1];
-                        if (b'1'..=b'9').contains(&next) {
-                            out.push_str(&colors.logo[(next - b'1') as usize]);
-                            i += 2; continue;
-                        }
-                        match next {
-                            b'R' => { out.push_str(RESET); i += 2; continue; }
-                            b'$' => { out.push('$'); i += 2; continue; }
-                            _ => {}
-                        }
-                    }
-                    if bytes[i] != b'$' {
-                        let start = i;
-                        while i < bytes.len() && bytes[i] != b'$' { i += 1; }
-                        out.push_str(&line[start..i]);
-                        continue;
-                    }
-                    out.push('$');
-                    i += 1;
-                }
-                out
-            }).collect()
+            raw.lines()
+                .map(|line| config::expand_logo_slots(line, &cfg.colors.logo))
+                .collect()
         })
     };
 
@@ -3182,11 +3523,12 @@ fn main() {
             eprintln!("arcfetch: --animate requires a terminal");
             return;
         }
+        let art = CustomArt { lines: &custom_lines, anim: custom_anim.as_ref() };
         if args.foreground {
             stop_background();
-            run_animate(&out_lines, &logo_name, &custom_lines, &cfg, &args, eff, args.duration);
+            run_animate(&out_lines, &logo_name, art, &cfg, &args, eff, args.duration);
         } else {
-            run_background(PanelMode::Animate(eff), &logo_name, &custom_lines, &cfg, &out_lines, args.duration, args.no_color);
+            run_background(PanelMode::Animate(eff), &logo_name, art, &cfg, &out_lines, args.duration, args.no_color);
         }
         return;
     }
@@ -3205,7 +3547,7 @@ fn main() {
         && custom_lines.is_none()
         && image_escape.is_none()
     {
-        let animated_logo = matches!(logo_name.as_str(), "atom" | "dna" | "arcreactor");
+        let animated_logo = logos::is_animated(&logo_name);
         let effect_on = !cfg.animation.effect.eq_ignore_ascii_case("none");
         if animated_logo || effect_on {
             run_intro(&out_lines, &logo_name, &cfg, &args, &cfg.animation);
@@ -3302,7 +3644,12 @@ fn main() {
             if args.no_color {
                 let _ = writeln!(out, "{indent}{}{:pad$}{gap}{}", ll, "", inf, pad = pad);
             } else {
-                let lc = logo_line_color(&logo_name, i, &cfg, args.color.is_some());
+                let lc = if logos::is_animated(&logo_name) {
+                    gradient_for_row(&cfg.animation, i, logo.len(), 0)
+                        .unwrap_or_else(|| logo_line_color(&logo_name, i, &cfg, args.color.is_some()))
+                } else {
+                    logo_line_color(&logo_name, i, &cfg, args.color.is_some())
+                };
                 let _ = writeln!(out, "{indent}{}{}{:pad$}{}{gap}{}",
                     lc, ll, "", RESET, inf, pad = pad);
             }

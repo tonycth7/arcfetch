@@ -326,6 +326,16 @@ pub fn apply_depth(c: &mut Colors, depth: ColorDepth) {
     for l in c.logo.iter_mut() { *l = d(l); }
 }
 
+/// Down-sample the animation gradient with the rest of the palette.
+pub fn apply_depth_animation(a: &mut Animation, depth: ColorDepth) {
+    if depth == ColorDepth::True {
+        return;
+    }
+    for g in &mut a.gradient {
+        *g = downgrade(g, depth);
+    }
+}
+
 /// Byte length of a `38;2;…`/`38;5;…` SGR sequence starting at `s[i]`, if any.
 fn sgr_colour_at(s: &str, i: usize) -> Option<usize> {
     let rest = &s[i..];
@@ -367,134 +377,34 @@ pub fn downgrade_str(s: &str, depth: ColorDepth) -> String {
 
 // ── Colour schemes ───────────────────────────────────────
 
-pub type Rgb = (u8, u8, u8);
-
-/// RGB triplets for a named scheme, in palette order:
-/// rosewater, flamingo, pink, mauve, red, maroon, peach, yellow, green,
-/// teal, sky, sapphire, blue, lavender, text, subtext1, overlay0.
-pub fn scheme_rgb(name: &str) -> Option<[Rgb; 17]> {
-    let v: [Rgb; 17] = match name.trim().to_ascii_lowercase().as_str() {
-        "mocha" | "catppuccin" | "catppuccin-mocha" => [
-            (245,224,220),(242,205,205),(245,194,231),(203,166,247),(243,139,168),
-            (235,160,172),(250,179,135),(249,226,175),(166,227,161),(148,226,213),
-            (137,220,235),(116,199,236),(137,180,250),(180,190,254),(205,214,244),
-            (186,194,222),(108,112,134),
-        ],
-        "latte" | "catppuccin-latte" => [
-            (220,138,120),(221,120,120),(234,118,203),(136,57,239),(210,15,57),
-            (230,69,83),(254,100,11),(223,142,29),(64,160,43),(23,146,153),
-            (4,165,229),(32,159,181),(30,102,245),(114,135,253),(76,79,105),
-            (92,95,119),(156,160,176),
-        ],
-        "frappe" | "frappé" | "catppuccin-frappe" => [
-            (242,213,207),(238,190,190),(244,184,228),(202,158,230),(231,130,132),
-            (234,153,156),(239,159,118),(229,200,144),(166,209,137),(129,200,190),
-            (153,209,219),(133,193,220),(140,170,238),(186,187,241),(198,208,245),
-            (181,191,226),(115,121,148),
-        ],
-        "macchiato" | "catppuccin-macchiato" => [
-            (244,219,214),(240,198,198),(245,189,230),(198,160,246),(237,135,150),
-            (238,153,160),(245,169,127),(238,212,159),(166,218,149),(139,213,202),
-            (145,215,227),(125,196,228),(138,173,244),(183,189,248),(202,211,245),
-            (184,192,224),(110,115,141),
-        ],
-        "nord" => [
-            (216,222,233),(208,135,112),(180,142,173),(180,142,173),(191,97,106),
-            (191,97,106),(208,135,112),(235,203,139),(163,190,140),(143,188,187),
-            (136,192,208),(129,161,193),(94,129,172),(129,161,193),(236,239,244),
-            (216,222,233),(76,86,106),
-        ],
-        "dracula" => [
-            (248,248,242),(255,121,198),(255,121,198),(189,147,249),(255,85,85),
-            (255,85,85),(255,184,108),(241,250,140),(80,250,123),(139,233,253),
-            (139,233,253),(98,114,164),(189,147,249),(189,147,249),(248,248,242),
-            (248,248,242),(98,114,164),
-        ],
-        "gruvbox" | "gruvbox-dark" => [
-            (235,219,178),(211,134,155),(211,134,155),(211,134,155),(251,73,52),
-            (204,36,29),(254,128,25),(250,189,47),(184,187,38),(142,192,124),
-            (131,165,152),(69,133,136),(131,165,152),(211,134,155),(235,219,178),
-            (213,196,161),(146,131,116),
-        ],
-        "tokyo" | "tokyo-night" | "tokyonight" => [
-            (247,118,142),(255,0,124),(187,154,247),(187,154,247),(247,118,142),
-            (219,75,75),(255,158,100),(224,175,104),(158,206,106),(115,218,202),
-            (125,207,255),(42,195,222),(122,162,247),(187,154,247),(192,202,245),
-            (169,177,214),(86,95,137),
-        ],
-        "solarized" | "solarized-dark" => [
-            (238,232,213),(211,54,130),(211,54,130),(108,113,196),(220,50,47),
-            (203,75,22),(203,75,22),(181,137,0),(133,153,0),(42,161,152),
-            (42,161,152),(38,139,210),(38,139,210),(108,113,196),(238,232,213),
-            (147,161,161),(88,110,117),
-        ],
-        // Rosé Pine (main): rose, love, gold, pine, foam, iris, text, subtle, muted
-        "rose-pine" | "rosepine" | "rose_pine" => [
-            (235,188,186),(235,188,186),(235,111,146),(196,167,231),(235,111,146),
-            (235,111,146),(246,193,119),(246,193,119),(49,116,143),(156,207,216),
-            (156,207,216),(49,116,143),(156,207,216),(196,167,231),(224,222,244),
-            (144,140,170),(110,106,134),
-        ],
-        "onedark" | "one-dark" | "atom" => [
-            (171,178,191),(224,108,117),(198,120,221),(198,120,221),(224,108,117),
-            (224,108,117),(209,154,102),(229,192,123),(152,195,121),(86,182,194),
-            (86,182,194),(97,175,239),(97,175,239),(198,120,221),(171,178,191),
-            (171,178,191),(92,99,112),
-        ],
-        // Kanagawa Wave: fujiWhite, sakuraPink, oniViolet, waveRed, autumnRed,
-        // surimiOrange, carpYellow, springGreen, waveAqua2, spring/crystal blue
-        "kanagawa" => [
-            (220,215,186),(210,126,153),(210,126,153),(149,127,184),(228,104,118),
-            (195,64,67),(255,160,102),(230,195,132),(152,187,108),(122,168,159),
-            (127,180,202),(126,156,216),(126,156,216),(156,171,202),(220,215,186),
-            (200,192,147),(114,113,105),
-        ],
-        "everforest" => [
-            (211,198,170),(230,126,128),(230,126,128),(214,153,182),(230,126,128),
-            (230,126,128),(230,152,117),(219,188,127),(167,192,128),(131,192,146),
-            (127,187,179),(127,187,179),(127,187,179),(214,153,182),(211,198,170),
-            (211,198,170),(133,146,137),
-        ],
-        // Ayu Dark (official): fg, red, purple, orange, yellow, green, cyan, blue
-        "ayu" | "ayu-dark" => [
-            (191,189,182),(240,113,120),(240,113,120),(210,166,255),(240,113,120),
-            (217,87,87),(255,143,64),(255,180,84),(170,217,76),(149,230,203),
-            (149,230,203),(57,186,230),(89,194,255),(210,166,255),(191,189,182),
-            (191,189,182),(98,106,115),
-        ],
-        _ => return None,
-    };
-    Some(v)
-}
-
-/// Build a full [`Colors`] from a named scheme.
+/// Build a full [`Colors`] from a verified upstream palette.
 ///
-/// `"auto"` picks a light/dark default (`latte`/`mocha`) from the terminal
-/// background, so the output stays legible on either kind of terminal.
+/// `"auto"` is a selector, not a palette: it queries the terminal background
+/// (OSC 11, `$COLORFGBG` fallback) and picks Latte for light or Mocha for
+/// dark/unavailable, so the choice stays deterministic.
 pub fn scheme(name: &str) -> Option<Colors> {
-    let name = if name.eq_ignore_ascii_case("auto") {
-        if crate::modules::term_is_light().unwrap_or(false) { "latte" } else { "mocha" }
+    let s = if name.eq_ignore_ascii_case("auto") {
+        crate::scheme::auto_for(crate::modules::term_is_light().unwrap_or(false))
     } else {
-        name
+        crate::scheme::find(name)?
     };
-    let p = scheme_rgb(name)?;
-    let c = |i: usize| {
-        let (r, g, b) = p[i];
+    let c = |role: &str| {
+        let (r, g, b) = s.rgb(role);
         format!("\x1b[38;2;{};{};{}m", r, g, b)
     };
     Some(Colors {
-        accent:   c(12),
-        username: c(3),
-        hostname: c(12),
-        labels:   [c(12), c(11), c(10), c(9), c(8), c(7), c(6)],
-        values:   c(15),
-        sep:      c(16),
-        bar:      c(12),
-        logo:     [c(12), c(11), c(10), c(9), c(8), c(7), c(6), c(12), c(14)],
+        accent:   c(s.roles.accent),
+        username: c(s.roles.purple),
+        hostname: c(s.roles.blue),
+        labels:   [c(s.roles.blue), c(s.roles.cyan), c(s.roles.teal), c(s.roles.green), c(s.roles.yellow), c(s.roles.orange), c(s.roles.red)],
+        values:   c(s.roles.subtext),
+        sep:      c(s.roles.overlay),
+        bar:      c(s.roles.blue),
+        logo:     [c(s.roles.blue), c(s.roles.cyan), c(s.roles.teal), c(s.roles.green), c(s.roles.yellow), c(s.roles.orange), c(s.roles.red), c(s.roles.accent), c(s.roles.purple)],
     })
 }
 
-/// Scheme names accepted by [`scheme`], for help text.
+/// Scheme names accepted by [`scheme`], for help text. `auto` is a selector.
 pub const SCHEMES: &[&str] = &[
     "auto", "mocha", "latte", "frappe", "macchiato", "nord", "dracula",
     "gruvbox", "tokyo-night", "solarized-dark", "rose-pine",
@@ -519,6 +429,111 @@ impl Colors {
     pub fn label(&self, idx: usize) -> &str {
         &self.labels[idx % 7]
     }
+}
+
+/// A vertical colour ramp, sampled by row. Stops are stored as RGB so they
+/// can be interpolated; the renderer asks for ANSI strings once.
+#[derive(Clone, Debug, Default)]
+pub struct Gradient {
+    stops: Vec<(u8, u8, u8)>,
+}
+
+impl Gradient {
+    pub fn new(stops: Vec<(u8, u8, u8)>) -> Self {
+        Self { stops }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stops.is_empty()
+    }
+
+    /// Sample at `t` in `0.0..=1.0`, interpolating between adjacent stops.
+    pub fn sample(&self, t: f32) -> Option<(u8, u8, u8)> {
+        match self.stops.len() {
+            0 => None,
+            1 => Some(self.stops[0]),
+            n => {
+                let pos = t.clamp(0.0, 1.0) * (n - 1) as f32;
+                let i = (pos.floor() as usize).min(n - 2);
+                let a = self.stops[i];
+                let b = self.stops[i + 1];
+                let f = pos - i as f32;
+                let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+                Some((mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2)))
+            }
+        }
+    }
+
+    /// A dense set of ANSI foregrounds, so the renderer only has to pick one.
+    pub fn ansi(&self, samples: usize) -> Vec<String> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let n = samples.max(2);
+        (0..n)
+            .map(|i| {
+                let (r, g, b) = self.sample(i as f32 / (n - 1) as f32).unwrap();
+                format!("\x1b[38;2;{r};{g};{b}m")
+            })
+            .collect()
+    }
+}
+
+/// Parse `#rgb` or `#rrggbb` for a gradient stop.
+fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim().trim_matches('"').trim_matches('\'');
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    match hex.len() {
+        3 => {
+            let f = |i: usize| hex_byte(&hex[i..i + 1]).map(|v| v.saturating_mul(17));
+            Some((f(0)?, f(1)?, f(2)?))
+        }
+        6 => Some((
+            hex_byte(&hex[0..2])?,
+            hex_byte(&hex[2..4])?,
+            hex_byte(&hex[4..6])?,
+        )),
+        _ => None,
+    }
+}
+
+fn art_color_is_theme(val: &str) -> bool {
+    val.trim_matches('"').trim_matches('\'').eq_ignore_ascii_case("theme")
+}
+
+/// Parse a single-line array of hex colours. Bad entries are skipped.
+fn parse_gradient(val: &str) -> Option<Gradient> {
+    let inner = val.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let stops = inner
+        .split(',')
+        .filter_map(parse_hex_rgb)
+        .collect();
+    Some(Gradient::new(stops))
+}
+
+/// Expand the `$1..$9`, `$R` and `$$` colour slots used by custom logos and
+/// animation frames. `chars` keeps multi-byte block art intact.
+pub fn expand_logo_slots(line: &str, logo: &[String; 9]) -> String {
+    let mut out = String::with_capacity(line.len() + 32);
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            if let Some(&next) = chars.peek() {
+                if ('1'..='9').contains(&next) {
+                    out.push_str(&logo[(next as u8 - b'1') as usize]);
+                    chars.next();
+                    continue;
+                }
+                match next {
+                    'R' => { out.push_str(RESET); chars.next(); continue; }
+                    '$' => { out.push('$'); chars.next(); continue; }
+                    _ => {}
+                }
+            }
+        }
+        out.push(ch);
+    }
+    out
 }
 
 impl Default for Colors {
@@ -1002,6 +1017,12 @@ pub struct Animation {
     pub intro_ms: u64,
     /// Colour-wave the logo while animating.
     pub wave:     bool,
+    /// Vertical gradient for plain art. Empty falls back to the logo palette.
+    pub gradient: Vec<String>,
+    /// Let the gradient crawl through the art as it animates.
+    pub gradient_scroll: bool,
+    /// Keep a frame's own ANSI colours; `false` forces the gradient on it.
+    pub art_color: bool,
 }
 
 impl Default for Animation {
@@ -1011,6 +1032,17 @@ impl Default for Animation {
             effect:   "none".into(),
             intro_ms: 700,
             wave:     true,
+            // animfetch's default ramp. Authored ANSI still wins.
+            gradient: Gradient::new(vec![
+                (0xf5, 0xc9, 0x5c),
+                (0xf1, 0x7f, 0x5b),
+                (0xf4, 0x5c, 0x82),
+                (0xb0, 0x7c, 0xf4),
+                (0x74, 0xa4, 0xff),
+            ])
+            .ansi(32),
+            gradient_scroll: false,
+            art_color: true,
         }
     }
 }
@@ -1112,41 +1144,39 @@ pub fn preset_names() -> Vec<String> {
 // Handles [section], [[table array]], key = value, single-line string arrays,
 // and # comments — enough for config.toml with zero deps. No multiline values.
 
-/// Index of a `#` that starts a comment: outside quotes and at the start of the
-/// line or after whitespace. Keeps `#` inside paths/hex values.
-fn comment_start(line: &str, from: usize) -> Option<usize> {
-    let mut quoted = false;
-    for (i, c) in line.char_indices() {
-        if i < from { continue; }
-        match c {
-            '"' => quoted = !quoted,
-            '#' if !quoted && (i == 0 || line.as_bytes()[i - 1].is_ascii_whitespace()) => {
-                return Some(i);
+/// Strip a trailing `# comment` without eating `#RRGGBB` values. Quotes,
+/// arrays and paths are respected, so both `path = /a#b` and
+/// `gradient = ["#f5c95c", "#f17f5b"] # note` survive.
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' if quote == Some(bytes[i]) => quote = None,
+            b'"' | b'\'' if quote.is_none() => quote = Some(bytes[i]),
+            b'#' if quote.is_none() => {
+                let hex = line[i + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .count();
+                let before = line[..i].trim_end();
+                let is_value = before.ends_with('=')
+                    || before.ends_with('[')
+                    || before.ends_with(',');
+                if is_value && matches!(hex, 3 | 6) {
+                    i += 1 + hex;
+                    continue;
+                }
+                if i == 0 || bytes[i - 1].is_ascii_whitespace() {
+                    return &line[..i];
+                }
             }
             _ => {}
         }
+        i += 1;
     }
-    None
-}
-
-/// Strip a trailing `# comment` without eating `#RRGGBB` colour values.
-fn strip_comment(line: &str) -> &str {
-    match line.find('=') {
-        Some(eq) => {
-            let rest = &line[eq + 1..];
-            let value_start = eq + 1 + (rest.len() - rest.trim_start().len());
-            if line[value_start..].starts_with('#') {
-                // the first '#' begins a hex value; only a later comment is removed
-                return comment_start(line, value_start + 1)
-                    .map(|p| &line[..p])
-                    .unwrap_or(line);
-            }
-            comment_start(line, value_start)
-                .map(|p| &line[..p])
-                .unwrap_or(line)
-        }
-        None => comment_start(line, 0).map(|p| &line[..p]).unwrap_or(line),
-    }
+    line
 }
 
 pub fn load(cli_accent: Option<&str>, preset: Option<&str>, config_file: Option<&str>) -> Config {
@@ -1542,6 +1572,13 @@ fn apply_toml(cfg: &mut Config, content: &str) {
                     "effect" => cfg.animation.effect = val.to_string(),
                     "intro_ms" => cfg.animation.intro_ms = val.parse().unwrap_or(700),
                     "wave" => cfg.animation.wave = on,
+                    "gradient" => {
+                        if let Some(g) = parse_gradient(val) {
+                            cfg.animation.gradient = g.ansi(32);
+                        }
+                    }
+                    "gradient_scroll" => cfg.animation.gradient_scroll = on,
+                    "art_color" => cfg.animation.art_color = !art_color_is_theme(val),
                     _ => {}
                 }
             }
@@ -1743,3 +1780,75 @@ label = "Distro"
         assert!(cfg.modules.as_ref().is_some_and(|m| !m.is_empty()));
     }
 }
+
+    #[test]
+    fn scheme_uses_the_canonical_palette() {
+        let c = scheme("mocha").unwrap();
+        assert_eq!(c.accent, "\x1b[38;2;137;180;250m");   // blue #89b4fa
+        assert_eq!(c.username, "\x1b[38;2;203;166;247m"); // mauve #cba6f7
+        assert_eq!(c.values, "\x1b[38;2;186;194;222m");   // subtext1 #bac2de
+    }
+
+    #[test]
+    fn scheme_aliases_and_invalid_names() {
+        assert_eq!(scheme("catppuccin").unwrap().accent, scheme("mocha").unwrap().accent);
+        assert_eq!(scheme("tokyonight").unwrap().accent, scheme("tokyo-night").unwrap().accent);
+        assert_eq!(scheme("atom").unwrap().accent, scheme("onedark").unwrap().accent);
+        assert!(scheme("no-such-scheme").is_none());
+    }
+
+    #[test]
+    fn scheme_names_match_the_palette_module() {
+        assert_eq!(SCHEMES[0], "auto");
+        let names: Vec<&str> = crate::scheme::SCHEMES
+            .iter()
+            .map(|s| s.palette.name)
+            .collect();
+        assert_eq!(&SCHEMES[1..], names.as_slice());
+    }
+
+    #[test]
+    fn colour_depth_fallbacks_are_exact() {
+        let red = "\x1b[38;2;255;0;0m";
+        assert_eq!(downgrade_str(red, ColorDepth::True), red);
+        assert_eq!(downgrade_str(red, ColorDepth::Ansi256), "\x1b[38;5;196m");
+        assert_eq!(downgrade_str(red, ColorDepth::Ansi16), "\x1b[91m");
+    }
+
+    #[test]
+    fn preview_swatches_fall_back_without_truecolour() {
+        let sw = crate::scheme::swatch((255, 0, 0));
+        assert_eq!(downgrade_str(&sw, ColorDepth::Ansi256), "\x1b[38;5;196m██\x1b[0m");
+        assert_eq!(downgrade_str(&sw, ColorDepth::Ansi16), "\x1b[91m██\x1b[0m");
+    }
+
+    #[test]
+    fn logo_slots_expand_without_breaking_unicode() {
+        let mut logo = std::array::from_fn(|_| String::new());
+        logo[0] = "<red>".into();
+        assert_eq!(expand_logo_slots("$1█ $$ $R", &logo), "<red>█ $ \x1b[0m");
+    }
+
+    #[test]
+    fn gradient_keeps_quoted_hex_and_skips_bad_stops() {
+        let line = r##"gradient = ["#f5c95c", "#f17f5b", "nope"] # comment"##;
+        let line = strip_comment(line).trim();
+        assert_eq!(line, r##"gradient = ["#f5c95c", "#f17f5b", "nope"]"##);
+        let val = line.split_once('=').unwrap().1.trim();
+        let g = parse_gradient(val).unwrap();
+        assert_eq!(g.sample(0.0), Some((0xf5, 0xc9, 0x5c)));
+        assert_eq!(g.sample(1.0), Some((0xf1, 0x7f, 0x5b)));
+        assert_eq!(g.ansi(2).len(), 2);
+    }
+
+    #[test]
+    fn art_color_theme_accepts_quotes() {
+        assert!(art_color_is_theme("\"theme\""));
+        assert!(!art_color_is_theme("\"own\""));
+    }
+
+    #[test]
+    fn unquoted_hex_survives_comment_stripping() {
+        assert_eq!(strip_comment("accent = #89b4fa # blue"), "accent = #89b4fa ");
+        assert_eq!(strip_comment("# whole-line comment"), "");
+    }
