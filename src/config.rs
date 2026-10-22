@@ -901,6 +901,7 @@ pub struct Display {
     pub bar_width: usize,
     pub bar_elapsed: String,
     pub bar_total: String,
+    pub labels: bool,
 }
 
 impl Default for Display {
@@ -915,6 +916,7 @@ impl Default for Display {
             bar_width: 14,
             bar_elapsed: "\u{2588}".into(),
             bar_total: "\u{2591}".into(),
+            labels: true,
         }
     }
 }
@@ -928,8 +930,21 @@ pub struct Module {
     pub key_icon: Option<String>,
     pub padding_left: usize,
     pub key_width: Option<usize>,
-    pub text: Option<String>,   // command module
-    pub symbol: Option<String>, // colors module
+    pub text: Option<String>,    // command module
+    pub symbol: Option<String>,  // colors module
+    pub value: Option<String>,   // static value override
+    pub command: Option<String>, // value from a command
+}
+
+impl Default for Module {
+    fn default() -> Self {
+        Self {
+            kind: String::new(), key: None, format: None,
+            key_color: None, output_color: None, key_icon: None,
+            padding_left: 0, key_width: None, text: None, symbol: None,
+            value: None, command: None,
+        }
+    }
 }
 
 // ── Layout ───────────────────────────────────────────────
@@ -1010,6 +1025,7 @@ pub struct Config {
     pub animation: Animation,
     pub display:   Display,
     pub modules:   Option<Vec<Module>>,
+    pub command_timeout_ms: u64,
     pub source:    String,
 }
 
@@ -1023,6 +1039,7 @@ impl Default for Config {
             animation: Animation::default(),
             display: Display::default(),
             modules: None,
+            command_timeout_ms: 1000,
             source: String::new(),
         }
     }
@@ -1092,8 +1109,8 @@ pub fn preset_names() -> Vec<String> {
 }
 
 // ── Simple TOML-subset parser ────────────────────────────
-// Handles [section], key = value, # comments.
-// No arrays, no multiline — exactly what we need, zero deps.
+// Handles [section], [[table array]], key = value, single-line string arrays,
+// and # comments — enough for config.toml with zero deps. No multiline values.
 
 /// Index of a `#` that starts a comment: outside quotes and at the start of the
 /// line or after whitespace. Keeps `#` inside paths/hex values.
@@ -1159,6 +1176,9 @@ pub fn load(cli_accent: Option<&str>, preset: Option<&str>, config_file: Option<
                         eprintln!("arcfetch: warning: {path}: {e}");
                     }
                 } else {
+                    if let Some(style) = toml_info_style(&content) {
+                        apply_style(&mut cfg, &style);
+                    }
                     apply_toml(&mut cfg, &content);
                 }
             }
@@ -1177,17 +1197,221 @@ pub fn load(cli_accent: Option<&str>, preset: Option<&str>, config_file: Option<
     cfg
 }
 
+/// Split a single-line TOML string array (`["os", "cpu"]`).
+fn toml_array(val: &str) -> Option<Vec<String>> {
+    let inner = val.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let mut out = Vec::new();
+    for item in inner.split(',') {
+        let item = item.trim();
+        if item.is_empty() { continue; }
+        let item = item.strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+            .or_else(|| item.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(item);
+        if !item.is_empty() { out.push(item.to_string()); }
+    }
+    Some(out)
+}
+
+fn module_field(m: &mut Module, key: &str, val: &str) {
+    let k = key.trim().to_ascii_lowercase().replace(['-', '_'], "");
+    match k.as_str() {
+        "type" | "kind" => m.kind = val.trim().to_ascii_lowercase(),
+        "key" => m.key = Some(val.to_string()),
+        "format" => m.format = Some(val.to_string()),
+        "keycolor" => m.key_color = Some(resolve_config_color(val)),
+        "outputcolor" => m.output_color = Some(resolve_config_color(val)),
+        "keyicon" => m.key_icon = Some(val.to_string()),
+        "paddingleft" => m.padding_left = val.parse().unwrap_or(0),
+        "keywidth" => m.key_width = val.parse().ok(),
+        "text" => m.text = Some(val.to_string()),
+        "symbol" => m.symbol = Some(val.to_string()),
+        "value" => m.value = Some(val.to_string()),
+        "command" => m.command = Some(val.to_string()),
+        _ => {}
+    }
+}
+
+fn mods(kinds: &[&str]) -> Vec<Module> {
+    kinds.iter().map(|k| Module { kind: (*k).into(), ..Default::default() }).collect()
+}
+
+fn push_module(parsed: &mut Vec<Module>, m: Module) {
+    // `modules = ["os", "custom"]` defines order; a later [[modules]] entry
+    // fills that placeholder instead of adding a duplicate row.
+    let bare = |p: &Module| p.format.is_none() && p.key.is_none() && p.key_icon.is_none()
+        && p.value.is_none() && p.command.is_none() && p.text.is_none()
+        && p.symbol.is_none() && p.key_color.is_none() && p.output_color.is_none();
+    match parsed.iter().position(|p| p.kind == m.kind && bare(p)) {
+        Some(i) => parsed[i] = m,
+        None => parsed.push(m),
+    }
+}
+
+fn install_modules(cfg: &mut Config, mods: Vec<Module>) {
+    // The module list is the source of truth: don't collect rows that are not
+    // rendered (this is what keeps custom layouts on the fast path).
+    cfg.show.clear_fields();
+    for m in &mods {
+        // A static value or command replaces the collector's output, so don't
+        // pay for it (notably public_ip/weather and other subprocess modules).
+        if m.value.is_none() && m.command.is_none() {
+            cfg.show.enable_module(&m.kind);
+        }
+    }
+    cfg.modules = Some(mods);
+}
+
+/// Built-in starting points for `info_style`. Users can override anything with
+/// `[[modules]]`, so these are layouts, not a closed list.
+fn apply_style(cfg: &mut Config, name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    match n.as_str() {
+        "classic" | "" | "default" => return false,
+        "minimal" => {
+            cfg.show.header = Header::None;
+            cfg.display.labels = false;
+            cfg.display.separator = Some(" ".into());
+            cfg.display.key_width = Some(0);
+            install_modules(cfg, mods(&["os", "kernel", "de", "shell", "term", "cpu", "gpu", "memory", "disk", "colors"]));
+        }
+        "boxed" | "card" | "chips" => {
+            cfg.layout.box_style = "round".into();
+            install_modules(cfg, mods(&["os", "host", "kernel", "uptime", "packages", "shell", "de", "term", "cpu", "gpu", "memory", "disk", "colors"]));
+        }
+        "sections" => {
+            let mut ms = Vec::new();
+            let heading = |t: &str| Module {
+                kind: "custom".into(),
+                format: Some(format!("{{#accent}}\u{2500}\u{2500} {t} \u{2500}\u{2500}{{#}}")),
+                ..Default::default()
+            };
+            ms.push(heading("Hardware"));
+            ms.extend(mods(&["host", "cpu", "gpu", "memory", "disk"]));
+            ms.push(heading("Software"));
+            ms.extend(mods(&["os", "kernel", "packages", "shell", "de", "term"]));
+            ms.push(heading("System"));
+            ms.extend(mods(&["uptime", "battery", "colors"]));
+            cfg.display.key_width = Some(11);
+            install_modules(cfg, ms);
+        }
+        "tree" => {
+            let mut ms = Vec::new();
+            ms.push(Module {
+                kind: "custom".into(),
+                format: Some("{#accent}{user-name}@{host-name}{#}".into()),
+                ..Default::default()
+            });
+            for (kind, label) in [
+                ("os", "\u{251c}\u{2500} os"),
+                ("kernel", "\u{251c}\u{2500} kernel"),
+                ("packages", "\u{251c}\u{2500} packages"),
+                ("shell", "\u{251c}\u{2500} shell"),
+                ("de", "\u{251c}\u{2500} wm"),
+                ("term", "\u{251c}\u{2500} terminal"),
+                ("cpu", "\u{251c}\u{2500} cpu"),
+                ("gpu", "\u{251c}\u{2500} gpu"),
+                ("memory", "\u{2514}\u{2500} memory"),
+            ] {
+                ms.push(Module { kind: kind.into(), key: Some(label.into()), ..Default::default() });
+            }
+            cfg.display.key_width = Some(15);
+            cfg.display.separator = Some(" : ".into());
+            install_modules(cfg, ms);
+        }
+        "iconic" => {
+            cfg.display.labels = true;
+            cfg.display.key_width = Some(2);
+            cfg.display.separator = Some(" ".into());
+            let mut ms = mods(&["os", "kernel", "de", "shell", "term", "cpu", "gpu", "memory", "disk"]);
+            for (m, icon) in ms.iter_mut().zip([
+                "\u{f17c}", "\u{f17c}", "\u{f108}", "\u{f120}", "\u{f120}",
+                "\u{f2db}", "\u{f108}", "\u{f0a0}", "\u{f0a0}",
+            ]) {
+                m.key = Some(String::new());
+                m.key_icon = Some(icon.into());
+            }
+            install_modules(cfg, ms);
+        }
+        other => {
+            eprintln!("arcfetch: warning: unknown info_style '{other}' (try: classic, minimal, boxed, sections, tree, iconic, card, chips)");
+            return false;
+        }
+    }
+    true
+}
+
+/// Read `info_style` from the root of a TOML file without applying anything.
+fn toml_info_style(content: &str) -> Option<String> {
+    let mut section = "";
+    for raw_line in content.lines() {
+        let line = strip_comment(raw_line).trim();
+        if line.is_empty() { continue; }
+        if let Some(rest) = line.strip_prefix('[') {
+            section = rest.split_once(']').map(|(n, _)| n.trim()).unwrap_or("");
+            continue;
+        }
+        if section.is_empty() {
+            if let Some((k, v)) = line.split_once('=') {
+                if k.trim() == "info_style" {
+                    let v = v.trim();
+                    let v = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(v);
+                    if !v.is_empty() { return Some(v.to_string()); }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn apply_toml(cfg: &mut Config, content: &str) {
     let mut section = "";
+    let mut current: Option<Module> = None;
+    let mut parsed: Vec<Module> = Vec::new();
+    let mut override_kind: Option<String> = None;
+    let mut overrides: Vec<(String, Option<String>, Option<String>, Option<String>)> = Vec::new();
+    let mut modules_seen = false;
+
+    macro_rules! flush {
+        () => {
+            if let Some(m) = current.take() {
+                if !m.kind.is_empty() { push_module(&mut parsed, m); }
+            }
+        };
+    }
+
     for (lineno, raw_line) in content.lines().enumerate() {
         let line = strip_comment(raw_line).trim();
         if line.is_empty() { continue; }
+
+        // [[modules]] / [[custom]]
+        if let Some(rest) = line.strip_prefix("[[") {
+            if let Some(name) = rest.strip_suffix("]]") {
+                flush!();
+                let name = name.trim();
+                modules_seen = true;
+                override_kind = None;
+                if name == "modules" || name == "custom" {
+                    section = name;
+                    let mut m = Module::default();
+                    if name == "custom" { m.kind = "custom".into(); }
+                    current = Some(m);
+                } else {
+                    eprintln!("arcfetch: warning: unknown table array [[{name}]] at line {}", lineno + 1);
+                }
+                continue;
+            }
+        }
 
         if let Some(rest) = line.strip_prefix('[') {
             if let Some((name, _)) = rest.split_once(']') {
                 let name = name.trim();
                 if !name.is_empty() {
+                    flush!();
                     section = name;
+                    override_kind = name.strip_prefix("overrides.").map(|s| s.to_string());
+                    if let Some(kind) = &override_kind {
+                        overrides.push((kind.clone(), None, None, None));
+                    }
                     continue;
                 }
             }
@@ -1203,7 +1427,55 @@ fn apply_toml(cfg: &mut Config, content: &str) {
         let val = val.trim();
         let val = val.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(val);
 
+        if section == "modules" || section == "custom" {
+            if let Some(m) = current.as_mut() { module_field(m, key, val); }
+            continue;
+        }
+
+        if override_kind.is_some() {
+            if let Some(o) = overrides.last_mut() {
+                match key.to_ascii_lowercase().as_str() {
+                    "label" => o.1 = Some(val.to_string()),
+                    "value" => o.2 = Some(val.to_string()),
+                    "command" => o.3 = Some(val.to_string()),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
         match section {
+            "" => match key {
+                "modules" => {
+                    if let Some(items) = toml_array(val) {
+                        modules_seen = true;
+                        parsed = items.into_iter()
+                            .map(|k| Module { kind: k.trim().to_ascii_lowercase(), ..Default::default() })
+                            .collect();
+                    } else {
+                        eprintln!("arcfetch: warning: modules must be a single-line array, e.g. [\"os\", \"cpu\"]");
+                    }
+                }
+                "command_timeout" => {
+                    let secs = val.parse::<f64>().unwrap_or(1.0);
+                    cfg.command_timeout_ms = (secs * 1000.0).clamp(100.0, 10_000.0) as u64;
+                }
+                // handled before this pass
+                "info_style" => {}
+                _ => {}
+            },
+            "display" => match key {
+                "separator" => cfg.display.separator = Some(val.to_string()),
+                "separator_color" => cfg.display.separator_color = Some(resolve_config_color(val)),
+                "key_color" => cfg.display.key_color = Some(resolve_config_color(val)),
+                "key_width" => cfg.display.key_width = val.parse().ok(),
+                "key_padding_left" => cfg.display.key_padding_left = val.parse().unwrap_or(0),
+                "bar_width" => cfg.display.bar_width = val.parse().unwrap_or(14).clamp(1, 200),
+                "bar_elapsed" => cfg.display.bar_elapsed = val.to_string(),
+                "bar_total" => cfg.display.bar_total = val.to_string(),
+                "labels" => cfg.display.labels = matches!(val, "true" | "yes" | "1" | "on"),
+                _ => {}
+            },
             "colors" => {
                 let ansi = resolve(val);
                 match key {
@@ -1254,6 +1526,8 @@ fn apply_toml(cfg: &mut Config, content: &str) {
             "logo" => match key {
                 "name" => cfg.logo.name = Some(val.to_string()),
                 "file" => cfg.logo.file = Some(val.to_string()),
+                "data" => cfg.logo.data = Some(val.to_string()),
+                "position" => cfg.logo.position = val.to_ascii_lowercase(),
                 "color" => cfg.logo.color = match val.trim().to_ascii_lowercase().as_str() {
                     "accent" | "default" | "auto" | "none" => None,
                     _ => Some(resolve(val)),
@@ -1274,10 +1548,35 @@ fn apply_toml(cfg: &mut Config, content: &str) {
             _ => {}
         }
     }
-}
 
+    flush!();
+
+    let has_overrides = !overrides.is_empty();
+    if has_overrides && !modules_seen {
+        parsed = mods(&["os", "host", "kernel", "uptime", "packages", "shell", "de", "term", "cpu", "gpu", "memory", "disk", "colors"]);
+    }
+    for (kind, label, value, command) in overrides {
+        let mut target = parsed.iter_mut().find(|m| m.kind == kind);
+        if target.is_none() {
+            parsed.push(Module { kind: kind.clone(), ..Default::default() });
+            target = parsed.last_mut();
+        }
+        let m = target.unwrap();
+        if let Some(v) = label { m.key = Some(v); }
+        if let Some(v) = value { m.value = Some(v); }
+        if let Some(v) = command { m.command = Some(v); }
+    }
+
+    if modules_seen || has_overrides {
+        install_modules(cfg, parsed);
+    }
+}
 fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
     let root = jsonc::parse(text)?;
+
+    if let Some(style) = root.get("info_style").and_then(jsonc::Value::as_str) {
+        apply_style(cfg, style);
+    }
 
     if let Some(logo) = root.get("logo") {
         match logo {
@@ -1322,6 +1621,9 @@ fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
         if let Some(v) = d.get("separator").and_then(jsonc::Value::as_str) {
             cfg.display.separator = Some(v.to_string());
         }
+        if let Some(v) = d.get("labels").and_then(jsonc::Value::as_bool) {
+            cfg.display.labels = v;
+        }
         if let Some(color) = d.get("color") {
             if let Some(v) = color.get("separator").and_then(jsonc::Value::as_str) {
                 cfg.display.separator_color = Some(resolve_config_color(v));
@@ -1349,11 +1651,7 @@ fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
     if let Some(arr) = root.get("modules").and_then(jsonc::Value::as_array) {
         let mut mods = Vec::with_capacity(arr.len());
         for item in arr {
-            let mut m = Module {
-                kind: String::new(), key: None, format: None,
-                key_color: None, output_color: None, key_icon: None,
-                padding_left: 0, key_width: None, text: None, symbol: None,
-            };
+            let mut m = Module::default();
             match item {
                 jsonc::Value::Str(s) => m.kind = s.trim().to_ascii_lowercase(),
                 jsonc::Value::Obj(_) => {
@@ -1368,6 +1666,8 @@ fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
                     m.key_width = item.get("keyWidth").and_then(jsonc::Value::as_usize);
                     m.text = item.get("text").and_then(jsonc::Value::as_str).map(String::from);
                     m.symbol = item.get("symbol").and_then(jsonc::Value::as_str).map(String::from);
+                    m.value = item.get("value").and_then(jsonc::Value::as_str).map(String::from);
+                    m.command = item.get("command").and_then(jsonc::Value::as_str).map(String::from);
                 }
                 _ => continue,
             }
@@ -1375,8 +1675,7 @@ fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
         }
         cfg.show.clear_fields();
         cfg.show.header = Header::None;
-        for m in &mods { cfg.show.enable_module(&m.kind); }
-        cfg.modules = Some(mods);
+        install_modules(cfg, mods);
     }
 
     Ok(())
@@ -1414,5 +1713,33 @@ mod tests {
         l.set("box_color", "none");
         assert_eq!(l.box_style, "round");
         assert_eq!(l.box_color.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn toml_modules_overrides_and_styles() {
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, r#"
+modules = ["os", "custom", "uptime"]
+command_timeout = 5
+[[custom]]
+format = "head"
+[[modules]]
+type = "uptime"
+key = "up"
+[overrides.os]
+label = "Distro"
+"#);
+        let mods = cfg.modules.as_ref().unwrap();
+        assert_eq!(mods.iter().map(|m| m.kind.as_str()).collect::<Vec<_>>(),
+                   ["os", "custom", "uptime"]);
+        assert_eq!(mods[0].key.as_deref(), Some("Distro"));
+        assert_eq!(mods[1].format.as_deref(), Some("head"));
+        assert_eq!(mods[2].key.as_deref(), Some("up"));
+        assert_eq!(cfg.command_timeout_ms, 5000);
+
+        let mut cfg = Config::default();
+        assert!(apply_style(&mut cfg, "minimal"));
+        assert!(!cfg.display.labels);
+        assert!(cfg.modules.as_ref().is_some_and(|m| !m.is_empty()));
     }
 }

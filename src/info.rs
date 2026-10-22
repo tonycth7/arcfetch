@@ -856,7 +856,6 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     let gpu_mem       = if show.gpu_mem       { modules::gpu_mem() } else { String::new() };
     let btrfs         = if show.btrfs         { modules::btrfs() } else { String::new() };
     let users         = if show.users         { modules::users() } else { String::new() };
-    let wifi = if show.wifi { modules::wifi() } else { String::new() };
     let cursor        = if show.cursor        { modules::cursor() } else { String::new() };
     let term_size     = if show.term_size     { modules::term_size() } else { String::new() };
     let camera        = if show.camera        { modules::camera() } else { String::new() };
@@ -871,7 +870,7 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     let cpu_start = std::time::Instant::now();
     let cpu0      = show.cpu_usage.then(modules::cpu_snapshot);
     let (pkg_updates, wallpaper, media, public_ip, weather, opengl, vulkan, codec,
-         bluetooth, physical_disk, top_processes, term_theme, de_wm_ver) =
+         bluetooth, physical_disk, top_processes, term_theme, de_wm_ver, wifi_h) =
         std::thread::scope(|s| {
         let pkg_updates = show.pkg_updates.then(|| s.spawn(|| {
             if Path::new("/var/lib/pacman/sync").is_dir() {
@@ -883,8 +882,15 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
                 })
             } else { "N/A".into() }
         }));
-        let wallpaper = show.wallpaper.then(|| s.spawn(modules::wallpaper));
-        let media     = show.media.then(|| s.spawn(modules::media));
+        let wallpaper = show.wallpaper.then(|| s.spawn(|| {
+            crate::cache::get_or_compute_ttl("wallpaper", 60, modules::wallpaper)
+        }));
+        let media     = show.media.then(|| s.spawn(|| {
+            crate::cache::get_or_compute_ttl("media", 15, modules::media)
+        }));
+        let wifi_h    = show.wifi.then(|| s.spawn(|| {
+            crate::cache::get_or_compute_ttl("wifi", 3, modules::wifi)
+        }));
         let public_ip = show.public_ip.then(|| s.spawn(|| {
             crate::cache::get_or_compute_swr("public_ip", 3600, net::public_ip)
         }));
@@ -923,8 +929,11 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
             top_processes.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
             term_theme.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
             de_wm_ver.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
+            wifi_h.map(|h| h.join().unwrap_or_default()).unwrap_or_default(),
         )
     });
+
+    let wifi = if show.wifi { wifi_h } else { String::new() };
 
     // CPU usage spans the work above; only pad the window if it finished fast.
     let cpu_usage = match cpu0 {

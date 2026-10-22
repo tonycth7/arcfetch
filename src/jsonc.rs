@@ -198,7 +198,16 @@ impl<'a> Parser<'a> {
                     _ => return Err(self.err("invalid escape")),
                 },
                 Some(c) if c < 0x20 => return Err(self.err("control character in string")),
-                Some(c) => out.push(c as char),
+                Some(c) if c < 0x80 => out.push(c as char),
+                Some(_) => {
+                    // Copy the whole UTF-8 sequence, not one byte as Latin-1.
+                    let start = self.i - 1;
+                    while self.peek().is_some_and(|n| n & 0xC0 == 0x80) { self.i += 1; }
+                    match std::str::from_utf8(&self.b[start..self.i]) {
+                        Ok(s) => out.push_str(s),
+                        Err(_) => out.push('\u{fffd}'),
+                    }
+                }
                 None => return Err(self.err("unterminated string")),
             }
         }

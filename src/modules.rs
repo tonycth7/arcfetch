@@ -152,7 +152,7 @@ pub(crate) fn run_timeout(program: &str, args: &[&str], ms: u64) -> Option<Strin
                 let _ = child.wait();
                 return None;
             }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => thread::sleep(Duration::from_micros(200)),
             Err(_) => {
                 kill_group(child.id());
                 let _ = child.kill();
@@ -782,6 +782,29 @@ pub fn btrfs() -> String {
     }
 }
 
+/// SSID via wpa_supplicant control socket (fast, no subprocess).
+#[allow(dead_code)]
+fn wpa_ssid(iface: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let path = format!("/run/wpa_supplicant/{}", iface);
+    let mut stream = UnixStream::connect(&path).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+    let _ = stream.write_all(b"STATUS\n");
+    let mut buf = String::new();
+    let _ = stream.read_to_string(&mut buf);
+    for line in buf.lines() {
+        if let Some(v) = line.strip_prefix("ssid=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// SSID for an interface via `iw`, if present.
 #[allow(dead_code)]
 fn iw_ssid(iface: &str) -> Option<String> {
@@ -837,7 +860,7 @@ pub fn wifi() -> String {
     if let Some(l) = level {
         out.push_str(&format!(" {:.0}dBm", l));
     }
-    if let Some(ssid) = iw_ssid(&iface) {
+    if let Some(ssid) = wpa_ssid(&iface).or_else(|| iw_ssid(&iface)) {
         out.push(' ');
         out.push_str(&ssid);
     }

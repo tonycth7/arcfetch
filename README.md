@@ -217,19 +217,60 @@ local_ip    = false        # interface + local ip
 ssh         = false        # ssh sessions
 ports       = false        # listening ports
 
+# ── rows (root keys; keep these before the first [section]) ──
+# Start from a built-in layout, then override any row:
+# classic | minimal | boxed | sections | tree | iconic | card | chips
+# (card and chips currently use the boxed layout)
+# info_style = "classic"
+
+# Rows in order (overrides the style's default list):
+# modules = ["os", "host", "kernel", "uptime", "packages", "shell", "de", "term", "cpu", "gpu", "memory", "disk", "colors"]
+
+# seconds a command row may take (0.1–10)
+# command_timeout = 1.0
+
+[display]
+separator = " "         # between a row's key and its value
+labels    = true        # false = values only (minimal/iconic)
+key_width = 9           # 0 removes the gap
+bar_width = 14
+
 [logo]
 # name = arch          # arch | ascii | tux | nix | gentoo | mini | pi | auto
 # file = <path>        # custom ascii file (overrides name)
 
-[template]
-preset = full           # full | minimal | hacker | science
+# Full per-row control; the same keys JSONC presets use:
+# [[modules]]
+# type = "os"
+# key = "distro"
+# format = "{key}: {value}"
+# keyColor = "blue"
+# outputColor = "text"
+# keyIcon = ""
+
+# A line of your own:
+# [[custom]]
+# format = "{#accent}── {user-name} ──{#}"
+
+# A command row:
+# [[modules]]
+# type = "command"
+# key = "Public IP"
+# text = "curl -s --max-time 1 ifconfig.me"
+
+# Change a built-in row (value and command are alternatives):
+# [overrides.uptime]
+# label = "Up"
+# command = "uptime -p"
 ```
+
+`classic` is the default fast path. `info_style` picks a starting layout; `modules`, `[[modules]]`, `[[custom]]` and `[overrides.*]` then shape it row by row. For a fully custom layout, JSONC presets are supported too: `arcfetch --preset <name|file>`, `arcfetch --list-presets`, or `arcfetch --config ~/.config/arcfetch/config.jsonc`.
 
 logos and presets can be overridden via CLI — handy for one-off flexes:
 
 ```bash
 arcfetch --logo nix               # nixos snowflake even if config says arch
-arcfetch --preset science          # physicist quote even in minimal config
+arcfetch --preset 2              # a shipped JSONC layout (--list-presets)
 ```
 
 ---
@@ -239,9 +280,10 @@ arcfetch --preset science          # physicist quote even in minimal config
 ```
 -h,  --help               this
 -V,  --version            version + e=mc²
-     --config             config reference + write sample
+     --config [file]      config reference + sample, or load a config file
      --full               show most fields
-     --preset <n>         full | minimal | hacker | science
+     --preset <name|file> load a JSONC preset (see --list-presets)
+     --list-presets       list shipped JSONC presets
      --logo <name>        arch | mini | ascii | tux | nix | gentoo | pi | auto | custom
      --logo-file <path>   ascii art or image file (supports $1..$9 color tokens)
      --accent <color>     hex (#rrggbb) or catppuccin name

@@ -847,7 +847,14 @@ fn format_template(
     let b = tpl.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] != b'{' { out.push(b[i] as char); i += 1; continue; }
+        if b[i] != b'{' {
+            // Copy whole UTF-8 runs, not byte-by-byte, so non-ASCII text
+            // (box drawing, nerd icons) is not re-encoded as Latin-1.
+            let start = i;
+            while i < b.len() && b[i] != b'{' { i += 1; }
+            out.push_str(&tpl[start..i]);
+            continue;
+        }
         let Some(rel) = tpl[i + 1..].find('}') else { out.push_str(&tpl[i..]); break; };
         let end = i + 1 + rel;
         let token = &tpl[i + 1..end];
@@ -929,7 +936,7 @@ fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut 
         }
         "command" => {
             let Some(cmd) = &m.text else { return Vec::new() };
-            let Some(raw) = modules::run_timeout("sh", &["-c", cmd], 1000) else { return Vec::new() };
+            let Some(raw) = modules::run_timeout("sh", &["-c", cmd], cfg.command_timeout_ms) else { return Vec::new() };
             let value = raw.trim();
             if value.is_empty() { return Vec::new(); }
             let key = m.key.clone().unwrap_or_default();
@@ -947,7 +954,13 @@ fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut 
         _ => {}
     }
 
-    let Some((default_key, value)) = module_value(&kind, si, cfg) else { return Vec::new() };
+    let Some((default_key, mut value)) = module_value(&kind, si, cfg) else { return Vec::new() };
+    if let Some(cmd) = &m.command {
+        value = modules::run_timeout("sh", &["-c", cmd], cfg.command_timeout_ms)
+            .unwrap_or_default().trim().to_string();
+    } else if let Some(v) = &m.value {
+        value = v.clone();
+    }
     if value.is_empty() { return Vec::new(); }
     let key = m.key.clone().unwrap_or(default_key);
     let key = format!("{icon}{key}");
@@ -963,13 +976,21 @@ fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut 
 }
 
 fn row_cfg(key: &str, val: &str, key_color: &str, val_color: &str, m: &config::Module, cfg: &Config) -> String {
+    let pad = m.padding_left + cfg.display.key_padding_left;
+    if !cfg.display.labels {
+        let mut s = String::with_capacity(val.len() + pad + 16);
+        for _ in 0..pad { s.push(' '); }
+        s.push_str(val_color);
+        s.push_str(val);
+        s.push_str(RESET);
+        return s;
+    }
     let sep = cfg.display.separator.as_deref().unwrap_or(" ");
     let sep = match &cfg.display.separator_color {
         Some(c) => format!("{c}{sep}{RESET}"),
         None => sep.to_string(),
     };
     let width = if key.contains('\x1b') { 0 } else { m.key_width.or(cfg.display.key_width).unwrap_or(9) };
-    let pad = m.padding_left + cfg.display.key_padding_left;
     let mut s = String::with_capacity(key.len() + val.len() + 32);
     for _ in 0..pad { s.push(' '); }
     s.push_str(BOLD);
@@ -1748,6 +1769,18 @@ fn print_config_help(cfg_path: &str) {
     println!("  {s}cursor term_size term_theme codec bluetooth camera mouse keyboard{r}", s=s, r=r);
     println!("  {s}tpm physical_disk top_processes monitor{r}", s=s, r=r);
     println!();
+    println!("  {b}{BLUE}rows{r}  {s}root keys: pick a layout, then override any row{r}", b=b, BLUE=BLUE, r=r, s=s);
+    println!("  {g}info_style{r} = classic  {s}# classic | minimal | boxed | sections | tree | iconic | card | chips (card/chips = boxed){r}", g=g, r=r, s=s);
+    println!("  {g}modules{r}    = [\"os\", \"host\", \"cpu\", \"memory\", \"disk\"]  {s}# ordered rows{r}", g=g, r=r, s=s);
+    println!("  {s}  [[modules]] gives one row: type, key, keyIcon, format, keyColor, outputColor{r}", s=s, r=r);
+    println!("  {s}  [[custom]] gives a line of your own: format = \"...\"{r}", s=s, r=r);
+    println!("  {s}  [overrides.cpu] changes a built-in row: label | value | command{r}", s=s, r=r);
+    println!("  {g}command_timeout{r} = 1.0  {s}# seconds a command row may take (0.1–10){r}", g=g, r=r, s=s);
+    println!();
+    println!("  {b}{BLUE}[display]{r}  {s}row separator and value-only output{r}", b=b, BLUE=BLUE, r=r, s=s);
+    println!("  {g}separator{r} = \" \"  {g}labels{r} = true  {g}key_width{r} = 9  {g}bar_width{r} = 14", g=g, r=r);
+    println!("  {s}labels = false prints values only (minimal/iconic styles do this){r}", s=s, r=r);
+    println!();
     println!("  {b}{BLUE}[logo]{r}  {s}choose logo or custom ASCII file{r}", b=b, BLUE=BLUE, r=r, s=s);
     println!("  {g}name{r} = arch         {s}# arch | ascii | tux | nix | gentoo | mini | auto{r}", g=g, r=r, s=s);
     println!("  {g}file{r} = <path>       {s}# custom ASCII file (overrides name){r}", g=g, r=r, s=s);
@@ -1781,8 +1814,6 @@ fn print_config_help(cfg_path: &str) {
     println!("    box = round");
     println!("    [logo]");
     println!("    name = arch");
-    println!("    [template]");
-    println!("    preset = full");
     println!("    EOF");
     println!();
 }
@@ -1812,6 +1843,45 @@ fn write_sample_config(cfg_path: &str) {
 
     let sample = r#"# arcfetch config — ~/.config/arcfetch/config.toml
 # all values are optional — delete lines to use defaults
+
+# ── rows ─────────────────────────────────────────────────
+# Start from a built-in layout. Every row can still be overridden below.
+# classic | minimal | boxed | sections | tree | iconic | card | chips
+# card and chips currently use the boxed layout.
+# info_style = "classic"
+
+# Rows in order. Leave this out to use the style's defaults.
+# modules = ["os", "host", "kernel", "uptime", "packages", "shell", "de", "term", "cpu", "gpu", "memory", "disk", "colors"]
+
+# One table per row; the same keys JSONC presets use.
+# [[modules]]
+# type = "os"
+# key = "distro"
+# keyIcon = ""
+# format = "{key} {value}"
+# keyColor = "blue"
+# outputColor = "text"
+
+# A line of your own:
+# [[custom]]
+# format = "{#accent}── {user-name} ──{#}"
+
+# A command row (for example a public IP):
+# [[modules]]
+# type = "command"
+# key = "Public IP"
+# text = "curl -s --max-time 1 ifconfig.me"
+
+# Change a built-in row. value and command are alternatives.
+# [overrides.os]
+# label = "Distro"
+# [overrides.uptime]
+# command = "uptime -p"
+# [overrides.kernel]
+# value = "my-kernel 1.0"
+
+# seconds a command row may take (0.1-10)
+# command_timeout = 1.0
 
 [colors]
 # palette preset (uncomment to switch): auto | mocha | latte | frappe | macchiato |
@@ -1929,6 +1999,16 @@ physical_disk = false  # disks: model, size, type, temp
 top_processes = false  # top 5 processes by CPU
 monitor       = false  # EDID: name, resolution, Hz, size, PPI
 
+[display]
+# space between a row's key and its value
+# separator = " "
+# set false to print values only (used by minimal/iconic)
+# labels = true
+# key column width; 0 removes the gap
+# key_width = 9
+# key_padding_left = 0
+# bar_width = 14
+
 [layout]
 # box around the normal one-shot output:
 #   none | round | square | double | heavy | dashed | ascii
@@ -1991,7 +2071,7 @@ fn print_help(cfg_path: &str) {
     println!("  {b}{SAPPHIRE}flags{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
     println!("    {b}{g}-h, --help{r}                 this screen", b=b, g=g, r=r);
     println!("    {b}{g}-V, --version{r}              version + E=mc² joke", b=b, g=g, r=r);
-    println!("    {b}{g}--config{r}                   show config ref + write sample file", b=b, g=g, r=r);
+    println!("    {b}{g}--config [file]{r}           {s}config ref + write sample; or use a config file{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--blackhole{r}                {MAUVE}M87 accretion disk, pinned above your shell{r}", b=b, g=g, r=r, MAUVE=MAUVE);
     println!("    {b}{g}-t, --t <secs>{r}            {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo <name>{r}              switch logo {s}(arch|ubuntu|debian|fedora|nix|auto…){r}", b=b, g=g, r=r, s=s);
@@ -1999,7 +2079,8 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}--list-schemes{r}            {s}show every colour scheme as a swatch strip{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo ?{r}                  {s}same as --list-logos{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--logo-file <path>{r}         {s}ASCII art or image (kitty protocol){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--preset <n>{r}               {s}full|minimal|hacker|science{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--preset <name|file>{r}       {s}load a JSONC preset (see --list-presets){r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}--list-presets{r}            {s}list JSONC presets shipped with arcfetch{r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--full{r}                     {s}show all fields (overrides minimal default){r}", b=b, g=g, r=r, s=s);
     println!("    {b}{g}--accent <color>{r}           name | #RRGGBB | rgb(r,g,b) | colorN", b=b, g=g, r=r);
     println!("    {b}{g}--color <spec>{r}             logo colour: name | hex | random", b=b, g=g, r=r);
@@ -3002,7 +3083,13 @@ fn main() {
                             _ => {}
                         }
                     }
-                    out.push(bytes[i] as char);
+                    if bytes[i] != b'$' {
+                        let start = i;
+                        while i < bytes.len() && bytes[i] != b'$' { i += 1; }
+                        out.push_str(&line[start..i]);
+                        continue;
+                    }
+                    out.push('$');
                     i += 1;
                 }
                 out

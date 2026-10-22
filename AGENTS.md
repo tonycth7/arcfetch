@@ -18,7 +18,7 @@ No CI or linter/formatter config. `cargo test` runs a few unit tests (config com
 - `src/info.rs` — 25+ collectors reading `/proc`, `/sys`, env vars, CPUID, `libc::sysinfo`/`libc::uname`; gates all optional collectors behind `Show` flags
 - `src/modules.rs` — opt-in collectors (datetime, dns, host, chassis, bootmgr, cpu cache, login manager, brightness, terminal, terminal size/theme, cursor, cpu usage, disk/net io, physmem, VRAM, btrfs, wifi, users, wallpaper, media, opengl, vulkan, codec, bluetooth, camera, mouse, keyboard, TPM, physical disks, top processes, monitor/EDID)
 - `src/net.rs` — std-only HTTP/1.0 client (64 KiB cap, timeouts) for `public_ip` / `weather`
-- `src/config.rs` — Catppuccin Mocha palette, hand-rolled TOML subset parser (no `toml` crate), `config_path()` resolves `$XDG_CONFIG_HOME/arcfetch/config.toml`; `Show::enable_all` / `clear_fields` / `select` back `--all` and `-s`; `Layout` holds box style/colour, indent and logo/info gap
+- `src/config.rs` — Catppuccin palette, hand-rolled zero-dependency TOML subset parser (no `toml` crate) and the shared ordered-module render model; `config_path()` resolves `$XDG_CONFIG_HOME/arcfetch/config.toml`, JSONC via `config.jsonc`/`--config <file.jsonc>`; supports `modules = [...]`, `[[modules]]`, `[[custom]]`, `[overrides.<module>]` (`label`/`value`/`command`), `[display]` (`separator`, `labels`, `key_width`, `bar_width`) and `info_style` presets (`classic`, `minimal`, `boxed`, `sections`, `tree`, `iconic`, `card`, `chips`); `Show::enable_all` / `clear_fields` / `select` back `--all` and `-s`; `Layout` holds box style/colour, indent and logo/info gap
 - `src/pkgs.rs` — pacman/dpkg/rpm/nix/apk/portage/xbps/bedrock count; contains hand-rolled read-only SQLite B-tree reader
 - `src/cache.rs` — two-tier: `/dev/shm/arcfetch-<uid>/` (same-boot, private) + `$XDG_CACHE_HOME/arcfetch/` or `~/.cache/arcfetch/` (persistent, TTL-gated); writes are temp+rename; a fresh persistent hit is promoted into tmpfs for the rest of the boot
 - `src/logos.rs` — 40+ distro logo constants; `from_name`, `all_names`, `detect(id, id_like)`
@@ -34,7 +34,10 @@ No CI or linter/formatter config. `cargo test` runs a few unit tests (config com
 - `--t 0` means infinite; `--t N` means N seconds (background animations stop with `--stop`, not Ctrl+C)
 - Config file at `~/.config/arcfetch/config.toml`, auto-generated via `arcfetch --config`; `[layout]` sets `box`, `box_color`, `indent` and `gap`, `[logo] color` gives a uniform logo colour
 - `ARCFETCH_ACCENT` env var overrides accent color
-- `--preset science` picks random logo + physicist quote from `/proc/uptime` seed
+- `--preset <name|file>` loads a JSONC preset from `presets/examples` (or a path); `--list-presets` lists them
+- TOML rows: `modules = [...]` sets order, `[[modules]]` / `[[custom]]` give per-row control, `[overrides.<module>]` changes a built-in row, `info_style` picks a starting layout. `info_style` is scanned before the TOML pass, so an explicit `modules`/`[colors]`/`[layout]` still wins
+- Only when `cfg.modules` is set does rendering switch from `build_info` to `render_modules`; the default path is untouched, and command rows use `command_timeout` (0.1–10 s)
+- UTF-8 rule: never build display strings with `byte as char`; copy whole UTF-8 runs (`format_template`, JSONC strings, logo `$1` colorizing). Box drawing and Nerd Font icons otherwise turn into mojibake
 - Kitty image protocol supported for `--logo-file <png|jpg|gif>`
 - Only one display mode at a time (`--blackhole`, `--cosmic`, `--quantum`, `--mandelbrot`, `--animate` are mutually exclusive)
 - `--animate [shimmer|scanline|boot|frames]` renders a live logo using `logos::animate_line` + `logos::color_wave_phase`; animated logos (`atom`, `dna`, `arcreactor`) cycle via `logos::from_name_frame`
