@@ -39,11 +39,11 @@ pub fn run(out_lines: &[String], _logo_name: &str, _cfg: &Config, args: &super::
     const ROWS: usize = 19;
     const COLS: usize = 31;
     const STARS: usize = 40;
-    const FRAME_MS: u64 = 120;
+    const FRAME_MS: u64 = 60;
 
     let moon = moon_phase();
     let max_frames: Option<u64> = match args.duration {
-        None    => Some(48),
+        None    => Some(96), // ≈6 s at 60 ms/frame
         Some(0) => None,
         Some(n) => Some(n * 1000 / FRAME_MS),
     };
@@ -71,7 +71,8 @@ pub fn run(out_lines: &[String], _logo_name: &str, _cfg: &Config, args: &super::
 
     let out     = std::io::stdout();
     let mut buf = out.lock();
-    write!(buf, "\x1b[?25l").ok();
+    // Full-screen immersive scene: the shell's scrollback is restored on exit.
+    super::screen_enter(&mut buf);
     unsafe { libc::signal(libc::SIGINT, super::sigint_handler as *const () as libc::sighandler_t); }
 
     let mut frame = 0u64;
@@ -131,7 +132,5 @@ pub fn run(out_lines: &[String], _logo_name: &str, _cfg: &Config, args: &super::
 
         thread::sleep(Duration::from_millis(FRAME_MS));
     }
-    write!(buf, "\x1b[?25h").ok();
-    writeln!(buf).ok();
-    buf.flush().ok();
+    super::screen_leave(&mut buf);
 }

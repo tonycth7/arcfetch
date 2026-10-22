@@ -22,7 +22,8 @@ No CI or linter/formatter config. `cargo test` runs the colour-scheme unit tests
 - `src/scheme.rs` — canonical upstream palettes for all 14 schemes, semantic role mappings, aliases and `auto` selection; single source of truth for `--scheme` and `--list-schemes`
 - `src/pkgs.rs` — pacman/dpkg/rpm/nix/apk/portage/xbps/bedrock count; contains hand-rolled read-only SQLite B-tree reader
 - `src/cache.rs` — two-tier: `/dev/shm/arcfetch/` (same-boot) + `~/.cache/arcfetch/` (persistent, TTL-gated); a fresh persistent hit is promoted into tmpfs for the rest of the boot
-- `src/logos.rs` — 40+ distro logo constants; `from_name`, `all_names`, `detect(id, id_like)`
+- `src/logos.rs` — 40+ distro logo constants, keyframe logos and the procedural `aurora`; `frame`, `animate_line`, `color_wave_phase`, `all_names`, `detect(id, id_like)`
+- `src/anim.rs` — user frame animations from `~/.config/arcfetch/animations/<name>/` (sorted `*.txt`/`*.ansi`, used verbatim so animfetch `$` art survives)
 - `src/mandelbrot.rs`, `src/cosmic.rs` — display modes
 
 ## Key quirks
@@ -31,18 +32,21 @@ No CI or linter/formatter config. `cargo test` runs the colour-scheme unit tests
 - GPU probe walks `/sys/class/drm`, falls back to NVIDIA `/proc/driver/nvidia/gpus`, then PCI
 - Package DB uses hand-rolled SQLite parser — no `rusqlite` dep
 - Cache TTL: GPU 24h, pkgs 1h, CPU freq 24h
-- Animations (`--blackhole`, `--quantum`, `--cosmic`) require a TTY; auto-disable on pipe
+- Animations (`--blackhole`, `--quantum`, `--cosmic`, `--animate`, `--animation`) require a TTY; auto-disable on pipe
 - `--t 0` means infinite; `--t N` means N seconds (background animations stop with `--stop`, not Ctrl+C)
 - Config file at `~/.config/arcfetch/config.toml`, auto-generated via `arcfetch --config`
 - `ARCFETCH_ACCENT` env var overrides accent color
 - `--preset science` picks random logo + physicist quote from `/proc/uptime` seed
 - Kitty image protocol supported for `--logo-file <png|jpg|gif>`
 - Only one display mode at a time (`--blackhole`, `--cosmic`, `--quantum`, `--mandelbrot`, `--animate` are mutually exclusive)
-- `--animate [shimmer|scanline|boot|dither|frames]` renders a live logo using `logos::animate_line` + `logos::color_wave_phase`; keyframe logos (`atom`, `dna`, `arcreactor`) cycle via `logos::frame`, while `orbit` and `aurora` are generated per tick (34×15 grid, no frame tables)
-- Normal mode plays a short self-overwriting intro on a TTY (`[animation] enabled/effect/intro_ms/wave`, default 700 ms `none`); animated logos always play. `--no-animate` skips it. Piped output stays static. `orbit`/`aurora` are procedural; `dither` dissolves solid `█` blocks with a Bayer threshold and rebuilds them
+- `--animate [shimmer|scanline|boot|frames]` pins a compact live logo using `logos::animate_line`; keyframe logos (`atom`, `dna`, `arcreactor`) cycle via `logos::frame`, while `aurora` is generated per tick (34×15 grid, no frame table). The pinned painter runs at ~30 fps and skips unchanged rows.
+- Animated art is painted by a vertical gradient, animfetch-style: plain lines get one escape per row from `[animation] gradient` (default animfetch's five stops), and `gradient_scroll` moves the ramp. Lines carrying authored ANSI keep their own colours (`art_color = "own"`, the default); `art_color = "theme"` strips them so the gradient wins. `gradient = []` falls back to the old `logos::color_wave_phase` + `$1..$9` palette wave.
+- `--animation <name|path>` plays user frames from `~/.config/arcfetch/animations/<name>/` and implies `--animate`; `--list-animations` lists built-in and custom sets. Frames are `*.txt`/`*.ansi` in filename order, padded to a common width.
+- Normal mode plays a short self-overwriting intro on a TTY (`[animation] enabled/effect/intro_ms/wave/gradient`, default 700 ms `none`); animated logos always play. `--no-animate` skips it. Piped output stays static.
 - `--list-logos` / `--logo ?` prints every built-in name grouped with a one-line preview and `[animated]` marker
 - `--list-schemes` prints every scheme with its upstream variant and semantic role swatches (bg, fg, accent, red/green/yellow/blue/purple, …) plus exact hex; it wraps to terminal width and down-samples when truecolor is unavailable
 - `--blackhole` uses truecolor temperature gradients, Doppler beaming, turbulence and a lensed photon ring
+- `--cosmic` is a distinct full-screen immersive scene on the alternate screen, not a pinned pane
 - `--animate` / `--blackhole` pin the **full fetch** above the **real shell**: art on the left, info on the right, with the same 2-space indent and gap as one-shot output. The terminal's scroll region (DECSTBM) is set below the pane and origin mode (DECOM) is enabled, so the prompt, aliases, history and starship keep working and all command output scrolls under the fetch. The painter forks into its own process group (same session), returns immediately, pauses while a foreground command owns the terminal (`tcgetpgrp`), drops origin mode for that command so TUIs (fzf, vim, less) can use absolute cursor addressing (full-screen apps reset the region themselves), then restores the region/origin and repaints when the shell returns. It also reasserts the region on resize and stores its PID per tty in `$XDG_RUNTIME_DIR/arcfetch-<tty>.pid`.
 - `--stop` kills the pin on the current terminal, clears the fetch pane and resets DECOM/DECSTBM (and cleans the old global `arcfetch-anim.pid`); `--t N` bounds one (`0`/none = until stopped) and leaves the last frame as a static picture. Pinning clears the screen (scrollback is kept). `--foreground` uses the alternate screen (`?1049h`/`?1049l`) for the old blocking full-screen version.
 - Colour specs accept catppuccin names, `black`/`white`/`gray`/`orange`/`purple`/`cyan`, `ansi_*`, `#RGB`, `#RRGGBB`, `rgb(r,g,b)`, `colorN`/`N` (xterm-256)

@@ -297,6 +297,16 @@ pub fn apply_depth(c: &mut Colors, depth: ColorDepth) {
     for l in c.logo.iter_mut() { *l = d(l); }
 }
 
+/// Down-sample the animation gradient with the rest of the palette.
+pub fn apply_depth_animation(a: &mut Animation, depth: ColorDepth) {
+    if depth == ColorDepth::True {
+        return;
+    }
+    for g in &mut a.gradient {
+        *g = downgrade(g, depth);
+    }
+}
+
 /// Byte length of a `38;2;…`/`38;5;…` SGR sequence starting at `s[i]`, if any.
 fn sgr_colour_at(s: &str, i: usize) -> Option<usize> {
     let rest = &s[i..];
@@ -390,6 +400,111 @@ impl Colors {
     pub fn label(&self, idx: usize) -> &str {
         &self.labels[idx % 7]
     }
+}
+
+/// A vertical colour ramp, sampled by row. Stops are stored as RGB so they
+/// can be interpolated; the renderer asks for ANSI strings once.
+#[derive(Clone, Debug, Default)]
+pub struct Gradient {
+    stops: Vec<(u8, u8, u8)>,
+}
+
+impl Gradient {
+    pub fn new(stops: Vec<(u8, u8, u8)>) -> Self {
+        Self { stops }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stops.is_empty()
+    }
+
+    /// Sample at `t` in `0.0..=1.0`, interpolating between adjacent stops.
+    pub fn sample(&self, t: f32) -> Option<(u8, u8, u8)> {
+        match self.stops.len() {
+            0 => None,
+            1 => Some(self.stops[0]),
+            n => {
+                let pos = t.clamp(0.0, 1.0) * (n - 1) as f32;
+                let i = (pos.floor() as usize).min(n - 2);
+                let a = self.stops[i];
+                let b = self.stops[i + 1];
+                let f = pos - i as f32;
+                let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+                Some((mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2)))
+            }
+        }
+    }
+
+    /// A dense set of ANSI foregrounds, so the renderer only has to pick one.
+    pub fn ansi(&self, samples: usize) -> Vec<String> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let n = samples.max(2);
+        (0..n)
+            .map(|i| {
+                let (r, g, b) = self.sample(i as f32 / (n - 1) as f32).unwrap();
+                format!("\x1b[38;2;{r};{g};{b}m")
+            })
+            .collect()
+    }
+}
+
+/// Parse `#rgb` or `#rrggbb` for a gradient stop.
+fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim().trim_matches('"').trim_matches('\'');
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    match hex.len() {
+        3 => {
+            let f = |i: usize| hex_byte(&hex[i..i + 1]).map(|v| v.saturating_mul(17));
+            Some((f(0)?, f(1)?, f(2)?))
+        }
+        6 => Some((
+            hex_byte(&hex[0..2])?,
+            hex_byte(&hex[2..4])?,
+            hex_byte(&hex[4..6])?,
+        )),
+        _ => None,
+    }
+}
+
+fn art_color_is_theme(val: &str) -> bool {
+    val.trim_matches('"').trim_matches('\'').eq_ignore_ascii_case("theme")
+}
+
+/// Parse a single-line array of hex colours. Bad entries are skipped.
+fn parse_gradient(val: &str) -> Option<Gradient> {
+    let inner = val.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let stops = inner
+        .split(',')
+        .filter_map(parse_hex_rgb)
+        .collect();
+    Some(Gradient::new(stops))
+}
+
+/// Expand the `$1..$9`, `$R` and `$$` colour slots used by custom logos and
+/// animation frames. `chars` keeps multi-byte block art intact.
+pub fn expand_logo_slots(line: &str, logo: &[String; 9]) -> String {
+    let mut out = String::with_capacity(line.len() + 32);
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            if let Some(&next) = chars.peek() {
+                if ('1'..='9').contains(&next) {
+                    out.push_str(&logo[(next as u8 - b'1') as usize]);
+                    chars.next();
+                    continue;
+                }
+                match next {
+                    'R' => { out.push_str(RESET); chars.next(); continue; }
+                    '$' => { out.push('$'); chars.next(); continue; }
+                    _ => {}
+                }
+            }
+        }
+        out.push(ch);
+    }
+    out
 }
 
 impl Default for Colors {
@@ -754,6 +869,12 @@ pub struct Animation {
     pub intro_ms: u64,
     /// Colour-wave the logo while animating.
     pub wave:     bool,
+    /// Vertical gradient for plain art. Empty falls back to the logo palette.
+    pub gradient: Vec<String>,
+    /// Let the gradient crawl through the art as it animates.
+    pub gradient_scroll: bool,
+    /// Keep a frame's own ANSI colours; `false` forces the gradient on it.
+    pub art_color: bool,
 }
 
 impl Default for Animation {
@@ -763,6 +884,17 @@ impl Default for Animation {
             effect:   "none".into(),
             intro_ms: 700,
             wave:     true,
+            // animfetch's default ramp. Authored ANSI still wins.
+            gradient: Gradient::new(vec![
+                (0xf5, 0xc9, 0x5c),
+                (0xf1, 0x7f, 0x5b),
+                (0xf4, 0x5c, 0x82),
+                (0xb0, 0x7c, 0xf4),
+                (0x74, 0xa4, 0xff),
+            ])
+            .ansi(32),
+            gradient_scroll: false,
+            art_color: true,
         }
     }
 }
@@ -790,26 +922,39 @@ pub fn config_path() -> String {
 }
 
 // ── Simple TOML-subset parser ────────────────────────────
-// Handles [section], key = value, # comments.
-// No arrays, no multiline — exactly what we need, zero deps.
+// Handles [section], key = value, # comments and single-line arrays.
+// No multiline — exactly what we need, zero deps.
 
-/// Strip a trailing `# comment` without eating `#RRGGBB` colour values.
+/// Strip a trailing `# comment` without eating `#RRGGBB` values. Quotes and
+/// arrays are respected, so `gradient = ["#f5c95c", "#f17f5b"] # note` works.
 fn strip_comment(line: &str) -> &str {
-    match line.find('=') {
-        Some(eq) => {
-            let rest = &line[eq + 1..];
-            let value_start = eq + 1 + (rest.len() - rest.trim_start().len());
-            if line[value_start..].starts_with('#') {
-                // the first '#' begins a hex value; only a second '#' is a comment
-                if let Some(p) = line[value_start + 1..].find('#') {
-                    return &line[..value_start + 1 + p];
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' if quote == Some(bytes[i]) => quote = None,
+            b'"' | b'\'' if quote.is_none() => quote = Some(bytes[i]),
+            b'#' if quote.is_none() => {
+                let hex = line[i + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .count();
+                let before = line[..i].trim_end();
+                let is_value = before.ends_with('=')
+                    || before.ends_with('[')
+                    || before.ends_with(',');
+                if is_value && matches!(hex, 3 | 6) {
+                    i += 1 + hex;
+                    continue;
                 }
-                return line;
+                return &line[..i];
             }
-            line.find('#').map(|p| &line[..p]).unwrap_or(line)
+            _ => {}
         }
-        None => line.find('#').map(|p| &line[..p]).unwrap_or(line),
+        i += 1;
     }
+    line
 }
 
 pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
@@ -920,6 +1065,13 @@ pub fn load(cli_accent: Option<&str>, cli_preset: Option<&str>) -> Config {
                         "effect"   => animation.effect   = val.to_string(),
                         "intro_ms" => animation.intro_ms = val.parse().unwrap_or(700),
                         "wave"     => animation.wave     = on,
+                        "gradient" => {
+                            if let Some(g) = parse_gradient(val) {
+                                animation.gradient = g.ansi(32);
+                            }
+                        }
+                        "gradient_scroll" => animation.gradient_scroll = on,
+                        "art_color" => animation.art_color = !art_color_is_theme(val),
                         _ => {}
                     }
                 }
@@ -993,5 +1145,36 @@ mod tests {
         let sw = crate::scheme::swatch((255, 0, 0));
         assert_eq!(downgrade_str(&sw, ColorDepth::Ansi256), "\x1b[38;5;196m██\x1b[0m");
         assert_eq!(downgrade_str(&sw, ColorDepth::Ansi16), "\x1b[91m██\x1b[0m");
+    }
+
+    #[test]
+    fn logo_slots_expand_without_breaking_unicode() {
+        let mut logo = std::array::from_fn(|_| String::new());
+        logo[0] = "<red>".into();
+        assert_eq!(expand_logo_slots("$1█ $$ $R", &logo), "<red>█ $ \x1b[0m");
+    }
+
+    #[test]
+    fn gradient_keeps_quoted_hex_and_skips_bad_stops() {
+        let line = r##"gradient = ["#f5c95c", "#f17f5b", "nope"] # comment"##;
+        let line = strip_comment(line).trim();
+        assert_eq!(line, r##"gradient = ["#f5c95c", "#f17f5b", "nope"]"##);
+        let val = line.split_once('=').unwrap().1.trim();
+        let g = parse_gradient(val).unwrap();
+        assert_eq!(g.sample(0.0), Some((0xf5, 0xc9, 0x5c)));
+        assert_eq!(g.sample(1.0), Some((0xf1, 0x7f, 0x5b)));
+        assert_eq!(g.ansi(2).len(), 2);
+    }
+
+    #[test]
+    fn art_color_theme_accepts_quotes() {
+        assert!(art_color_is_theme("\"theme\""));
+        assert!(!art_color_is_theme("\"own\""));
+    }
+
+    #[test]
+    fn unquoted_hex_survives_comment_stripping() {
+        assert_eq!(strip_comment("accent = #89b4fa # blue"), "accent = #89b4fa ");
+        assert_eq!(strip_comment("# whole-line comment"), "");
     }
 }

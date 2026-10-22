@@ -119,7 +119,6 @@ arcfetch --logo tux               # linux penguin
 arcfetch --logo nix               # nixos snowflake
 arcfetch --logo gentoo            # gentoo G
 arcfetch --logo pi                # raspberry pi
-arcfetch --logo orbit             # ringed planet
 arcfetch --logo aurora            # northern lights
 arcfetch --logo auto              # detect from /etc/os-release
 arcfetch --logo custom            # ~/.config/arcfetch/logo.txt
@@ -136,13 +135,60 @@ arcfetch --blackhole --t 0        # infinite loop
 arcfetch --mandelbrot [iter]      # mandelbrot fractal as logo
 arcfetch --quantum                # wave-function collapse
 arcfetch --quantum --t 5          # 5s quantum animation
-arcfetch --cosmic                 # starfield + moon phase
-arcfetch --cosmic --t 10          # 10s cosmic animation
+arcfetch --cosmic                 # full-screen starfield + moon phase
+arcfetch --cosmic --t 10          # 10s cosmic scene
 arcfetch --animate --logo aurora  # pinned live northern lights
-arcfetch --animate dither --logo orbit  # dither dissolve
+arcfetch --animate shimmer        # pinned logo with shimmer
+arcfetch --animation pulse        # pinned frames from your config
 ```
 
-mutually exclusive. pick one.
+`--animate` pins a compact logo pane above the shell. `--cosmic` is a
+full-screen scene on the alternate screen, so the two do not compete. Display
+modes are mutually exclusive; `--animation` implies `--animate`.
+
+---
+
+## make your own animation
+
+No compiler or rebuild needed. Put one text file per frame in
+`~/.config/arcfetch/animations/<name>/` and play it:
+
+```bash
+mkdir -p ~/.config/arcfetch/animations/pulse
+cat > ~/.config/arcfetch/animations/pulse/01.txt <<'EOF'
+   ▄▄▄▄▄
+  █  ●  █
+   ▀▀▀▀▀
+EOF
+cat > ~/.config/arcfetch/animations/pulse/02.txt <<'EOF'
+   ▄▄▄▄▄
+  █  ○  █
+   ▀▀▀▀▀
+EOF
+
+arcfetch --animation pulse       # pinned above the shell
+arcfetch --animation ./my-frames # or any directory path
+arcfetch --list-animations       # show names and frame counts
+```
+
+Frames play in filename order (`01.txt`, `02.txt`, …), so zero-pad the names.
+Wide frames are padded to the widest line; keep the art the same size for a
+steady layout. Frames are used verbatim, so animfetch-style art containing `$`,
+`$$` or `$R` works as drawn; ANSI colours are kept as they are. Art without its
+own colour gets the vertical gradient. The animation is rendered in the same
+pane as `--animate`, so `--animate shimmer --animation pulse` adds a glyph
+effect to plain frames (authored-colour frames are passed through untouched).
+
+The gradient is animfetch's default ramp, independent of `--scheme`. Override it
+with any hex colours:
+
+```toml
+[animation]
+gradient = ["#f5c95c", "#f17f5b", "#f45c82", "#b07cf4", "#74a4ff"]
+gradient_scroll = false  # true = let the ramp crawl through the art
+art_color = "own"        # "theme" ignores frame ANSI and forces the gradient
+# gradient = []          # fall back to the scheme's logo palette wave
+```
 
 ---
 
@@ -254,8 +300,11 @@ arcfetch --preset science          # physicist quote even in minimal config
      --blackhole          m87 accretion disk animation
      --mandelbrot [iter]  mandelbrot fractal (default 64)
      --quantum            wave-function collapse
-     --cosmic             starfield + moon
-     --t <secs>           0=forever, n=n secs (blackhole, quantum, cosmic)
+     --cosmic             full-screen starfield + moon
+     --animate [effect]   pin a live logo (shimmer | scanline | boot | frames)
+     --animation <name>   play frames from ~/.config/arcfetch/animations/<name>/
+     --list-animations    built-in and custom frame sets
+     --t <secs>           0=forever, n=n secs (blackhole, cosmic, animate)
 ```
 
 ---
@@ -309,9 +358,10 @@ everything in `src/`:
 | `pkgs.rs`         | pacman, dpkg, rpm, nix, apk, portage  |
 | `cache.rs`        | `/dev/shm` + `~/.cache` with ttl      |
 | `config.rs`       | catppuccin palette + toml parser      |
-| `logos.rs`        | 10+ logos + auto-detect + custom loader |
+| `logos.rs`        | 10+ logos + procedural aurora + effects |
+| `anim.rs`         | user animation frames from the config dir |
 | `mandelbrot.rs`   | mandelbrot set in rust                |
-| `cosmic.rs`       | starfield + moon phase                |
+| `cosmic.rs`       | full-screen starfield + moon phase    |
 | `flake.nix`       | nix flake for reproducible builds     |
 
 ---
