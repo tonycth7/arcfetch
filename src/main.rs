@@ -933,11 +933,13 @@ fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut 
             let value = raw.trim();
             if value.is_empty() { return Vec::new(); }
             let key = m.key.clone().unwrap_or_default();
+            let key = format!("{icon}{key}");
+            let key = format_template(&key, "command", &key, value, icon, si, cfg, key_color);
             let value = match &m.format {
                 Some(f) => format_template(f, "command", &key, value, icon, si, cfg, key_color),
                 None => value.to_string(),
             };
-            let row = row_cfg(&format!("{icon}{key}"), &value, key_color,
+            let row = row_cfg(&key, &value, key_color,
                 m.output_color.as_deref().unwrap_or(&cfg.colors.values), m, cfg);
             *li += 1;
             return row.split('\n').map(String::from).collect();
@@ -949,6 +951,7 @@ fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut 
     if value.is_empty() { return Vec::new(); }
     let key = m.key.clone().unwrap_or(default_key);
     let key = format!("{icon}{key}");
+    let key = format_template(&key, &kind, &key, &value, icon, si, cfg, key_color);
     let value = match &m.format {
         Some(f) => format_template(f, &kind, &key, &value, icon, si, cfg, key_color),
         None => value,
@@ -965,7 +968,7 @@ fn row_cfg(key: &str, val: &str, key_color: &str, val_color: &str, m: &config::M
         Some(c) => format!("{c}{sep}{RESET}"),
         None => sep.to_string(),
     };
-    let width = m.key_width.or(cfg.display.key_width).unwrap_or(9);
+    let width = if key.contains('\x1b') { 0 } else { m.key_width.or(cfg.display.key_width).unwrap_or(9) };
     let pad = m.padding_left + cfg.display.key_padding_left;
     let mut s = String::with_capacity(key.len() + val.len() + 32);
     for _ in 0..pad { s.push(' '); }
