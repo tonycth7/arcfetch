@@ -119,6 +119,8 @@ arcfetch --logo tux               # linux penguin
 arcfetch --logo nix               # nixos snowflake
 arcfetch --logo gentoo            # gentoo G
 arcfetch --logo pi                # raspberry pi
+arcfetch --logo orbit             # ringed planet
+arcfetch --logo aurora            # northern lights
 arcfetch --logo auto              # detect from /etc/os-release
 arcfetch --logo custom            # ~/.config/arcfetch/logo.txt
 arcfetch --logo-file <path>       # any ascii art or image (kitty protocol)
@@ -136,6 +138,8 @@ arcfetch --quantum                # wave-function collapse
 arcfetch --quantum --t 5          # 5s quantum animation
 arcfetch --cosmic                 # starfield + moon phase
 arcfetch --cosmic --t 10          # 10s cosmic animation
+arcfetch --animate --logo aurora  # pinned live northern lights
+arcfetch --animate dither --logo orbit  # dither dissolve
 ```
 
 mutually exclusive. pick one.

@@ -38,8 +38,8 @@ No CI or linter/formatter config. `cargo test` runs the colour-scheme unit tests
 - `--preset science` picks random logo + physicist quote from `/proc/uptime` seed
 - Kitty image protocol supported for `--logo-file <png|jpg|gif>`
 - Only one display mode at a time (`--blackhole`, `--cosmic`, `--quantum`, `--mandelbrot`, `--animate` are mutually exclusive)
-- `--animate [shimmer|scanline|boot|frames]` renders a live logo using `logos::animate_line` + `logos::color_wave_phase`; animated logos (`atom`, `dna`, `arcreactor`) cycle via `logos::from_name_frame`
-- Normal mode plays a short self-overwriting intro on a TTY (`[animation] enabled/effect/intro_ms/wave`, default 700 ms `none`); animated logos always play. `--no-animate` skips it. Piped output stays static
+- `--animate [shimmer|scanline|boot|dither|frames]` renders a live logo using `logos::animate_line` + `logos::color_wave_phase`; keyframe logos (`atom`, `dna`, `arcreactor`) cycle via `logos::frame`, while `orbit` and `aurora` are generated per tick (34×15 grid, no frame tables)
+- Normal mode plays a short self-overwriting intro on a TTY (`[animation] enabled/effect/intro_ms/wave`, default 700 ms `none`); animated logos always play. `--no-animate` skips it. Piped output stays static. `orbit`/`aurora` are procedural; `dither` dissolves solid `█` blocks with a Bayer threshold and rebuilds them
 - `--list-logos` / `--logo ?` prints every built-in name grouped with a one-line preview and `[animated]` marker
 - `--list-schemes` prints every scheme with its upstream variant and semantic role swatches (bg, fg, accent, red/green/yellow/blue/purple, …) plus exact hex; it wraps to terminal width and down-samples when truecolor is unavailable
 - `--blackhole` uses truecolor temperature gradients, Doppler beaming, turbulence and a lensed photon ring

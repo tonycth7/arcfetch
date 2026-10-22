@@ -249,11 +249,13 @@ fn detect_auto_logo(si: &info::SysInfo) -> String {
 fn parse_effect(s: &str) -> logos::AnimEffect {
     match s.trim().to_ascii_lowercase().as_str() {
         // `frames`/`wave` add no glyph distortion — they let the native
-        // keyframes (atom/dna/arcreactor) and the colour wave speak for themselves.
+        // keyframes (atom/dna/arcreactor) and the generated orbit/aurora art
+        // speak for themselves.
         "none" | "off" | "frames" | "keyframes" | "wave" | "rainbow"
                                          => logos::AnimEffect::None,
         "scanline" | "scan" | "crt"      => logos::AnimEffect::Scanline,
         "boot" | "bootreveal" | "reveal" => logos::AnimEffect::BootReveal,
+        "dither" | "dissolve" | "fade"   => logos::AnimEffect::Dither,
         _                                => logos::AnimEffect::Shimmer,
     }
 }
@@ -286,7 +288,7 @@ fn wave_text(line: &str, row: usize, tick: usize, palette: &[String]) -> String 
 }
 
 /// Short, self-overwriting intro played before the normal static render.
-/// Animated logos (atom/dna/arcreactor) cycle frames; others can shimmer.
+/// Animated logos cycle frames; others can shimmer.
 fn run_intro(
     info: &[String],
     logo_name: &str,
@@ -298,7 +300,7 @@ fn run_intro(
     const FRAME_MS: u64 = 70;
 
     let frames = (anim.intro_ms / FRAME_MS).clamp(1, 24);
-    let animated_logo = matches!(logo_name, "atom" | "dna" | "arcreactor");
+    let animated_logo = logos::is_animated(logo_name);
     let effect = if animated_logo {
         logos::AnimEffect::None
     } else {
@@ -319,8 +321,7 @@ fn run_intro(
     let mut prev_nl = 0usize;
     for tick in 0..frames {
         if !RUNNING.load(Ordering::Relaxed) { break; }
-        let base: Vec<String> = logos::from_name_frame(logo_name, (tick / 3) as usize)
-            .iter().map(|s| (*s).to_string()).collect();
+        let base: Vec<String> = logos::frame(logo_name, tick as usize, 3);
         let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
         let logo_w = widths.iter().max().copied().unwrap_or(36);
         let rows = base.len().max(info.len());
@@ -402,8 +403,7 @@ fn run_animate(
         // current logo frame: animated logos cycle, everything else stays put
         let base: Vec<String> = match custom {
             Some(c) => c.clone(),
-            None => logos::from_name_frame(logo_name, t / 6)
-                .iter().map(|s| (*s).to_string()).collect(),
+            None => logos::frame(logo_name, t, 6),
         };
         let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
         let logo_w = widths.iter().max().copied().unwrap_or(36);
@@ -1327,57 +1327,168 @@ fn print_json(si: &info::SysInfo, cfg: &Config) {
 
 fn print_config_help(cfg_path: &str) {
     let (b, r, s, g) = (BOLD, RESET, SUBTEXT1, GREEN);
+    let field = |key: &str, val: &str, desc: &str| {
+        println!("  {g}{key:<14}{r} = {val:<10} {s}# {desc}{r}",
+            g = g, r = r, key = key, val = val, s = s, desc = desc);
+    };
+
     println!();
     println!("  {b}{PEACH}config file{r}  {s}{cfg_path}{r}", b=b, PEACH=PEACH, r=r, s=s, cfg_path=cfg_path);
+    println!("  {s}TOML subset: [section] headers, key = value, # comments. Every key is optional.{r}", s=s, r=r);
+    println!("  {s}Unknown keys/sections are ignored. Booleans: true/yes/1/on enable; anything else disables.{r}", s=s, r=r);
+    println!("  {s}Relative paths are used from the current directory; ~ is expanded for logo files.{r}", s=s, r=r);
     println!();
-    println!("  {b}{BLUE}[colors]{r}", b=b, BLUE=BLUE, r=r);
-    println!("  {s}# 7 label slots (cycle through fields), accent, values, sep, bar{r}", s=s, r=r);
-    println!("  {g}scheme{r}   = auto       {s}# auto|{} (auto = light/dark from the terminal){r}", config::SCHEMES.join("|"), g=g, r=r, s=s);
-    println!("  {s}# values: catppuccin names | black/white/gray/orange | ansi_* | #RGB | #RRGGBB | rgb(r,g,b) | color0..255{r}", s=s, r=r);
-    println!("  {g}accent{r}   = blue       {s}# logo + hostname color{r}", g=g, r=r, s=s);
-    println!("  {g}username{r} = mauve      {s}# user part of user@host{r}", g=g, r=r, s=s);
-    println!("  {g}hostname{r} = blue", g=g, r=r);
-    println!("  {g}c1{r}       = blue       {s}# field label 1 (os, term, disk...){r}", g=g, r=r, s=s);
-    println!("  {g}c2{r}       = sapphire", g=g, r=r);
-    println!("  {g}c3{r}       = sky", g=g, r=r);
-    println!("  {g}c4{r}       = teal", g=g, r=r);
-    println!("  {g}c5{r}       = green", g=g, r=r);
-    println!("  {g}c6{r}       = yellow", g=g, r=r);
-    println!("  {g}c7{r}       = peach      {s}# repeats if more than 7 visible fields{r}", g=g, r=r, s=s);
-    println!("  {g}values{r}   = subtext1   {s}# all field values{r}", g=g, r=r, s=s);
-    println!("  {g}sep{r}      = overlay0   {s}# separator ────{r}", g=g, r=r, s=s);
-    println!("  {g}bar{r}      = blue       {s}# memory bar fill{r}", g=g, r=r, s=s);
-    println!("  {s}  logo1..logo9{r}  {s}custom logo inline colors (default: c1..c7 + accent + text){r}", s=s, r=r);
+
+    println!("  {b}{BLUE}[colors]{r}  {s}keys apply in file order — put scheme first if you use it{r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("scheme", "mocha", "palette preset; default mocha");
+    println!("  {s}              values: auto|mocha|latte|frappe|macchiato|nord|dracula|gruvbox|tokyo-night{r}", s=s, r=r);
+    println!("  {s}                      solarized-dark|rose-pine|onedark|kanagawa|everforest|ayu{r}", s=s, r=r);
+    println!("  {s}              auto = latte on a light terminal, mocha on dark/unknown; aliases: catppuccin,{r}", s=s, r=r);
+    println!("  {s}              tokyonight, atom, gruvbox-dark, solarized, rosepine, ayu-dark, …{r}", s=s, r=r);
+    field("accent", "blue", "default logo colour, header rule and box border");
+    field("username", "mauve", "user part of user@host");
+    field("hostname", "blue", "host part of user@host");
+    field("c1", "blue", "field-label colour 1");
+    field("c2", "sapphire", "field-label colour 2");
+    field("c3", "sky", "field-label colour 3");
+    field("c4", "teal", "field-label colour 4");
+    field("c5", "green", "field-label colour 5");
+    field("c6", "yellow", "field-label colour 6");
+    field("c7", "peach", "field-label colour 7; c1..c7 repeat after 7 visible fields");
+    field("values", "subtext1", "all field values");
+    field("sep", "overlay0", "parsed but not used by the current renderer");
+    field("bar", "blue", "memory bar fill");
+    field("logo1..logo9", "c1..c7, blue, text", "custom-logo $1..$9 colours");
+    println!("  {s}# colour specs (any colour key):{r}", s=s, r=r);
+    println!("  {s}#   catppuccin  rosewater flamingo pink mauve red maroon peach yellow green teal sky sapphire blue lavender text subtext1 overlay0{r}", s=s, r=r);
+    println!("  {s}#   extra       black white gray/grey silver navy lime aqua fuchsia purple/magenta cyan orange{r}", s=s, r=r);
+    println!("  {s}#   ANSI        ansi_black … ansi_bright_white (16 base colours){r}", s=s, r=r);
+    println!("  {s}#   numeric     #RGB | #RRGGBB | rgb(r,g,b) | color0..color255 | bare 0..255; unknown = blue{r}", s=s, r=r);
     println!();
-    println!("  {b}{BLUE}[show]{r}  {s}(true/false each field){r}", b=b, BLUE=BLUE, r=r, s=s);
-    println!("  os=true  kernel=true  uptime=true  res=false  pkgs=true");
-    println!("  shell=true  de_wm=true  term=true  cpu=true  gpu=true");
-    println!("  memory=true  disk=false  load=false  locale=false");
-    println!("  swatches=false  color_bar=false");
-    println!("  swap=false  sound=false  gpu_driver=false  theme=false");
-    println!("  bios=false  board=false  disk_type=false  pkg_updates=false");
-    println!("  local_ip=false  init_ver=false  de_wm_ver=false");
-    println!("  {s}# opt-in modules (all false by default — or use --all):{r}", s=s, r=r);
-    println!("  {s}datetime editor dns host chassis bootmgr cpu_cache login_manager{r}", s=s, r=r);
-    println!("  {s}brightness cpu_usage diskio netio physmem gpu_mem btrfs wifi users{r}", s=s, r=r);
-    println!("  {s}wallpaper media public_ip weather opengl vulkan{r}", s=s, r=r);
-    println!("  {s}cursor term_size term_theme codec bluetooth camera mouse keyboard{r}", s=s, r=r);
-    println!("  {s}tpm physical_disk top_processes monitor{r}", s=s, r=r);
+
+    println!("  {b}{BLUE}[show]{r}  {s}per-field visibility; true/yes/1/on enables, anything else disables{r}", b=b, BLUE=BLUE, r=r, s=s);
+    println!("  {s}# --all enables every data field below except header, uptime_long, swatches and color_bar.{r}", s=s, r=r);
+    field("header", "both", "both | user/username | host/hostname | none/false");
+    println!("  {s}# core fields (on by default):{r}", s=s, r=r);
+    field("os", "true", "distro PRETTY_NAME from /etc/os-release");
+    field("kernel", "true", "kernel release from uname -r");
+    field("uptime", "true", "short uptime, e.g. 3d 4h 5m");
+    field("pkgs", "true", "installed package count (cached 1 h)");
+    field("shell", "true", "basename of $SHELL");
+    field("de_wm", "true", "$XDG_CURRENT_DESKTOP / $DESKTOP_SESSION / Hyprland / Sway / X11 / TTY");
+    field("term", "true", "$TERM_PROGRAM, fallback $TERM");
+    field("cpu", "true", "CPU brand, core count and max GHz (cached 24 h)");
+    field("gpu", "true", "GPU name from DRM/NVIDIA/PCI (cached 24 h)");
+    field("memory", "true", "used / total RAM with a 14-cell bar");
+    println!("  {s}# optional core fields:{r}", s=s, r=r);
+    field("uptime_long", "false", "true = 3 days, 4 hrs, 5 mins (only changes uptime)");
+    field("res", "false", "primary output resolution from /sys/class/drm");
+    field("gpu_temp", "false", "GPU hwmon temperature in °C, or N/A");
+    field("battery", "false", "BAT0/BAT1/BAT capacity + charging icon, or N/A");
+    field("disk", "false", "root filesystem used / total");
+    field("load", "false", "1, 5 and 15 minute load averages");
+    field("locale", "false", "$LANG");
+    println!("  {s}# network fields (collected together when any of ip/ssh/ports is on):{r}", s=s, r=r);
+    field("ip", "false", "primary interface IPv4 address");
+    field("ssh", "false", "port 22 listening: active / inactive");
+    field("ports", "false", "count of listening TCP ports");
+    println!("  {s}# extra rows:{r}", s=s, r=r);
+    field("swatches", "false", "14-dot Catppuccin palette row (fixed colours)");
+    field("color_bar", "false", "8-block neofetch-style colour bar");
+    field("init", "false", "PID 1 init name (systemd/OpenRC/runit/s6/…)");
+    field("cpu_temp", "false", "CPU package temperature from hwmon or ACPI, or N/A");
+    field("processes", "false", "number of processes in /proc");
+    field("container", "false", "Docker / Podman / Kubernetes / LXC / none");
+    field("session", "false", "$XDG_SESSION_TYPE, or tty");
+    println!("  {s}# fastfetch-inspired fields (off by default):{r}", s=s, r=r);
+    field("swap", "false", "swap used / total, or N/A");
+    field("sound", "false", "PipeWire / PulseAudio / ALSA");
+    field("gpu_driver", "false", "DRM driver and version (nvidia/amdgpu)");
+    field("bios", "false", "DMI BIOS version and date");
+    field("board", "false", "DMI motherboard vendor and model");
+    field("disk_type", "false", "SSD / NVMe SSD / HDD from the root device");
+    field("pkg_updates", "false", "pacman sync repos found (lightweight, not a full update check)");
+    field("theme", "false", "GTK theme from gtk-3.0/settings.ini (gtk2 fallback)");
+    field("icons", "false", "GTK icon theme");
+    field("term_font", "false", "terminal font from the environment or terminal config");
+    field("de_wm_ver", "false", "desktop environment / WM version (may spawn <wm> --version)");
+    field("init_ver", "false", "init version (systemd shows distro VERSION_ID)");
+    field("local_ip", "false", "interface + local IPv4 address");
+    println!("  {s}# opt-in modules (all off by default; or use --all):{r}", s=s, r=r);
+    field("datetime", "false", "local date and time");
+    field("editor", "false", "$VISUAL or $EDITOR");
+    field("dns", "false", "nameservers from /etc/resolv.conf");
+    field("host", "false", "DMI system vendor and product");
+    field("chassis", "false", "DMI chassis type (Laptop/Desktop/…)");
+    field("bootmgr", "false", "UEFI or BIOS");
+    field("cpu_cache", "false", "L1 / L2 / L3 cache sizes");
+    field("login_manager", "false", "display-manager.service");
+    field("brightness", "false", "backlight percentage");
+    field("cpu_usage", "false", "/proc/stat sample (at least 60 ms)");
+    field("diskio", "false", "totals from /proc/diskstats");
+    field("netio", "false", "totals from /proc/net/dev");
+    field("physmem", "false", "DIMM slots from DMI (root may be required)");
+    field("gpu_mem", "false", "VRAM used / total");
+    field("btrfs", "false", "btrfs volumes");
+    field("wifi", "false", "wireless interface, SSID and signal");
+    field("users", "false", "logged-in users");
+    field("wallpaper", "false", "current wallpaper (Hyprland/Sway/GNOME)");
+    field("media", "false", "now playing via playerctl");
+    field("public_ip", "false", "public IP (network; 1 h cache, stale-while-revalidate)");
+    field("weather", "false", "weather from wttr.in (network; 15 min cache)");
+    field("opengl", "false", "OpenGL renderer via glxinfo (24 h cache)");
+    field("vulkan", "false", "Vulkan drivers (24 h cache)");
+    field("cursor", "false", "cursor theme and size");
+    field("term_size", "false", "terminal columns x rows");
+    field("term_theme", "false", "terminal FG/BG from $COLORFGBG (5 min cache)");
+    field("codec", "false", "VA-API encoders/decoders via vainfo (24 h cache)");
+    field("bluetooth", "false", "Bluetooth radio and HCI version (24 h cache)");
+    field("camera", "false", "connected cameras");
+    field("mouse", "false", "pointing devices");
+    field("keyboard", "false", "keyboards");
+    field("tpm", "false", "TPM version");
+    field("physical_disk", "false", "disks: model, size, type and temperature");
+    field("top_processes", "false", "top 5 processes by CPU");
+    field("monitor", "false", "EDID: name, resolution, Hz, size and PPI");
     println!();
-    println!("  {b}{BLUE}[logo]{r}  {s}choose logo or custom ASCII file{r}", b=b, BLUE=BLUE, r=r, s=s);
-    println!("  {g}name{r} = arch         {s}# arch | ascii | tux | nix | gentoo | mini | auto{r}", g=g, r=r, s=s);
-    println!("  {g}file{r} = <path>       {s}# custom ASCII file (overrides name){r}", g=g, r=r, s=s);
-    println!("  {s}list every logo name from the CLI: arcfetch --list-logos{r}", s=s, r=r);
+
+    println!("  {b}{BLUE}[logo]{r}  {s}pick a built-in logo or a custom file{r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("name", "arch", "built-in name; default arch (minimal preset uses mini; science picks random)");
+    println!("  {s}              names: arch, mini, ascii, tux, nix, gentoo, auto, atom, dna, arcreactor,{r}", s=s, r=r);
+    println!("  {s}                      orbit, aurora, bedrock, guix, ubuntu, debian, fedora, …{r}", s=s, r=r);
+    println!("  {s}              _small suffixes are compact variants; --list-logos prints every name{r}", s=s, r=r);
+    println!("  {s}              auto detects /etc/os-release ID/ID_LIKE; unknown IDs fall back to arch{r}", s=s, r=r);
+    field("file", "<path>", "custom ASCII or png/jpg/gif (kitty protocol); overrides name");
+    println!("  {s}              text files support $1..$9 = logo1..logo9, $R = reset, $$ = literal ${r}", s=s, r=r);
     println!();
-    println!("  {b}{BLUE}[animation]{r}  {s}short intro on a real terminal{r}", b=b, BLUE=BLUE, r=r, s=s);
-    println!("  {g}enabled{r}  = true      {s}# false = always static{r}", g=g, r=r, s=s);
-    println!("  {g}effect{r}   = none      {s}# none | shimmer | scanline | boot{r}", g=g, r=r, s=s);
-    println!("  {g}intro_ms{r} = 700       {s}# 0 disables; animated logos auto-play{r}", g=g, r=r, s=s);
-    println!("  {g}wave{r}     = true      {s}# colour-wave atom/dna/arcreactor{r}", g=g, r=r, s=s);
+
+    println!("  {b}{BLUE}[animation]{r}  {s}short intro on a real terminal (normal mode only){r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("enabled", "true", "false = always static; --no-animate also skips the intro");
+    field("effect", "none", "none|shimmer|scanline|boot|dither");
+    println!("  {s}              aliases: off/frames/keyframes/wave/rainbow = none, scan/crt = scanline,{r}", s=s, r=r);
+    println!("  {s}                      bootreveal/reveal = boot, dissolve/fade = dither, else shimmer{r}", s=s, r=r);
+    field("intro_ms", "700", "intro length; 0 disables; capped at 24 frames (~1.7 s)");
+    field("wave", "true", "colour-wave animated logos (atom, dna, arcreactor, orbit, aurora)");
+    println!("  {s}              the intro is skipped for custom/image logos, piped output and --no-animate{r}", s=s, r=r);
+    println!("  {s}              animated logos play their frames whenever the intro is enabled{r}", s=s, r=r);
     println!();
-    println!("  {b}{BLUE}[template]{r}  {s}overrides [show] entirely{r}", b=b, BLUE=BLUE, r=r, s=s);
-    println!("  {g}preset{r} = full         {s}# full | minimal | hacker | science{r}", g=g, r=r, s=s);
+
+    println!("  {b}{BLUE}[template]{r}  {s}preset overrides [show] entirely; explicit header is kept{r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("preset", "<unset>", "full|minimal|hacker|science; unset keeps [show]; unknown = full");
+    println!("  {s}  full     os kernel uptime res pkgs shell de_wm term cpu gpu battery memory disk load locale{r}", s=s, r=r);
+    println!("  {s}           swatches init cpu_temp processes session swap sound gpu_driver disk_type theme{r}", s=s, r=r);
+    println!("  {s}           init_ver local_ip cursor term_size term_theme camera mouse keyboard tpm physical_disk monitor{r}", s=s, r=r);
+    println!("  {s}  minimal  os kernel uptime memory battery swatches; logo becomes mini unless --logo is explicit{r}", s=s, r=r);
+    println!("  {s}  hacker   kernel uptime cpu gpu gpu_temp memory disk load ip ssh ports swatches{r}", s=s, r=r);
+    println!("  {s}  science  os kernel uptime cpu memory disk; random science logo + physicist quote{r}", s=s, r=r);
     println!();
+
+    println!("  {b}{TEAL}precedence{r}", b=b, TEAL=TEAL, r=r);
+    println!("  {s}[colors] keys apply in file order; --scheme replaces the palette; --accent/ARCFETCH_ACCENT{r}", s=s, r=r);
+    println!("  {s}then overrides accent + hostname; --color overrides the logo accent. A file accent does not set hostname.{r}", s=s, r=r);
+    println!("  {s}CLI --preset/--full overrides [template]; --all runs next, then -s/--structure wins.{r}", s=s, r=r);
+    println!();
+
     println!("  {b}{TEAL}color names{r}  {s}or #RRGGBB hex{r}", b=b, TEAL=TEAL, r=r, s=s);
     println!("  {RW}rosewater{r}  {FL}flamingo{r}  {PK}pink{r}  {MV}mauve{r}  {RD}red{r}  {MR}maroon{r}",
         RW=ROSEWATER, FL=FLAMINGO, PK=PINK, MV=MAUVE, RD=RED, MR=MAROON, r=r);
@@ -1385,6 +1496,7 @@ fn print_config_help(cfg_path: &str) {
         PE=PEACH, YW=YELLOW, GN=GREEN, TL=TEAL, SK=SKY,
         SP=SAPPHIRE, BL=BLUE, LV=LAVENDER, r=r);
     println!();
+
     println!("  {b}{SKY}quick start{r}", b=b, SKY=SKY, r=r);
     println!("    mkdir -p $(dirname {cfg_path})", cfg_path=cfg_path);
     println!("    cat > {cfg_path} << 'EOF'", cfg_path=cfg_path);
@@ -1429,9 +1541,11 @@ fn write_sample_config(cfg_path: &str) {
 # all values are optional — delete lines to use defaults
 
 [colors]
-# palette preset (uncomment to switch): auto | mocha | latte | frappe | macchiato |
-#   nord | dracula | gruvbox | tokyo-night | solarized-dark | rose-pine |
-#   onedark | kanagawa | everforest | ayu   (auto = light/dark from the terminal)
+# keys apply in file order — keep scheme first if you use it
+# palette preset (mocha is the default; uncomment to switch):
+#   auto | mocha | latte | frappe | macchiato | nord | dracula | gruvbox |
+#   tokyo-night | solarized-dark | rose-pine | onedark | kanagawa |
+#   everforest | ayu   (auto = light/dark from the terminal)
 # scheme = auto
 
 # every colour accepts: catppuccin names, black/white/gray/orange/purple/cyan,
@@ -1451,7 +1565,7 @@ sep    = overlay0
 bar    = blue
 
 # logo inline colors for custom logo files ($1..$9)
-# defaults: c1..c7 + accent + text
+# defaults: c1..c7 + blue + text
 logo1 = blue
 logo2 = sapphire
 logo3 = sky
@@ -1459,11 +1573,11 @@ logo4 = teal
 logo5 = green
 logo6 = yellow
 logo7 = peach
-logo8 = mauve
+logo8 = blue
 logo9 = text
 
 [show]
-# header: both | user | host | none
+# header: both | user/username | host/hostname | none/false
 header      = both
 
 os          = true
@@ -1492,6 +1606,13 @@ ports       = false
 swatches    = false   # color palette swatches row
 color_bar   = false   # neofetch-style 8-color bar (■■■■■■■■)
 
+# system fields (hidden by default)
+init        = false   # PID 1 init name (systemd/OpenRC/runit/s6/…)
+cpu_temp    = false   # CPU package temperature (hwmon or ACPI)
+processes   = false   # process count from /proc
+container   = false   # Docker / Podman / Kubernetes / LXC / none
+session     = false   # XDG session type (x11/wayland/tty)
+
 # fastfetch-inspired fields (all hidden by default)
 swap        = false   # swap usage
 sound       = false   # audio server (PipeWire/PulseAudio/ALSA)
@@ -1499,12 +1620,12 @@ gpu_driver  = false   # GPU driver name + version
 bios        = false   # BIOS version + date
 board       = false   # motherboard vendor + model
 disk_type   = false   # SSD / NVMe / HDD
-pkg_updates = false   # available package updates
+pkg_updates = false   # pacman sync repos found (not a full update count)
 theme       = false   # GTK theme name
 icons       = false   # icon theme name
 term_font   = false   # terminal font name
 de_wm_ver   = false   # desktop environment version
-init_ver    = false   # init system version
+init_ver    = false   # init version (systemd uses distro VERSION_ID)
 local_ip    = false   # interface + local IP
 
 # opt-in modules (all off by default; or just pass --all)
@@ -1517,7 +1638,7 @@ bootmgr       = false  # UEFI or BIOS
 cpu_cache     = false  # L1/L2/L3 cache sizes
 login_manager = false  # display-manager.service
 brightness    = false  # backlight %
-cpu_usage     = false  # /proc/stat sample (~200ms)
+cpu_usage     = false  # /proc/stat sample (at least 60 ms)
 diskio        = false  # /proc/diskstats totals
 netio         = false  # /proc/net/dev totals
 physmem       = false  # DIMM info (needs root for DMI)
@@ -1545,12 +1666,14 @@ top_processes = false  # top 5 processes by CPU
 monitor       = false  # EDID: name, resolution, Hz, size, PPI
 
 [logo]
-# logo name: arch | ascii | tux | nix | gentoo | mini | auto
-# or any built-in distro logo: ubuntu | debian | fedora | opensuse | manjaro |
+# any built-in name from `arcfetch --list-logos`
+# logo name: arch (default) | mini | ascii | tux | nix | gentoo | auto |
+#   atom | dna | arcreactor | orbit | aurora | ubuntu | debian | fedora | opensuse | manjaro |
 #   endeavouros | cachyos | kali | alpine | void | pop | linuxmint | garuda |
 #   artix | rocky | almalinux | centos | steamos | raspbian | wsl | neon |
-#   deepin | mx | blackarch | redhat | zorin  (append _small for compact)
-# discover every built-in name: arcfetch --list-logos
+#   deepin | mx | blackarch | redhat | zorin | elementary | nobara | bazzite |
+#   bedrock | guix | macos | windows | freebsd | rust
+# append _small for compact variants where available
 # name = arch
 
 # custom ASCII file path (overrides name if set)
@@ -1559,16 +1682,19 @@ monitor       = false  # EDID: name, resolution, Hz, size, PPI
 [animation]
 # short intro played on a real terminal before the static render
 enabled  = true
-# glyph effect: none | shimmer | scanline | boot
+# glyph effect: none | shimmer | scanline | boot | dither
+# aliases: off/frames/keyframes/wave/rainbow = none, scan/crt = scanline,
+#          bootreveal/reveal = boot, dissolve/fade = dither
 effect   = none
-# intro length in milliseconds (0 disables)
+# intro length in milliseconds (0 disables; capped at 24 frames, ~1.7 s)
 intro_ms = 700
-# colour-wave animated logos (atom/dna/arcreactor)
+# colour-wave animated logos (atom, dna, arcreactor, orbit, aurora)
 wave     = true
 
 [template]
-# preset overrides [show] entirely
-# options: full | minimal | hacker | science
+# preset overrides [show] entirely; an explicit header is kept
+# options: full | minimal | hacker | science (unknown = full)
+# CLI --preset / --full overrides this
 # preset = full
 "#;
 
@@ -1588,40 +1714,54 @@ wave     = true
 
 fn print_help(cfg_path: &str) {
     let (b, r, s, g) = (BOLD, RESET, SUBTEXT1, GREEN);
+    let flag = |syntax: &str, desc: &str| {
+        println!("    {b}{g}{syntax:<27}{r} {s}{desc}{r}",
+            b = b, g = g, syntax = syntax, r = r, s = s, desc = desc);
+    };
+
     println!();
     let ver = env!("CARGO_PKG_VERSION");
     println!("  {b}{MAUVE}arcfetch{r}  v{ver}  blazing-fast Arch sysinfo", b=b, MAUVE=MAUVE, ver=ver, r=r);
     println!();
     println!("  {b}{BLUE}usage{r}   arcfetch [OPTIONS]", b=b, BLUE=BLUE, r=r);
     println!();
-    println!("  {b}{SAPPHIRE}flags{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
-    println!("    {b}{g}-h, --help{r}                 this screen", b=b, g=g, r=r);
-    println!("    {b}{g}-V, --version{r}              version + E=mc² joke", b=b, g=g, r=r);
-    println!("    {b}{g}--config{r}                   show config ref + write sample file", b=b, g=g, r=r);
-    println!("    {b}{g}--blackhole{r}                {MAUVE}M87 accretion disk, pinned above your shell{r}", b=b, g=g, r=r, MAUVE=MAUVE);
-    println!("    {b}{g}-t, --t <secs>{r}            {s}0=infinite  N=N seconds{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--logo <name>{r}              switch logo {s}(arch|ubuntu|debian|fedora|nix|auto…){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--list-logos{r}              {s}show every logo name with a preview{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--list-schemes{r}            {s}show every colour scheme as a swatch strip{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--logo ?{r}                  {s}same as --list-logos{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--logo-file <path>{r}         {s}ASCII art or image (kitty protocol){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--preset <n>{r}               {s}full|minimal|hacker|science{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--full{r}                     {s}show all fields (overrides minimal default){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--accent <color>{r}           name | #RRGGBB | rgb(r,g,b) | colorN", b=b, g=g, r=r);
-    println!("    {b}{g}--color <spec>{r}             logo colour: name | hex | random", b=b, g=g, r=r);
-    println!("    {b}{g}--scheme <name>{r}            palette: {s}{}{r}", config::SCHEMES.join("|"), b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--box [style]{r}              {s}frame output (round|square|double|heavy|dashed|ascii){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--no-color{r}                 plain text (pipe-friendly)", b=b, g=g, r=r);
-    println!("    {b}{g}--all{r}                      {s}enable every optional field{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}-s, --structure <list>{r}     {s}show only listed fields (comma-sep){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--json{r}                     {s}machine-readable JSON output{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--watch{r}                    {s}refresh every second (Ctrl+C stops){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--mandelbrot [iter]{r}        {GREEN}Mandelbrot set as logo{r}", b=b, g=g, r=r, GREEN=GREEN);
-    println!("    {b}{g}--quantum{r}                  {MAUVE}wave-function collapse animation{r}", b=b, g=g, r=r, MAUVE=MAUVE);
-    println!("    {b}{g}--cosmic{r}                   {SKY}starfield + moon + shooting stars{r}", b=b, g=g, r=r, SKY=SKY);
-    println!("    {b}{g}--animate [effect]{r}         {s}animate any logo, pinned above your shell (shimmer|scanline|boot|frames){r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--no-animate{r}              {s}skip the short intro in normal mode{r}", b=b, g=g, r=r, s=s);
-    println!("    {b}{g}--foreground{r}             {s}blocking full-screen animation (alternate screen){r}", b=b, g=g, r=r, s=s);
+    println!("  {b}{SAPPHIRE}general{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
+    flag("-h, --help", "this screen");
+    flag("-V, --version", "version + E=mc² joke");
+    flag("--config", "print the full config reference; create the sample if missing");
+    flag("--all", "enable every data field (header, uptime_long, swatches, color_bar unchanged)");
+    flag("-s, --structure <list>", "only listed data fields (comma/space); keeps header/swatches/color_bar");
+    flag("--preset <name>", "full|minimal|hacker|science; unknown = full; overrides [show]");
+    flag("--full", "alias for --preset full");
+    flag("--json", "flat JSON object of enabled fields (uptime always included); no colour");
+    flag("--watch", "clear and re-run every second; Ctrl+C stops");
+    flag("--no-color", "plain text; also NO_COLOR, CLICOLOR=0, or non-TTY unless FORCE_COLOR");
+    println!();
+    println!("  {b}{SAPPHIRE}appearance{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
+    flag("--scheme <name>", "palette preset (default mocha); replaces the whole palette");
+    println!("    {s}   auto|mocha|latte|frappe|macchiato|nord|dracula|gruvbox|tokyo-night{r}", s=s, r=r);
+    println!("    {s}   solarized-dark|rose-pine|onedark|kanagawa|everforest|ayu{r}", s=s, r=r);
+    flag("--accent <color>", "colour spec (name/hex/rgb/colorN); accent + hostname; wins over scheme/config");
+    flag("--color <spec|random>", "logo/accent colour only; spec or random palette colour each run");
+    flag("--box [style]", "frame output: round (default)|square|double|heavy|dashed|ascii|none");
+    flag("--logo <name|?|list>", "built-in logo, auto, or list; default arch");
+    flag("--logo-file <path>", "ASCII text or kitty png/jpg/gif; overrides logo name; ~ expanded");
+    flag("--list-logos, --logos", "every built-in name with a preview");
+    flag("--list-schemes, --schemes", "every palette with role swatches and exact hex");
+    println!();
+    println!("  {b}{SAPPHIRE}display & animation{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
+    flag("--animate [effect]", "pin a live logo; shimmer (default)|scanline|boot|dither|frames");
+    flag("--blackhole", "M87 accretion disk; requires a TTY; pinned unless --foreground");
+    flag("--quantum", "wave-function collapse; fixed 8 frames; --t ignored");
+    flag("--cosmic", "starfield + moon + shooting stars; ~6 s blocking");
+    flag("--mandelbrot [iter]", "static fractal logo; default 64 iterations");
+    flag("-t, --t <secs>", "duration for blackhole/cosmic/animate; 0 = until --stop/Ctrl+C");
+    flag("--no-animate, --no-intro", "skip the normal-mode intro");
+    flag("--foreground, --fg", "run blackhole/animate blocking on the alternate screen");
+    flag("--stop", "remove the pinned animation and reset the terminal");
+    println!("    {s}one display mode at a time; --t does not affect quantum, mandelbrot or normal mode{r}", s=s, r=r);
+    println!("    {s}background blackhole/animate run until --stop or --t N; --foreground defaults to ~3 s{r}", s=s, r=r);
+    println!("    {s}--blackhole and --animate need a TTY; piped output exits with an error{r}", s=s, r=r);
     println!();
     println!("  {b}{TEAL}logos{r}", b=b, TEAL=TEAL, r=r);
 
@@ -1631,32 +1771,35 @@ fn print_help(cfg_path: &str) {
     println!("    {b}{g}tux{r}          Linux penguin", b=b, g=g, r=r);
     println!("    {b}{g}nix{r}          NixOS hexagonal snowflake", b=b, g=g, r=r);
     println!("    {b}{g}gentoo{r}       Gentoo G (fastfetch style)", b=b, g=g, r=r);
-    println!("    {b}{g}auto{r}         detect from {s}/etc/os-release{r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}auto{r}         detect from {s}/etc/os-release (unknown falls back to arch){r}", b=b, g=g, r=r, s=s);
+    println!("    {b}{g}atom{r}, {g}dna{r}, {g}arcreactor{r}, {g}orbit{r}, {g}aurora{r}  animated logos", b=b, g=g, r=r);
     println!("    {b}{g}custom{r}  {s}~/.config/arcfetch/logo.txt{r}", b=b, g=g, r=r, s=s);
-    println!("    {s}{n} built-in logos — try {g}--logo ubuntu{r}", s=s, n=logos::all_names().len(), g=g, r=r);
+    println!("    {s}{n} built-in names incl. distros, _small variants and mascots — try {g}--logo ubuntu{r}", s=s, n=logos::all_names().len(), g=g, r=r);
     println!();
     println!("  {b}{TEAL}presets{r}", b=b, TEAL=TEAL, r=r);
-    println!("    {g}full{r}      everything", g=g, r=r);
-    println!("    {g}minimal{r}   os kernel uptime memory battery", g=g, r=r);
-    println!("    {g}hacker{r}    cpu gpu mem disk load ip ssh ports", g=g, r=r);
-    println!("    {g}science{r}   os kernel cpu mem + random science logo + physicist quote", g=g, r=r);
+    println!("    {g}full{r}      os kernel uptime res pkgs shell de_wm term cpu gpu battery memory disk load locale", g=g, r=r);
+    println!("              swatches init cpu_temp processes session swap sound gpu_driver disk_type theme");
+    println!("              init_ver local_ip cursor term_size term_theme camera mouse keyboard tpm physical_disk monitor");
+    println!("    {g}minimal{r}   os kernel uptime memory battery swatches; logo becomes mini unless --logo is explicit", g=g, r=r);
+    println!("    {g}hacker{r}    kernel uptime cpu gpu gpu_temp memory disk load ip ssh ports swatches", g=g, r=r);
+    println!("    {g}science{r}   os kernel uptime cpu memory disk; random science logo + physicist quote", g=g, r=r);
     println!();
     println!("  {b}{PEACH}config{r}  {s}{cfg_path}{r}", b=b, PEACH=PEACH, r=r, s=s, cfg_path=cfg_path);
-    println!("    run {b}{g}arcfetch --config{r} for full config reference", b=b, g=g, r=r);
+    println!("    run {b}{g}arcfetch --config{r} for the full reference and a sample file", b=b, g=g, r=r);
+    println!("    {s}[colors] | [show] | [logo] | [animation] | [template] — all keys optional{r}", s=s, r=r);
     println!();
-    println!("  {b}{SKY}display modes{r}", b=b, SKY=SKY, r=r);
-    println!("    {g}--blackhole{r}   accretion disk, pinned above your shell", g=g, r=r);
-    println!("    {g}--mandelbrot{r}  fractal logo (math)", g=g, r=r);
-    println!("    {g}--quantum{r}     wave collapse (physics)", g=g, r=r);
-    println!("    {g}--cosmic{r}      starfield + moon + shooting stars (astronomy)", g=g, r=r);
-    println!("    {g}--animate{r}     procedural logo animation, pinned above your shell", g=g, r=r);
-    println!("    {g}--stop{r}        remove the pinned animation from this terminal", g=g, r=r);
-    println!("    {s}mutually exclusive — pick one{r}", s=s, r=r);
+    println!("  {b}{SKY}environment{r}", b=b, SKY=SKY, r=r);
+    println!("    {g}ARCFETCH_ACCENT{r}   {s}same as --accent (logo + hostname){r}", g=g, r=r, s=s);
+    println!("    {g}NO_COLOR{r}          {s}disable colour; CLICOLOR=0 does the same{r}", g=g, r=r, s=s);
+    println!("    {g}FORCE_COLOR{r}       {s}keep colour when stdout is piped{r}", g=g, r=r, s=s);
+    println!("    {g}XDG_CONFIG_HOME{r}   {s}base for arcfetch/config.toml (default ~/.config){r}", g=g, r=r, s=s);
     println!();
     println!("  {b}{OVERLAY0}shell startup (e.g. ~/.zshrc){r}", b=b, OVERLAY0=OVERLAY0, r=r);
     println!("    arcfetch                       {s}# minimal default (fast){r}", s=s, r=r);
-    println!("    arcfetch --full               {s}# show all fields{r}", s=s, r=r);
+    println!("    arcfetch --full               {s}# every preset field{r}", s=s, r=r);
+    println!("    arcfetch --scheme auto         {s}# follow the terminal light/dark background{r}", s=s, r=r);
     println!("    arcfetch --mandelbrot          {s}# fractal as logo{r}", s=s, r=r);
+    println!("    arcfetch --blackhole           {s}# pinned M87 disk; stop with arcfetch --stop{r}", s=s, r=r);
     println!("    arcfetch --logo nix --cosmic   {s}# cosmic + nix logo{r}", s=s, r=r);
     println!();
 }
@@ -1741,11 +1884,11 @@ fn print_logos() {
 
     let is_fun = |n: &str| matches!(
         n,
-        "ascii" | "tux" | "nix" | "gentoo" | "mini" | "dna" | "atom" | "wave"
-            | "emc2" | "pi" | "batman" | "batman_small" | "ironman" | "ironman_small"
-            | "arcreactor"
+        "ascii" | "tux" | "nix" | "gentoo" | "mini" | "dna" | "atom" | "orbit"
+            | "aurora" | "wave" | "emc2" | "pi" | "batman" | "batman_small" | "ironman"
+            | "ironman_small" | "arcreactor"
     );
-    let is_animated = |n: &str| matches!(n, "atom" | "dna" | "arcreactor");
+    let is_animated = logos::is_animated;
 
     println!();
     println!("  {BOLD}{BLUE}arcfetch logos{R}  {OVL}{n} available · use: arcfetch --logo <name>{R}",
@@ -1761,12 +1904,15 @@ fn print_logos() {
 
         for name in list {
             let art = logos::from_name(name);
-            let preview = art
-                .iter()
-                .filter(|l| !l.trim().is_empty())
-                .max_by_key(|l| visible_chars(l))
-                .map(|l| l.trim())
-                .unwrap_or("");
+            let preview = if matches!(*name, "orbit" | "aurora") {
+                art.last().map(|line| line.trim()).unwrap_or("")
+            } else {
+                art.iter()
+                    .filter(|l| !l.trim().is_empty())
+                    .max_by_key(|l| visible_chars(l))
+                    .map(|l| l.trim())
+                    .unwrap_or("")
+            };
             let preview: String = preview.chars().take(30).collect();
             let marker = if is_animated(name) {
                 format!(" {TEAL}[animated]{R}", TEAL = TEAL, R = RESET)
@@ -1842,7 +1988,7 @@ fn panel_logo(
     effect: logos::AnimEffect,
     palette: &[String],
 ) -> Vec<String> {
-    let base = logos::from_name_frame(logo_name, tick / 6);
+    let base = logos::frame(logo_name, tick, 6);
     let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
     let w = widths.iter().max().copied().unwrap_or(36);
     let last = palette.len().saturating_sub(1);
@@ -2667,7 +2813,7 @@ fn main() {
         && custom_lines.is_none()
         && image_escape.is_none()
     {
-        let animated_logo = matches!(logo_name.as_str(), "atom" | "dna" | "arcreactor");
+        let animated_logo = logos::is_animated(&logo_name);
         let effect_on = !cfg.animation.effect.eq_ignore_ascii_case("none");
         if animated_logo || effect_on {
             run_intro(&out_lines, &logo_name, &cfg, &args, &cfg.animation);

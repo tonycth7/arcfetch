@@ -1131,6 +1131,44 @@ pub static FRAMES_ATOM: [&[&str]; 2] = [&LOGO_ATOM, &LOGO_ATOM_FRAME_2];
 pub static FRAMES_DNA: [&[&str]; 2] = [&LOGO_DNA, &LOGO_DNA_FRAME_2];
 pub static FRAMES_ARCREACTOR: [&[&str]; 2] = [&LOGO_ARCREACTOR, &LOGO_ARCREACTOR_FRAME_2];
 
+// ── Orbit (ringed planet + moon, 34x15) ──────────────────
+pub const LOGO_ORBIT: [&str; 15] = [
+    " . ·  .                         ✦",
+    "      ·             ✦     ✦",
+    "       ·   ──░███▓▓▓░──     ·",
+    "      ─────░██████████░───── ·",
+    "    ·─   ░██████████▓▓▓▓░ · ─·",
+    "   · ·   ██████▓▓▓▓▓▒▒▒▒▒     ·",
+    "  ·     ░█▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░    ●·",
+    "        ░███████▓▓▓▓▓▓▓▓▒░",
+    ".  ·   · █████▓▓▓▓▓▒▒▒▒░░     ·",
+    "    ·──   ▓▓▓▓▒▒▒▒▒▒▒▒░░   ──·",
+    "       ──────▓▓▓▓▒▒▒▒──────   ..",
+    "  ·     ·    ════✦═══",
+    "                     .     ·   .",
+    "",
+    "          · O R B I T ·",
+];
+
+// ── Aurora (curtains, ridge and stars, 34x15) ────────────
+pub const LOGO_AURORA: [&str; 15] = [
+    "  · ✦         ·  ·             ·",
+    " · ·        ✦     ✦",
+    "·    · .     ·░▒▒▒░░░░░·     · ✦",
+    "█▒· ·    ✦ ·▒▓██▒░░░░▒▓█▓░",
+    "▓██▒·   ·░▓███▒░▒▒▒▒░░░▓██▓░·  ·░▒",
+    " ░▓▓▒░░▒▓██▓▒░·░░▓████▓▒░▒▒▒▒░░▒▓▓",
+    "·· ·░▒▓██▓░·     ·░▒▓▓▓▒░░░▒▓██▓▒·",
+    "▒░░▒▒▓▓▓░            ▒▒▒▒▒·░▒▓███▓",
+    "░░░░░░·   ▒▒▒▒▒▒▒▒▒▄▄▒▒▒▒▒▒▒▒ ·░▒▒",
+    "▒      ▒▒▒▒▒▒▒▒▒▄▄▄██▄▄▒▒▒▒▒▒▒▒▒",
+    "▒▒▒▒▒▒▒▒▒▄▄▄▄▄▄▄███████▄▒▒▒▒▒▒▒▒▒▒",
+    "▄▄▒▒▒▒▒▄▄███████████████▄▄▄▄▄▄▄▄▄▒",
+    "██▄▄▄▄▄██████████████████████████▄",
+    "██████████████████████████████████",
+    "         · A U R O R A ·",
+];
+
 // ══════════════════════════════════════════════════════════
 // LOOKUP & OS DETECTION API
 // ══════════════════════════════════════════════════════════
@@ -1148,6 +1186,8 @@ pub fn from_name(name: &str) -> &'static [&'static str] {
         "guix_small"                          => &LOGO_GUIX_SMALL,
         "dna"                                 => &LOGO_DNA,
         "atom"                                => &LOGO_ATOM,
+        "orbit" | "planet"                    => &LOGO_ORBIT,
+        "aurora" | "borealis"                 => &LOGO_AURORA,
         "wave" | "quantum"                    => &LOGO_WAVE,
         "emc2" | "relativity" | "einstein"    => &LOGO_EMC2,
         "pi" | "math"                         => &LOGO_PI,
@@ -1213,6 +1253,257 @@ pub fn from_name_frame(name: &str, tick: usize) -> &'static [&'static str] {
     }
 }
 
+/// One frame of an animated logo. `orbit` and `aurora` are generated per tick;
+/// the older keyframe logos advance every `keyframe_every` animation frames.
+pub fn frame(name: &str, tick: usize, keyframe_every: usize) -> Vec<String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "orbit" | "planet" => orbit_frame(tick),
+        "aurora" | "borealis" => aurora_frame(tick),
+        _ => from_name_frame(name, tick / keyframe_every.max(1))
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    }
+}
+
+/// Whether `--animate` and the normal-mode intro should advance frames for this
+/// logo. Aliases are included so `--logo arc` animates the same as `arcreactor`.
+pub fn is_animated(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "atom"
+            | "dna"
+            | "arcreactor"
+            | "arc"
+            | "arc_reactor"
+            | "orbit"
+            | "planet"
+            | "aurora"
+            | "borealis"
+    )
+}
+
+// ══════════════════════════════════════════════════════════
+// PROCEDURAL LOGOS (generated per tick, no frame tables)
+// ══════════════════════════════════════════════════════════
+
+const PROC_W: usize = 34;
+const PROC_H: usize = 15;
+type Grid = [[char; PROC_W]; PROC_H];
+
+fn grid() -> Grid {
+    [[' '; PROC_W]; PROC_H]
+}
+
+fn grid_lines(g: &Grid) -> Vec<String> {
+    g.iter()
+        .map(|row| row.iter().collect::<String>().trim_end().to_string())
+        .collect()
+}
+
+fn set_label(g: &mut Grid, label: &str) {
+    let start = (PROC_W - label.chars().count()) / 2;
+    for (i, ch) in label.chars().enumerate() {
+        if let Some(cell) = g[PROC_H - 1].get_mut(start + i) {
+            *cell = ch;
+        }
+    }
+}
+
+fn hash01(mut n: u32) -> f64 {
+    n = n.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+    n = (n ^ (n >> 16)).wrapping_mul(2_246_822_519);
+    n = (n ^ (n >> 13)).wrapping_mul(3_266_489_917);
+    (n ^ (n >> 16)) as f64 / u32::MAX as f64
+}
+
+const ORBIT_CX: f64 = 16.5;
+const ORBIT_CY: f64 = 6.4;
+const ORBIT_RX: f64 = 8.6;
+const ORBIT_RY: f64 = 5.0;
+const ORBIT_RING_RX: f64 = 14.5;
+const ORBIT_RING_AMP: f64 = 4.3;
+
+fn orbit_frame(tick: usize) -> Vec<String> {
+    let t = tick as f64;
+    let mut g = grid();
+
+    for i in 0..40u32 {
+        let x = (hash01(i * 7 + 3) * PROC_W as f64) as usize;
+        let y = (hash01(i * 11 + 7) * (PROC_H - 2) as f64) as usize;
+        let twinkle = (t * 0.14 + i as f64 * 1.7) % 1.0;
+        g[y][x] = if twinkle < 0.55 {
+            '·'
+        } else if twinkle < 0.8 {
+            '.'
+        } else {
+            '✦'
+        };
+    }
+
+    draw_ring(&mut g, false, tick);
+    if (t * 0.10).sin() < 0.0 {
+        draw_moon(&mut g, tick);
+    }
+
+    for (y, row) in g.iter_mut().enumerate() {
+        for (x, cell) in row.iter_mut().enumerate() {
+            if let Some(ch) = planet_cell(x, y, tick) {
+                *cell = ch;
+            }
+        }
+    }
+
+    draw_ring(&mut g, true, tick);
+    if (t * 0.10).sin() >= 0.0 {
+        draw_moon(&mut g, tick);
+    }
+
+    set_label(&mut g, "· O R B I T ·");
+    grid_lines(&g)
+}
+
+#[allow(clippy::needless_range_loop)] // the row changes with x, so `g[y][x]` cannot use one row iterator
+fn draw_ring(g: &mut Grid, front: bool, tick: usize) {
+    for x in 0..PROC_W {
+        let t = (x as f64 - ORBIT_CX) / ORBIT_RING_RX;
+        if t.abs() > 1.0 {
+            continue;
+        }
+        let dy = ORBIT_RING_AMP * (1.0 - t * t).max(0.0).sqrt();
+        let y = (ORBIT_CY + if front { dy } else { -dy }).round() as isize;
+        if !(0..PROC_H as isize).contains(&y) {
+            continue;
+        }
+        g[y as usize][x] = if (x + tick).is_multiple_of(17) {
+            '✦'
+        } else if t.abs() > 0.84 {
+            '·'
+        } else if t.abs() < 0.28 {
+            '═'
+        } else {
+            '─'
+        };
+    }
+}
+
+fn draw_moon(g: &mut Grid, tick: usize) {
+    let a = tick as f64 * 0.10;
+    for k in (1..=2).rev() {
+        let aa = a - k as f64 * 0.12;
+        let x = (ORBIT_CX + 14.0 * aa.cos()).round() as isize;
+        let y = (ORBIT_CY + 4.0 * aa.sin()).round() as isize;
+        if (0..PROC_W as isize).contains(&x) && (0..PROC_H as isize).contains(&y) {
+            g[y as usize][x as usize] = '·';
+        }
+    }
+    let x = (ORBIT_CX + 14.0 * a.cos()).round() as isize;
+    let y = (ORBIT_CY + 4.0 * a.sin()).round() as isize;
+    if (0..PROC_W as isize).contains(&x) && (0..PROC_H as isize).contains(&y) {
+        g[y as usize][x as usize] = '●';
+    }
+}
+
+fn planet_cell(x: usize, y: usize, tick: usize) -> Option<char> {
+    let nx = (x as f64 - ORBIT_CX) / ORBIT_RX;
+    let ny = (y as f64 - ORBIT_CY) / ORBIT_RY;
+    let d = nx * nx + ny * ny;
+    if d > 1.0 {
+        return None;
+    }
+    let light = 0.62 + 0.38 * (-nx * 0.55 - ny * 0.5);
+    let band = 0.10 * (ny * 9.0 - tick as f64 * 0.10 + nx * 1.6).sin();
+    let v = light + band;
+    Some(if d > 0.87 || v < 0.34 {
+        '░'
+    } else if v < 0.50 {
+        '▒'
+    } else if v < 0.70 {
+        '▓'
+    } else {
+        '█'
+    })
+}
+
+fn aurora_frame(tick: usize) -> Vec<String> {
+    let t = tick as f64;
+    let mut g = grid();
+
+    for i in 0..22u32 {
+        let x = (hash01(i * 13 + 5) * PROC_W as f64) as usize;
+        let y = (hash01(i * 17 + 9) * 4.0) as usize;
+        let twinkle = (t * 0.10 + i as f64 * 2.1) % 1.0;
+        g[y][x] = if twinkle < 0.7 {
+            '·'
+        } else if twinkle < 0.9 {
+            '✦'
+        } else {
+            '.'
+        };
+    }
+
+    for (y, row) in g.iter_mut().enumerate().take(PROC_H - 4) {
+        for (x, cell) in row.iter_mut().enumerate() {
+            let xf = x as f64;
+            let mut d = 0.0f64;
+            for (layer, (c0, amp1, f1, amp2, f2, phase, thickness, speed)) in [
+                (3.4, 1.7, 0.26, 0.6, 0.10, 0.0, 1.15, 0.09),
+                (5.8, 1.4, 0.18, 0.5, 0.39, 1.8, 1.30, -0.10),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let center = c0
+                    + amp1 * (xf * f1 + t * speed + phase).sin()
+                    + amp2 * (xf * f2 - t * 0.04).sin();
+                let density = (-((y as f64 - center) / thickness).powi(2)).exp()
+                    * (0.70
+                        + 0.30
+                            * (xf * 0.55 + y as f64 * 0.25 + t * 0.18 + layer as f64 * 2.0).sin());
+                d = d.max(density);
+            }
+            let ch = if d > 0.80 {
+                '█'
+            } else if d > 0.62 {
+                '▓'
+            } else if d > 0.44 {
+                '▒'
+            } else if d > 0.28 {
+                '░'
+            } else if d > 0.17 {
+                '·'
+            } else {
+                ' '
+            };
+            if ch != ' ' {
+                *cell = ch;
+            }
+        }
+    }
+
+    for x in 0..PROC_W {
+        let xf = x as f64;
+        let back = ((9.0 + 1.1 * (xf * 0.18 + 1.1).sin() + 0.5 * (xf * 0.47 - 0.4).sin())
+            .round() as usize)
+            .min(PROC_H - 1);
+        for row in &mut g[back..PROC_H - 1] {
+            row[x] = '▒';
+        }
+        let front = ((10.7 + 1.4 * (xf * 0.23 + 0.7).sin() + 0.6 * (xf * 0.61 - 1.1).sin())
+            .round() as usize)
+            .min(PROC_H - 1);
+        for row in &mut g[front..PROC_H - 1] {
+            row[x] = '█';
+        }
+        if front < PROC_H - 1 {
+            g[front][x] = '▄';
+        }
+    }
+
+    set_label(&mut g, "· A U R O R A ·");
+    grid_lines(&g)
+}
+
 /// List of all built-in logo names accepted by `from_name`.
 pub fn all_names() -> &'static [&'static str] {
     &[
@@ -1227,6 +1518,8 @@ pub fn all_names() -> &'static [&'static str] {
         "guix_small",
         "dna",
         "atom",
+        "orbit",
+        "aurora",
         "wave",
         "emc2",
         "pi",
@@ -1366,7 +1659,18 @@ pub enum AnimEffect {
     Scanline,
     /// Progressive top-to-bottom matrix boot reveal.
     BootReveal,
+    /// Ordered-dither dissolve and rebuild, eased like a UI transition.
+    Dither,
 }
+
+/// 4×4 Bayer thresholds. Ordered dithering keeps the fade smooth instead of
+/// turning into random static.
+const BAYER: [[u8; 4]; 4] = [
+    [0, 8, 2, 10],
+    [12, 4, 14, 6],
+    [3, 11, 1, 9],
+    [15, 7, 13, 5],
+];
 
 /// Transforms a single logo line at `row` for frame `tick` using `effect`.
 /// Drop this into your TUI render loop later to animate *any* logo!
@@ -1416,6 +1720,33 @@ pub fn animate_line(line: &str, row: usize, tick: usize, effect: AnimEffect) -> 
                 line.to_string()
             }
         }
+        AnimEffect::Dither => {
+            let phase = (tick % 64) as f32 / 64.0;
+            let tri = if phase < 0.5 {
+                phase * 2.0
+            } else {
+                (1.0 - phase) * 2.0
+            };
+            let amount = tri * tri * (3.0 - 2.0 * tri) * 0.92;
+            line.chars()
+                .enumerate()
+                .map(|(col, ch)| {
+                    if ch != '█' {
+                        return ch;
+                    }
+                    let threshold = (BAYER[row & 3][col & 3] as f32 + 0.5) / 16.0;
+                    if threshold < amount {
+                        if threshold + 0.18 < amount {
+                            ' '
+                        } else {
+                            '░'
+                        }
+                    } else {
+                        ch
+                    }
+                })
+                .collect()
+        }
     }
 }
 
@@ -1424,4 +1755,47 @@ pub fn animate_line(line: &str, row: usize, tick: usize, effect: AnimEffect) -> 
 pub fn color_wave_phase(row: usize, col: usize, tick: usize) -> f32 {
     let angle = (row as f32 * 0.25) + (col as f32 * 0.12) - (tick as f32 * 0.18);
     (angle.sin() + 1.0) * 0.5
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn procedural_frames_are_deterministic_and_bounded() {
+        for name in ["orbit", "planet", "aurora", "borealis"] {
+            let a = frame(name, 3, 6);
+            let b = frame(name, 3, 6);
+            assert_eq!(a, b, "{name}");
+            assert_eq!(a.len(), PROC_H, "{name}");
+            assert!(
+                a.iter().any(|line| line.chars().any(|ch| ch != ' ')),
+                "{name}"
+            );
+            assert!(
+                a.iter().all(|line| line.chars().count() <= PROC_W),
+                "{name}"
+            );
+            assert_ne!(a, frame(name, 8, 6), "{name} did not move");
+            assert!(is_animated(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn static_frames_keep_the_old_contract() {
+        let expected: Vec<String> = from_name("arch")
+            .iter()
+            .map(|line| (*line).to_string())
+            .collect();
+        assert_eq!(frame("arch", 0, 6), expected);
+        assert!(!is_animated("arch"));
+        assert!(is_animated("arc_reactor"));
+    }
+
+    #[test]
+    fn dither_preserves_line_width() {
+        let input = "███  ░░  arcfetch";
+        let output = animate_line(input, 2, 32, AnimEffect::Dither);
+        assert_eq!(output.chars().count(), input.chars().count());
+    }
 }
