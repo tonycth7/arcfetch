@@ -3887,7 +3887,12 @@ fn main() {
         let mut names = config::preset_names();
         // numeric names sort naturally, named ones after them
         names.sort_by_key(|n| (n.parse::<u32>().unwrap_or(u32::MAX), n.clone()));
-        println!("{} presets: {}", names.len(), names.join(", "));
+        println!("{} presets — load one with --preset <name>:", names.len());
+        let width = names.iter().map(|n| n.len()).max().unwrap_or(1) + 2;
+        for row in names.chunks((78 / width).max(1)) {
+            let line: Vec<String> = row.iter().map(|n| format!("{n:<width$}")).collect();
+            println!("  {}", line.join("").trim_end());
+        }
         return;
     }
     if args.list_animations { print_animations(); return; }
