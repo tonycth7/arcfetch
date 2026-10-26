@@ -11,7 +11,7 @@ depends=('gcc-libs')
 makedepends=('rust')
 source=("$url/archive/v$pkgver.tar.gz")
 # Run `updpkgsums` after the v1.1.0 tag and tarball exist.
-sha256sums=('SKIP')
+sha256sums=('c427e8e874bc8efb9c4a34f00abe2c4a0fd4b24380c019c8a62e4c6211c2ace6')
 
 prepare() {
     cd "$srcdir/$pkgname-$pkgver"

@@ -9,6 +9,6 @@ pkgbase = arcfetch
 	makedepends = rust
 	depends = gcc-libs
 	source = https://github.com/tonycth7/arcfetch/archive/v1.1.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = c427e8e874bc8efb9c4a34f00abe2c4a0fd4b24380c019c8a62e4c6211c2ace6
 
 pkgname = arcfetch
