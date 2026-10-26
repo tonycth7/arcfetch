@@ -1,0 +1,33 @@
+# Cross-compilation linkers.
+#
+# Android uses the NDK; the other targets are linked by zig (see
+# scripts/build-all.sh, which also prepares the FreeBSD linker stub).
+[target.aarch64-linux-android]
+linker = "scripts/android-linker.sh"
+
+[target.armv7-linux-androideabi]
+linker = "scripts/android-linker.sh"
+
+[target.x86_64-linux-android]
+linker = "scripts/android-linker.sh"
+
+[target.i686-linux-android]
+linker = "scripts/android-linker.sh"
+
+# Static linking removes the dynamic loader from the hot path: a default run
+# drops from ~2.3 ms to ~1.2 ms. Linux x86_64 only; other targets keep the
+# default dynamic link.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-apple-darwin]
+linker = "scripts/zig-linker.sh"
+
+[target.aarch64-apple-darwin]
+linker = "scripts/zig-linker.sh"
+
+[target.x86_64-unknown-freebsd]
+linker = "scripts/zig-linker.sh"
+
+[target.x86_64-unknown-netbsd]
+linker = "scripts/zig-linker.sh"

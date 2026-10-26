@@ -869,6 +869,7 @@ pub fn wifi() -> String {
 
 /// Logged-in users via libc utmpx, deduped, joined `", "`.
 #[allow(dead_code)]
+#[cfg(not(target_os = "android"))]
 pub fn users() -> String {
     let mut seen: Vec<String> = Vec::new();
     unsafe {
@@ -882,6 +883,9 @@ pub fn users() -> String {
             if u.ut_type != libc::USER_PROCESS {
                 continue;
             }
+            #[cfg(target_os = "netbsd")]
+            let name = cstr(&u.ut_name);
+            #[cfg(not(target_os = "netbsd"))]
             let name = cstr(&u.ut_user);
             if name.is_empty() {
                 continue;
@@ -898,6 +902,11 @@ pub fn users() -> String {
         seen.join(", ")
     }
 }
+
+/// Android has utmp rather than utmpx; users are not collected there.
+#[allow(dead_code)]
+#[cfg(target_os = "android")]
+pub fn users() -> String { "N/A".into() }
 
 /// Scan a config file for a wallpaper line (hyprpaper / hyprland / sway).
 #[allow(dead_code)]
@@ -1128,11 +1137,11 @@ const ANSI_HEX: [&str; 16] = [
     "#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff",
 ];
 
-/// Terminal foreground/background, from an OSC 10/11 query if possible,
-/// else `$COLORFGBG`.
+/// Terminal foreground/background, from `$COLORFGBG` first, then an OSC 10/11
+/// query if possible.
 #[allow(dead_code)]
 pub fn term_theme() -> String {
-    term_theme_osc().or_else(term_theme_env).unwrap_or_else(|| "N/A".into())
+    term_theme_env().or_else(term_theme_osc).unwrap_or_else(|| "N/A".into())
 }
 
 fn term_theme_env() -> Option<String> {
@@ -1175,13 +1184,41 @@ fn term_theme_osc() -> Option<String> {
     }
 }
 
-/// Terminal background as `#RRGGBB`, from an OSC 11 query with `$COLORFGBG`
-/// as a fallback. Used to pick a light/dark scheme automatically.
+/// Terminal background as `#RRGGBB`, from `$COLORFGBG` first, then an OSC 11
+/// query. Used to pick a light/dark scheme automatically.
 pub fn term_bg() -> Option<String> {
-    if let (_, Some(bg)) = query_osc_colors() {
+    // `$COLORFGBG` is free and authoritative for the running shell.
+    if let Some(bg) = bg_from_colorfgbg(&env::var("COLORFGBG").unwrap_or_default()) {
         return Some(bg);
     }
-    let fgbg = env::var("COLORFGBG").ok()?;
+    // Styling only: with a pipe nothing is drawn, and the reply would just sit
+    // unread in the shell's input queue, so don't ask.
+    // SAFETY: `isatty` on a constant fd.
+    if unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1 {
+        return None;
+    }
+    // A terminal that never answers must not pay the probe timeout on every
+    // run, so the *silence* is cached for a while. Answers are re-read each
+    // run (~1 ms) so switching the terminal theme is picked up immediately.
+    const SILENT: &str = "1";
+    // Per terminal type: a silent emulator must not hide another one's answer.
+    let term = env::var("TERM").unwrap_or_default().replace('/', "_");
+    let key = format!("term_bg_silent_{term}");
+    if crate::cache::get_or_compute_ttl(&key, 300, || "0".into()) == SILENT {
+        return None;
+    }
+    match query_osc_colors().1 {
+        Some(bg) => Some(bg),
+        None => {
+            crate::cache::set(&key, SILENT);
+            None
+        }
+    }
+}
+
+/// Background from `$COLORFGBG` values like `"15;0"` (foreground;background in
+/// ANSI indexes).
+fn bg_from_colorfgbg(fgbg: &str) -> Option<String> {
     let bg = fgbg.split(';').next_back()?.trim().parse::<usize>().ok()?;
     ANSI_HEX.get(bg % 16).map(|s| (*s).to_string())
 }
@@ -1197,7 +1234,16 @@ pub fn term_is_light() -> Option<bool> {
 
 /// Query OSC 10 (foreground) and OSC 11 (background) from the controlling
 /// terminal. Returns `(fg, bg)` hex strings, either of which may be `None`.
+///
+/// The reply is fetched at most once per process (config and `--scheme` both
+/// resolve the scheme); `term_bg` skips it when nothing is drawn.
 fn query_osc_colors() -> (Option<String>, Option<String>) {
+    static RESPONSE: std::sync::OnceLock<(Option<String>, Option<String>)> =
+        std::sync::OnceLock::new();
+    RESPONSE.get_or_init(query_osc_colors_once).clone()
+}
+
+fn query_osc_colors_once() -> (Option<String>, Option<String>) {
     // SAFETY: opening `/dev/tty` returns a plain fd; checked below.
     let fd = unsafe {
         libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR | libc::O_NOCTTY)
@@ -1215,7 +1261,7 @@ fn query_osc_colors() -> (Option<String>, Option<String>) {
     let mut raw = saved;
     raw.c_lflag &= !(libc::ICANON | libc::ECHO);
     raw.c_cc[libc::VMIN] = 0;
-    raw.c_cc[libc::VTIME] = 1; // 100 ms per read
+    raw.c_cc[libc::VTIME] = 0; // non-blocking; `poll` owns the wait
     // SAFETY: applying a termios derived from the current one.
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
     let guard = TtyRaw { fd, saved };
@@ -1224,17 +1270,30 @@ fn query_osc_colors() -> (Option<String>, Option<String>) {
     // SAFETY: writing a static buffer to the open tty.
     unsafe { libc::write(fd, query.as_ptr().cast(), query.len()) };
 
+    // A terminal that answers does so in well under a millisecond; a silent one
+    // must not make every run wait longer than this.
     let mut buf = Vec::new();
     let mut tmp = [0u8; 256];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
-    while std::time::Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(60);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() { break; }
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid `pollfd` for the open tty.
+        if unsafe { libc::poll(&mut pfd, 1, left.as_millis() as libc::c_int) } <= 0 {
+            break;
+        }
         // SAFETY: reading into a valid buffer from the open tty.
         let n = unsafe { libc::read(fd, tmp.as_mut_ptr().cast(), tmp.len()) };
-        if n > 0 {
-            buf.extend_from_slice(&tmp[..n as usize]);
-            if buf.iter().filter(|&&b| b == 0x1b).count() >= 4 {
-                break;
-            }
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n as usize]);
+        let text = String::from_utf8_lossy(&buf);
+        // Stop as soon as both replies are complete instead of waiting for a
+        // fixed escape count.
+        if parse_osc_color(&text, 10).is_some() && parse_osc_color(&text, 11).is_some() {
+            break;
         }
     }
     drop(guard);
@@ -1572,6 +1631,15 @@ pub fn physical_disk() -> String {
 }
 
 fn disk_temp(name: &str) -> Option<f64> {
+    // An NVMe hwmon read can wake the controller (~30 ms on some laptops), so
+    // cache it briefly. TTL-gated because the value is volatile.
+    let key = format!("disk_temp_{name}");
+    crate::cache::get_or_compute_ttl(&key, 30, || {
+        disk_temp_uncached(name).map(|t| format!("{t:.1}")).unwrap_or_default()
+    }).parse().ok()
+}
+
+fn disk_temp_uncached(name: &str) -> Option<f64> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     // `nvme0n1` → controller `nvme0`, whose `hwmonN` node holds the temperature.
     if let Some(rest) = name.strip_prefix("nvme") {
@@ -1858,6 +1926,7 @@ fn bluetooth_info() -> (Option<String>, Option<String>) {
 }
 
 /// Uptime in seconds (for per-process CPU averaging).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn uptime_secs() -> u64 {
     let mut info = std::mem::MaybeUninit::<libc::sysinfo>::uninit();
     // SAFETY: `sysinfo` fills the struct on success.
@@ -1871,6 +1940,7 @@ fn uptime_secs() -> u64 {
 
 /// Top 5 processes by average CPU use since they started.
 #[allow(dead_code)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn top_processes() -> String {
     let hz = {
         // SAFETY: `sysconf` is always safe to call.
@@ -1884,7 +1954,7 @@ pub fn top_processes() -> String {
     };
     let uptime_ticks = uptime_secs().saturating_mul(hz);
     let Ok(rd) = fs::read_dir("/proc") else { return "N/A".into() };
-    let mut procs: Vec<(f64, u64, String, u64)> = Vec::new();
+    let mut procs: Vec<(f64, u64, String)> = Vec::new();
     for e in rd.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u64>().ok()) else { continue };
         let Ok(stat) = fs::read_to_string(e.path().join("stat")) else { continue };
@@ -1899,15 +1969,17 @@ pub fn top_processes() -> String {
         if elapsed == 0 { continue; }
         let cpu = (utime + stime) as f64 / elapsed as f64 * 100.0;
         if cpu < 0.05 { continue; }
-        let rss_pages: u64 = read_str(&format!("/proc/{pid}/statm"))
-            .split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
-        procs.push((cpu, pid, comm.to_string(), rss_pages.saturating_mul(page)));
+        procs.push((cpu, pid, comm.to_string()));
     }
     procs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     procs.truncate(5);
     if procs.is_empty() { return "N/A".into(); }
     let mut out = Vec::with_capacity(procs.len());
-    for (cpu, pid, name, rss) in procs {
+    for (cpu, pid, name) in procs {
+        // statm/io are only read for the five rows that survive the sort.
+        let rss_pages: u64 = read_str(&format!("/proc/{pid}/statm"))
+            .split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let rss = rss_pages.saturating_mul(page);
         let io = read_str(&format!("/proc/{pid}/io"));
         let rd_b = io.lines().find_map(|l| l.strip_prefix("read_bytes:"))
             .and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
@@ -1918,10 +1990,24 @@ pub fn top_processes() -> String {
     out.join(", ")
 }
 
+/// `/proc` process accounting is unavailable on macOS/BSD.
+#[allow(dead_code)]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn top_processes() -> String { "N/A".into() }
+
 /// Detailed monitor info for the first connected DRM connector (via EDID).
 #[allow(dead_code)]
-pub fn monitor() -> String {
-    let Ok(rd) = fs::read_dir("/sys/class/drm") else { return "N/A".into() };
+struct DisplayEntry {
+    name: String,
+    w: u32,
+    h: u32,
+    size_cm: Option<(u32, u32)>,
+    refresh: Option<f64>,
+    builtin: Option<bool>,
+}
+
+fn display_entry() -> Option<DisplayEntry> {
+    let rd = fs::read_dir("/sys/class/drm").ok()?;
     let mut entries: Vec<_> = rd.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
@@ -1938,26 +2024,104 @@ pub fn monitor() -> String {
         };
         let edid = fs::read(dir.join("edid")).unwrap_or_default();
         let (name, size_cm, refresh) = edid_info(&edid);
-        let name = name.unwrap_or_else(|| {
-            e.file_name().to_string_lossy()
-                .split_once('-').map(|(_, n)| n.to_string())
-                .unwrap_or_else(|| e.file_name().to_string_lossy().into_owned())
-        });
-        let mut out = format!("{name}: {w}x{h} px");
-        if let Some(r) = refresh {
-            out.push_str(&format!(" @ {r:.3} Hz"));
-        }
-        if let Some((wc, hc)) = size_cm {
-            let inches = ((wc as f64 / 2.54).powi(2) + (hc as f64 / 2.54).powi(2)).sqrt();
-            let ppi = ((w * w + h * h) as f64).sqrt() / inches;
-            out.push_str(&format!(
-                " - {}x{} mm ({inches:.2} inches, {ppi:.2} ppi)",
-                wc * 10, hc * 10
-            ));
-        }
-        return out;
+        let connector = e.file_name().to_string_lossy()
+            .split_once('-').map(|(_, n)| n.to_string())
+            .unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
+        let name = name.unwrap_or_else(|| connector.clone());
+        // DRM connector types are the only portable hint for panel kind.
+        let builtin = if connector.starts_with("eDP") || connector.starts_with("LVDS")
+            || connector.starts_with("DSI")
+        {
+            Some(true)
+        } else if connector.starts_with("HDMI") || connector.starts_with("DP")
+            || connector.starts_with("DisplayPort") || connector.starts_with("DVI")
+            || connector.starts_with("VGA")
+        {
+            Some(false)
+        } else {
+            None
+        };
+        return Some(DisplayEntry { name, w, h, size_cm, refresh, builtin });
     }
-    "N/A".into()
+    None
+}
+
+pub fn monitor() -> String {
+    let Some(d) = display_entry() else { return "N/A".into() };
+    let (name, w, h) = (d.name, d.w, d.h);
+    let mut out = format!("{name}: {w}x{h} px");
+    if let Some(r) = d.refresh {
+        out.push_str(&format!(" @ {r:.3} Hz"));
+    }
+    if let Some((wc, hc)) = d.size_cm {
+        let inches = ((wc as f64 / 2.54).powi(2) + (hc as f64 / 2.54).powi(2)).sqrt();
+        let ppi = ((w * w + h * h) as f64).sqrt() / inches;
+        out.push_str(&format!(
+            " - {}x{} mm ({inches:.2} inches, {ppi:.2} ppi)",
+            wc * 10, hc * 10
+        ));
+    }
+    out
+}
+
+/// Fastfetch's `display` line: `Display (name)`, `1920x1080 in 15", 60 Hz`.
+pub fn display_fastfetch() -> (String, String) {
+    let Some(d) = display_entry() else { return ("Display".into(), "N/A".into()) };
+    let mut out = format!("{}x{}", d.w, d.h);
+    if let Some((wc, hc)) = d.size_cm {
+        let inches = ((wc as f64 / 2.54).powi(2) + (hc as f64 / 2.54).powi(2)).sqrt();
+        if inches > 1.0 {
+            out.push_str(&format!(" in {:.0}\"", inches));
+        }
+    }
+    if let Some(r) = d.refresh {
+        out.push_str(&format!(", {r:.0} Hz"));
+    }
+    match d.builtin {
+        Some(true) => out.push_str(" [Built-in]"),
+        Some(false) => out.push_str(" [External]"),
+        None => {}
+    }
+    (format!("Display ({})", d.name), out)
+}
+
+/// Fastfetch's default battery line plus its dynamic `Battery (model)` key.
+pub fn battery_fastfetch() -> Option<(String, String)> {
+    let ac = ["AC", "ACAD", "ADP0", "ADP1"].iter().any(|n| {
+        read_str(&format!("/sys/class/power_supply/{n}/online")) == "1"
+    });
+    let dir = fs::read_dir("/sys/class/power_supply").ok()?;
+    for e in dir.flatten() {
+        let base = e.path();
+        if read_path(&base.join("type")).as_deref() != Some("Battery") {
+            continue;
+        }
+        let Some(cap) = read_path(&base.join("capacity")) else { continue };
+        let model = read_path(&base.join("model_name")).unwrap_or_default();
+        let status = read_path(&base.join("status")).unwrap_or_default();
+        let level = read_path(&base.join("capacity_level")).unwrap_or_default();
+        let mut flags = Vec::new();
+        if ac { flags.push("AC Connected"); }
+        match status.as_str() {
+            "Charging" => flags.push("Charging"),
+            "Discharging" => flags.push("Discharging"),
+            "Full" => flags.push("Full"),
+            _ => {}
+        }
+        if level == "Critical" { flags.push("Critical"); }
+        let value = if flags.is_empty() {
+            format!("{cap}%")
+        } else {
+            format!("{cap}% [{}]", flags.join(", "))
+        };
+        let key = if model.is_empty() {
+            "Battery".to_string()
+        } else {
+            format!("Battery ({model})")
+        };
+        return Some((key, value));
+    }
+    None
 }
 
 fn edid_info(edid: &[u8]) -> (Option<String>, Option<(u32, u32)>, Option<f64>) {
@@ -2027,6 +2191,27 @@ fn preferred_refresh(edid: &[u8]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colorfgbg_background_is_decoded() {
+        assert_eq!(bg_from_colorfgbg("15;0").as_deref(), Some("#000000"));
+        assert_eq!(bg_from_colorfgbg("0;15").as_deref(), Some("#ffffff"));
+        assert_eq!(bg_from_colorfgbg("7;4").as_deref(), Some("#000080"));
+        assert_eq!(bg_from_colorfgbg("0").as_deref(), Some("#000000"));
+        assert_eq!(bg_from_colorfgbg(""), None);
+        assert_eq!(bg_from_colorfgbg("0;nope"), None);
+    }
+
+    #[test]
+    fn osc_colour_replies_parse_bel_st_and_wide_components() {
+        let bel = "\x1b]10;rgb:ffff/aaaa/8080\x07\x1b]11;rgb:1e1e/1e1e/1e1e\x07";
+        assert_eq!(parse_osc_color(bel, 10).as_deref(), Some("#FFAA80"));
+        assert_eq!(parse_osc_color(bel, 11).as_deref(), Some("#1E1E1E"));
+        // ST-terminated replies and three-digit components.
+        let st = "\x1b]11;rgb:fff/000/123\x1b\\";
+        assert_eq!(parse_osc_color(st, 11).as_deref(), Some("#FF0012"));
+        assert_eq!(parse_osc_color("\x1b]11;rgb:zz/00/00\x07", 11), None);
+    }
 
     #[test]
     fn run_timeout_captures_stdout() {

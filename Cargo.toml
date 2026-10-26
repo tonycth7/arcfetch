@@ -1,8 +1,10 @@
 [package]
 name        = "arcfetch"
-version     = "1.0.9"
+version     = "1.1.0"
 edition = "2021"
-description = "Blazing-fast Arch Linux sysinfo"
+description = "Blazing-fast Unix sysinfo"
+license = "MIT"
+repository = "https://github.com/tonycth7/arcfetch"
 
 [[bin]]
 name = "arcfetch"

@@ -5,6 +5,7 @@ mod anim;
 mod cache;
 mod config;
 mod cosmic;
+mod fastfetch;
 mod info;
 mod jsonc;
 mod logos;
@@ -14,7 +15,7 @@ mod net;
 mod pkgs;
 mod scheme;
 
-use std::{env, thread};
+use std::{env, fs, thread};
 use std::f64::consts::PI;
 use std::io::{Write, stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,7 +180,78 @@ pub(crate) fn expand_path(path: &str) -> String {
     } else { path.to_string() }
 }
 
-fn kitty_image(path: &str) -> Option<String> {
+/// Pixel dimensions from a PNG/GIF/JPEG header, without an image crate.
+fn image_size(data: &[u8]) -> Option<(u32, u32)> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") && data.len() >= 24 {
+        let w = u32::from_be_bytes(data[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(data[20..24].try_into().ok()?);
+        return Some((w, h));
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        if data.len() < 10 { return None; }
+        let w = u16::from_le_bytes(data[6..8].try_into().ok()?) as u32;
+        let h = u16::from_le_bytes(data[8..10].try_into().ok()?) as u32;
+        return Some((w, h));
+    }
+    if data.starts_with(&[0xFF, 0xD8]) {
+        let mut i = 2;
+        while i + 4 <= data.len() {
+            if data[i] != 0xFF { i += 1; continue; }
+            let marker = data[i + 1];
+            i += 2;
+            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+                continue;
+            }
+            let len = u16::from_be_bytes(data[i..i + 2].try_into().ok()?) as usize;
+            if len < 2 || i + len > data.len() { break; }
+            if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF)
+                && len >= 7
+            {
+                let h = u16::from_be_bytes(data[i + 3..i + 5].try_into().ok()?) as u32;
+                let w = u16::from_be_bytes(data[i + 5..i + 7].try_into().ok()?) as u32;
+                return Some((w, h));
+            }
+            i += len;
+        }
+    }
+    None
+}
+
+/// Cell dimensions for a kitty image. Terminals use roughly 2:1 cells, so a
+/// pixel aspect ratio maps to terminal rows without a pixel-size query.
+fn image_cells(data: &[u8], width: Option<usize>, height: Option<usize>)
+    -> (usize, usize)
+{
+    let (cols, rows) = match (width, height) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => {
+            let r = image_size(data)
+                .map(|(pw, ph)| (w as f64 * ph as f64 / (pw.max(1) as f64 * 2.0)).round())
+                .unwrap_or(19.0);
+            (w, r.max(1.0) as usize)
+        }
+        (None, Some(h)) => {
+            let c = image_size(data)
+                .map(|(pw, ph)| (h as f64 * 2.0 * pw as f64 / ph.max(1) as f64).round())
+                .unwrap_or(31.0);
+            (c.max(1.0) as usize, h)
+        }
+        (None, None) => {
+            let r = image_size(data)
+                .map(|(pw, ph)| (31.0 * ph as f64 / (pw.max(1) as f64 * 2.0)).round())
+                .unwrap_or(19.0);
+            (31, r.max(1.0) as usize)
+        }
+    };
+    (cols.clamp(1, 200), rows.clamp(1, 200))
+}
+
+/// `(escape, columns, rows)`. `hold` keeps the cursor on the image's top-left
+/// cell so info can be printed beside it; otherwise the terminal moves past
+/// the image (the old above/below layout).
+fn kitty_image(path: &str, width: Option<usize>, height: Option<usize>, hold: bool)
+    -> Option<(String, usize, usize)>
+{
     let ext = path.rsplit('.').next()?.to_lowercase();
     let format = match ext.as_str() {
         "png" => 100u32,
@@ -190,11 +262,13 @@ fn kitty_image(path: &str) -> Option<String> {
     let expanded = expand_path(path);
     let data = std::fs::read(&expanded).ok()?;
     let b64 = base64_encode(&data);
-    Some(format!("\x1b_Ga=T,f={},c=31,r=19,d=A;{}\x1b\\", format, b64))
+    let (cols, rows) = image_cells(&data, width, height);
+    let hold = if hold { "C=1," } else { "" };
+    Some((format!("\x1b_Ga=T,f={format},{hold}c={cols},r={rows};{b64}\x1b\\"), cols, rows))
 }
 
 /// System hostname via `gethostname(2)`, or `"localhost"` on failure.
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let mut buf = [0 as libc::c_char; 256];
     // SAFETY: `buf` is a valid, writable buffer of `buf.len()` bytes.
     if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } == 0 {
@@ -208,6 +282,9 @@ fn hostname() -> String {
 }
 
 fn detect_auto_logo(si: &info::SysInfo) -> String {
+    if env::var_os("TERMUX_VERSION").is_some() {
+        return "termux".into();
+    }
     if !si.os_id.is_empty() {
         return logos::detect(&si.os_id, &si.os_id_like).to_string();
     }
@@ -295,9 +372,9 @@ fn run_intro(
     anim: &config::Animation,
 ) {
     use std::fmt::Write as _;
-    const FRAME_MS: u64 = 33;
+    let frame_ms = anim.frame_ms();
 
-    let frames = (anim.intro_ms / FRAME_MS).clamp(1, 24);
+    let frames = (anim.intro_ms / frame_ms).clamp(1, 24);
     let animated_logo = logos::is_animated(logo_name);
     let effect = if animated_logo {
         logos::AnimEffect::None
@@ -320,6 +397,7 @@ fn run_intro(
     let indent = " ".repeat(cfg.layout.indent);
     let gap = " ".repeat(cfg.layout.gap);
     for tick in 0..frames {
+        let frame_deadline = Instant::now() + Duration::from_millis(frame_ms);
         if !RUNNING.load(Ordering::Relaxed) { break; }
         let base: Vec<String> = logos::frame(logo_name, tick as usize, 4);
         let widths: Vec<usize> = base.iter().map(|l| visible_chars(l)).collect();
@@ -338,7 +416,7 @@ fn run_intro(
 
             if args.no_color {
                 let _ = writeln!(frame, "{indent}{}{}{gap}{}", line, " ".repeat(pad), inf);
-            } else if animated_logo && anim.wave {
+            } else if animated_logo {
                 let shown = wave_text(&line, i, base.len(), tick as usize, &cfg.colors.logo, anim);
                 let _ = writeln!(frame, "{indent}{}{}{gap}{}", shown, " ".repeat(pad), inf);
             } else {
@@ -350,7 +428,9 @@ fn run_intro(
         prev_nl = frame.matches('\n').count();
         buf.write_all(frame.as_bytes()).ok();
         buf.flush().ok();
-        thread::sleep(Duration::from_millis(FRAME_MS));
+        if let Some(left) = frame_deadline.checked_duration_since(Instant::now()) {
+            thread::sleep(left);
+        }
     }
 
     if prev_nl > 0 { write!(buf, "\x1b[{prev_nl}A\r").ok(); }
@@ -367,8 +447,8 @@ fn run_animate(
     effect_name: &str,
     duration: Option<u64>,
 ) {
-    const FRAME_MS: u64 = 33;
-    const DEFAULT_FRAMES: u64 = 90; // ≈3s
+    let frame_ms = cfg.animation.frame_ms();
+    let default_frames = (3000 / frame_ms).max(1); // ≈3s
 
     RUNNING.store(true, Ordering::Relaxed);
     unsafe {
@@ -379,9 +459,9 @@ fn run_animate(
 
     let effect = parse_effect(effect_name);
     let max_frames: Option<u64> = match duration {
-        None    => Some(DEFAULT_FRAMES),
+        None    => Some(default_frames),
         Some(0) => None, // Ctrl+C to stop
-        Some(n) => Some((n * 1000 / FRAME_MS).max(1)),
+        Some(n) => Some((n * 1000 / frame_ms).max(1)),
     };
 
     let indent = " ".repeat(cfg.layout.indent);
@@ -391,15 +471,25 @@ fn run_animate(
     let mut buf = out.lock();
     screen_enter(&mut buf);
 
+    // Fit frame animations to the terminal once, leaving room for the info.
+    let (cols, rows) = term_size();
+    let info_w = info.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
+    let art_max = cols
+        .saturating_sub(info_w + cfg.layout.gap + cfg.layout.indent)
+        .max(1);
+    let frames: Option<Vec<Vec<String>>> =
+        art.anim.map(|a| a.fitted(art_max, rows.saturating_sub(2).max(1)));
+
     let mut tick: u64 = 0;
     loop {
+        let frame_deadline = Instant::now() + Duration::from_millis(frame_ms);
         if !RUNNING.load(Ordering::Relaxed) { break; }
         if let Some(max) = max_frames { if tick >= max { break; } }
         let t = tick as usize;
 
         let owned;
-        let base: &[String] = if let Some(a) = art.anim {
-            a.frame(t, 1)
+        let base: &[String] = if let Some(frames) = &frames {
+            &frames[t % frames.len()]
         } else if let Some(c) = art.lines {
             c
         } else {
@@ -428,7 +518,9 @@ fn run_animate(
         buf.write_all(screen.as_bytes()).ok();
         buf.flush().ok();
 
-        thread::sleep(Duration::from_millis(FRAME_MS));
+        if let Some(left) = frame_deadline.checked_duration_since(Instant::now()) {
+            thread::sleep(left);
+        }
         tick += 1;
     }
 
@@ -490,13 +582,7 @@ fn build_info(si: &info::SysInfo, cfg: &Config) -> Vec<String> {
     // uptime — short or long format based on config
     if sh.uptime {
         let upt_str = if sh.uptime_long {
-            let s = si.uptime_secs;
-            let (d, h, m) = (s/86400, (s%86400)/3600, (s%3600)/60);
-            match (d, h, m) {
-                (0, 0, m) => format!("{} min{}", m, if m==1 {""} else {"s"}),
-                (0, h, m) => format!("{} hr{}, {} min{}", h, if h==1 {""} else {"s"}, m, if m==1 {""} else {"s"}),
-                (d, h, m) => format!("{} day{}, {} hr{}, {} min{}", d, if d==1 {""} else {"s"}, h, if h==1 {""} else {"s"}, m, if m==1 {""} else {"s"}),
-            }
+            uptime_long(si.uptime_secs)
         } else {
             si.uptime.clone()
         };
@@ -683,7 +769,16 @@ fn module_value(kind: &str, si: &info::SysInfo, cfg: &Config) -> Option<(String,
     match norm(kind).as_str() {
         "os" => v!("os", si.os),
         "kernel" => v!("kernel", si.kernel),
-        "uptime" => v!("uptime", si.uptime),
+        "uptime" => {
+            let val = if cfg.fastfetch {
+                uptime_fastfetch(si.uptime_secs)
+            } else if cfg.show.uptime_long {
+                uptime_long(si.uptime_secs)
+            } else {
+                si.uptime.clone()
+            };
+            Some(("uptime".into(), val))
+        }
         "res" => v!("res", si.res),
         "pkgs" | "packages" => v!("pkgs", si.pkgs),
         "shell" => v!("shell", si.shell),
@@ -692,7 +787,14 @@ fn module_value(kind: &str, si: &info::SysInfo, cfg: &Config) -> Option<(String,
         "cpu" => v!("cpu", si.cpu),
         "gpu" => v!("gpu", si.gpu),
         "gputemp" => v!("gpu °C", si.gpu_temp),
-        "battery" => v!("battery", si.battery),
+        "battery" => {
+            if cfg.fastfetch {
+                let key = if si.battery_key.is_empty() { "Battery" } else { &si.battery_key };
+                Some((key.to_string(), si.battery.clone()))
+            } else {
+                v!("battery", si.battery)
+            }
+        }
         "disk" => v!("disk", si.disk),
         "load" | "loadavg" => v!("load", si.load),
         "locale" => v!("locale", si.locale),
@@ -761,7 +863,14 @@ fn module_value(kind: &str, si: &info::SysInfo, cfg: &Config) -> Option<(String,
         "tpm" => v!("tpm", si.tpm),
         "physicaldisk" => v!("phy disk", si.physical_disk),
         "topprocesses" => v!("top procs", si.top_processes),
-        "monitor" => v!("monitor", si.monitor),
+        "monitor" => {
+            if cfg.fastfetch {
+                let key = if si.display_key.is_empty() { "Display" } else { &si.display_key };
+                Some((key.to_string(), si.monitor.clone()))
+            } else {
+                v!("monitor", si.monitor)
+            }
+        }
         "version" => v!("version", env!("CARGO_PKG_VERSION").to_string()),
         _ => None,
     }
@@ -769,6 +878,9 @@ fn module_value(kind: &str, si: &info::SysInfo, cfg: &Config) -> Option<(String,
 
 fn format_color(spec: &str, key_color: &str) -> Option<String> {
     if spec.is_empty() { return Some(RESET.into()); }
+    // Fastfetch spells the terminal default `default` (and `reset_` for a
+    // full reset). Without this, `{#default}` used to fall through to blue.
+    if spec == "default" || spec == "reset_" { return Some(RESET.into()); }
     if spec == "keys" { return Some(key_color.to_string()); }
     if let Some(n) = spec.strip_prefix('@').and_then(|v| v.parse::<u8>().ok()) {
         return Some(format!("\x1b[38;5;{}m", n));
@@ -793,10 +905,128 @@ fn value_slice(value: &str, spec: &str) -> String {
     value.chars().skip(start).take(end.map_or(usize::MAX, |e| e.saturating_sub(start))).collect()
 }
 
+/// Kernel name for fastfetch's `{sysname}` token.
+fn sysname() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "Darwin",
+        "freebsd" => "FreeBSD",
+        "netbsd" => "NetBSD",
+        "openbsd" => "OpenBSD",
+        _ => "Linux",
+    }
+}
+
+/// DMI host field, cleaned like fastfetch. Falls back to the collected
+/// `host` string when the platform has no DMI files (macOS/BSD).
+fn host_field(name: &str, si: &info::SysInfo) -> Option<String> {
+    let file = match name {
+        "family" => "product_family",
+        "name" => "product_name",
+        "version" => "product_version",
+        "sku" => "product_sku",
+        "vendor" => "sys_vendor",
+        "serial" => "product_serial",
+        "uuid" => "product_uuid",
+        _ => return None,
+    };
+    let raw = std::fs::read_to_string(format!("/sys/class/dmi/id/{file}"))
+        .unwrap_or_default();
+    let raw = raw.trim();
+    let bogus = ["Not Applicable", "Not Specified", "None", "Unknown",
+                 "To Be Filled By O.E.M.", "System Product Name"];
+    if !raw.is_empty() && !bogus.contains(&raw) {
+        return Some(raw.to_string());
+    }
+    if name == "name" {
+        let mut parts = si.host.splitn(2, char::is_whitespace);
+        let first = parts.next().unwrap_or("");
+        return Some(parts.next().unwrap_or(first).to_string());
+    }
+    if name == "vendor" {
+        return si.host.split_whitespace().next().map(str::to_string);
+    }
+    Some(String::new())
+}
+
+/// `"83% [AC Connected, Charging]"` → (`"83%"`, `"AC Connected, Charging"`).
+fn battery_parts(value: &str) -> (String, String) {
+    let cap = value.split_whitespace().next().unwrap_or("").to_string();
+    let status = value.split_once('[')
+        .and_then(|(_, rest)| rest.rsplit_once(']').map(|(s, _)| s.trim().to_string()))
+        .unwrap_or_default();
+    (cap, status)
+}
+
+/// Fastfetch numeric placeholders. `{1}` still means the whole value for
+/// custom modules; only host/battery have published field orders.
+fn numeric_field(name: &str, kind: &str, value: &str, si: &info::SysInfo) -> Option<String> {
+    let n = name.parse::<usize>().ok()?;
+    match norm(kind).as_str() {
+        "host" => {
+            let field = match n {
+                1 => "family", 2 => "name", 3 => "version", 4 => "sku",
+                5 => "vendor", 6 => "serial", 7 => "uuid", _ => return Some(String::new()),
+            };
+            host_field(field, si)
+        }
+        "battery" => match n {
+            4 => Some(battery_parts(value).0),
+            5 => Some(battery_parts(value).1),
+            _ => Some(String::new()),
+        },
+        "gpu" => match n {
+            1 => Some(value.to_string()),
+            2 => gpu_driver_value(si),
+            3 => info::gpu_type().map(|t| t.to_string()),
+            _ => Some(String::new()),
+        },
+        _ => None,
+    }
+}
+
+/// Resolve the GPU driver for fastfetch-style `{2}` field references on GPU modules.
+/// Computes it on demand when `show.gpu_driver` didn't already populate `si.gpu_driver`.
+fn gpu_driver_value(si: &info::SysInfo) -> Option<String> {
+    if !si.gpu_driver.is_empty() {
+        return Some(si.gpu_driver.clone());
+    }
+    // Fall back to reading the DRM driver directly (same logic as collect_all).
+    let mut drv = "Unknown".to_string();
+    for i in 0..4u8 {
+        let uevent = format!("/sys/class/drm/card{}/device/uevent", i);
+        if let Ok(u) = fs::read_to_string(&uevent) {
+            if let Some(p) = u.lines().find(|l| l.starts_with("DRIVER=")) {
+                let name = p.trim_start_matches("DRIVER=").to_string();
+                if !name.is_empty() { drv = name; break; }
+            }
+        }
+    }
+    if drv == "nvidia" || drv == "Unknown" {
+        if let Ok(v) = fs::read_to_string("/proc/driver/nvidia/version") {
+            if let Some(l) = v.lines().next() {
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                if parts.len() >= 2 { drv = format!("nvidia {}", parts[1]); }
+            }
+        }
+    }
+    if drv == "amdgpu" || drv.starts_with("amdgpu") {
+        if let Ok(v) = fs::read_to_string("/sys/module/amdgpu/version") {
+            let v = v.trim();
+            if !v.is_empty() { drv = format!("amdgpu {}", v); }
+        }
+    }
+    Some(drv)
+}
+
 fn format_field(
     name: &str, kind: &str, key: &str, value: &str, icon: &str,
     si: &info::SysInfo, cfg: &Config,
 ) -> Option<String> {
+    if name.bytes().all(|b| b.is_ascii_digit()) {
+        if let Some(v) = numeric_field(name, kind, value, si) {
+            return Some(v);
+        }
+    }
     let c = &cfg.colors;
     let (user, host) = user_host();
     match name {
@@ -808,30 +1038,122 @@ fn format_field(
         "user-name-colored" => Some(format!("{}{}{}", c.username, user, RESET)),
         "host-name-colored" => Some(format!("{}{}{}", c.hostname, host, RESET)),
         "at-symbol-colored" => Some(format!("{}{}{}", OVERLAY0, "@", RESET)),
-        "sysname" => Some("Linux".into()),
+        "sysname" => Some(sysname().into()),
         "arch" => Some(std::env::consts::ARCH.into()),
+        "family" if norm(kind) == "host" => host_field("family", si),
+        "name" if norm(kind) == "host" => host_field("name", si),
+        "version" if norm(kind) == "host" => host_field("version", si),
+        "sku" if norm(kind) == "host" => host_field("sku", si),
+        "vendor" if norm(kind) == "host" => host_field("vendor", si),
+        "serial" if norm(kind) == "host" => host_field("serial", si),
+        "uuid" if norm(kind) == "host" => host_field("uuid", si),
+        "capacity" if norm(kind) == "battery" => Some(battery_parts(value).0),
+        "status" if norm(kind) == "battery" => Some(battery_parts(value).1),
         "pretty-name" | "name" if norm(kind) == "os" => Some(si.os.clone()),
+        "pretty-name" | "name" if matches!(norm(kind).as_str(), "de" | "wm" | "desktop") => Some(si.de_wm.clone()),
+        "pretty-name" | "name" if matches!(norm(kind).as_str(), "term" | "terminal") => Some(si.term.clone()),
+        "process-name" | "exe-name" if matches!(norm(kind).as_str(), "de" | "wm" | "desktop") => Some(si.de_wm.clone()),
+        "process-name" | "exe-name" if matches!(norm(kind).as_str(), "term" | "terminal") => Some(si.term.clone()),
+        "release" | "kernel-release" if norm(kind) == "kernel" => Some(si.kernel.clone()),
+        "release" | "kernel-release" if norm(kind) == "os" => {
+            if cfg.fastfetch { Some(si.os_version.clone()) } else { Some(si.kernel.clone()) }
+        }
         "id" => Some(si.os_id.clone()),
         "id-like" => Some(si.os_id_like.clone()),
         "version" if norm(kind) == "kernel" => Some(si.kernel.clone()),
-        "version" if norm(kind) == "os" => Some(si.kernel.clone()),
+        "version" if norm(kind) == "os" => {
+            if cfg.fastfetch { Some(si.os_version.clone()) } else { Some(si.kernel.clone()) }
+        }
+        "version" if matches!(norm(kind).as_str(), "de" | "wm" | "desktop") => Some(si.de_wm_ver.clone()),
+        "version" if matches!(norm(kind).as_str(), "term" | "terminal") => {
+            Some(env::var("TERM_PROGRAM_VERSION").unwrap_or_default())
+        }
+        "protocol-name" if matches!(norm(kind).as_str(), "de" | "wm" | "desktop") => {
+            Some(if env::var_os("WAYLAND_DISPLAY").is_some() {
+                "Wayland".into()
+            } else if env::var_os("DISPLAY").is_some() {
+                "X11".into()
+            } else {
+                String::new()
+            })
+        }
+        "formatted" | "combined" | "result" => Some(value.to_string()),
+        "filesystem" if norm(kind) == "disk" => Some(root_filesystem()),
+        "all" | "appimage" | "flatpak-system" | "flatpak-user" | "flatpak-all"
+        | "nix-default" | "nix-system" | "nix-user" | "nix-all"
+        | "pacman" | "dpkg" | "rpm" | "apk" | "portage" | "xbps" | "bedrock"
+            if matches!(norm(kind).as_str(), "pkgs" | "packages") => package_field(value, name),
+        "temperature" if norm(kind) == "cpu" => Some(si.cpu_temp.clone()),
+        "temperature" if norm(kind) == "gpu" => Some(si.gpu_temp.clone()),
+        "usage" | "avg" if matches!(norm(kind).as_str(), "cpu" | "cpuusage") => {
+            Some(si.cpu_usage.clone())
+        }
+        "freq-max" | "frequency" if norm(kind) == "cpu" => {
+            let khz = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())?;
+            Some(format!("{:.2} GHz", khz / 1_000_000.0))
+        }
+        "type" if norm(kind) == "gpu" => info::gpu_type().map(str::to_string),
+        "vendor" if norm(kind) == "gpu" => value.split_whitespace().next().map(str::to_string),
+        "process-name" | "exe-name" | "pretty-name" if norm(kind) == "shell" => {
+            Some(si.shell.split_whitespace().next().unwrap_or(&si.shell).to_string())
+        }
+        "version" if norm(kind) == "shell" => {
+            si.shell.split_whitespace().nth(1).map(str::to_string)
+        }
+        "user-id" => Some(unsafe { libc::getuid() }.to_string()),
+        "mac" if norm(kind) == "localip" => {
+            let ifname = si.local_ip.split_whitespace().next().unwrap_or("");
+            (ifname != "N/A").then(|| {
+                fs::read_to_string(format!("/sys/class/net/{ifname}/address"))
+                    .map(|v| v.trim().to_string()).unwrap_or_default()
+            })
+        }
+        "artist" if norm(kind) == "media" => {
+            si.media.split_once(" - ").map(|(a, _)| a.to_string())
+        }
+        "home-dir" => env::var("HOME").ok(),
+        "user-shell" => env::var("SHELL").ok(),
+        "exe-path" => env::current_exe().ok().map(|p| p.display().to_string()),
+        "pid" => Some(std::process::id().to_string()),
+        "cwd" => env::current_dir().ok().map(|p| p.display().to_string()),
         "name" => Some(value.to_string()),
-        "title" if norm(kind) == "media" => Some(value.to_string()),
-        "used" | "total" | "percentage" | "size-used" | "size-total" | "size-percentage" => {
+        "title" if norm(kind) == "media" => {
+            Some(si.media.split_once(" - ").map(|(_, t)| t).unwrap_or(&si.media).to_string())
+        }
+        "used" | "total" | "percentage" | "size-used" | "size-total" | "size-percentage"
+        | "percentage-bar" | "size-percentage-bar" => {
             let (used, total) = match norm(kind).as_str() {
                 "memory" | "mem" => (si.mem_used as f64 / 1024.0, si.mem_total as f64 / 1024.0),
                 "disk" => parse_pair(&si.disk),
                 "swap" => parse_pair(&si.swap),
                 _ => parse_pair(value),
             };
+            if name.ends_with("percentage-bar") {
+                return Some(bar_cfg(used as u64, total as u64, cfg));
+            }
             let pct = if total > 0.0 { used / total * 100.0 } else { 0.0 };
-            let val = match name {
-                "used" => format!("{used:.1}"),
-                "total" => format!("{total:.1}"),
-                "percentage" => format!("{pct:.0}%"),
-                "size-used" => format!("{used:.1}G"),
-                "size-total" => format!("{total:.1}G"),
-                _ => format!("{pct:.0}%"),
+            // Fastfetch prints binary units with two digits; arcfetch's own
+            // compact layout keeps one digit.
+            let val = if cfg.fastfetch {
+                match name {
+                    "used" => format!("{used:.2} GiB"),
+                    "total" => format!("{total:.2} GiB"),
+                    "percentage" => format!("{pct:.0}%"),
+                    "size-used" => format!("{used:.2} GiB"),
+                    "size-total" => format!("{total:.2} GiB"),
+                    _ => format!("{pct:.0}%"),
+                }
+            } else {
+                match name {
+                    "used" => format!("{used:.1}"),
+                    "total" => format!("{total:.1}"),
+                    "percentage" => format!("{pct:.0}%"),
+                    "size-used" => format!("{used:.1}G"),
+                    "size-total" => format!("{total:.1}G"),
+                    _ => format!("{pct:.0}%"),
+                }
             };
             Some(val)
         }
@@ -850,7 +1172,7 @@ fn format_field(
             else { Some(value.to_string()) }
         }
         "ifname" if norm(kind) == "localip" => Some(si.local_ip.split_whitespace().next().unwrap_or("").into()),
-        "cores-logical" | "cores-physical" => {
+        "cores-logical" | "cores-online" | "cores-physical" => {
             Some(unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.to_string())
         }
         "driver" => Some(si.gpu_driver.clone()),
@@ -865,14 +1187,94 @@ fn parse_pair(s: &str) -> (f64, f64) {
     (it.next().unwrap_or(0.0), it.next().unwrap_or(0.0))
 }
 
+fn root_filesystem() -> String {
+    std::fs::read_to_string("/proc/mounts").ok()
+        .and_then(|s| s.lines().find_map(|line| {
+            let mut f = line.split_whitespace();
+            let _dev = f.next()?;
+            let mount = f.next()?;
+            let fs = f.next()?;
+            (mount == "/").then(|| fs.to_string())
+        }))
+        .unwrap_or_default()
+}
+
+/// Pull one manager's count out of a `"2302 (pacman), 7 (flatpak-system)"` list.
+fn package_field(value: &str, name: &str) -> Option<String> {
+    if name == "all" {
+        let total: u64 = value.split(',')
+            .filter_map(|p| p.trim().split_once('('))
+            .filter_map(|(n, _)| n.trim().parse::<u64>().ok())
+            .sum();
+        return Some(total.to_string());
+    }
+    if name == "flatpak-all" || name == "nix-all" {
+        let names: &[&str] = if name == "flatpak-all" {
+            &["flatpak-system", "flatpak-user"]
+        } else {
+            &["nix-default", "nix-system", "nix-user"]
+        };
+        let mut total = 0u64;
+        for part in value.split(',') {
+            let part = part.trim();
+            let Some(open) = part.find('(') else { continue };
+            let mgr = part[open + 1..].trim_end_matches(')').trim();
+            if names.contains(&mgr) {
+                total += part[..open].trim().parse::<u64>().unwrap_or(0);
+            }
+        }
+        return Some(total.to_string());
+    }
+    for part in value.split(',') {
+        let part = part.trim();
+        let Some(open) = part.find('(') else { continue };
+        let count = part[..open].trim();
+        let mgr = part[open + 1..].trim_end_matches(')').trim();
+        if mgr == name { return Some(count.to_string()); }
+    }
+    None
+}
+
+fn uptime_long(secs: u64) -> String {
+    let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
+    match (d, h, m) {
+        (0, 0, m) => format!("{} min{}", m, if m == 1 { "" } else { "s" }),
+        (0, h, m) => format!("{} hr{}, {} min{}",
+            h, if h == 1 { "" } else { "s" }, m, if m == 1 { "" } else { "s" }),
+        (d, h, m) => format!("{} day{}, {} hr{}, {} min{}",
+            d, if d == 1 { "" } else { "s" },
+            h, if h == 1 { "" } else { "s" },
+            m, if m == 1 { "" } else { "s" }),
+    }
+}
+
+/// Fastfetch's own uptime wording: `1 hour, 30 mins`.
+fn uptime_fastfetch(secs: u64) -> String {
+    let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
+    let mut parts = Vec::new();
+    if d > 0 { parts.push(format!("{} day{}", d, if d == 1 { "" } else { "s" })); }
+    if h > 0 { parts.push(format!("{} hour{}", h, if h == 1 { "" } else { "s" })); }
+    if m > 0 || parts.is_empty() { parts.push(format!("{} min{}", m, if m == 1 { "" } else { "s" })); }
+    parts.join(", ")
+}
+
 fn format_template(
     tpl: &str, kind: &str, key: &str, value: &str, icon: &str,
     si: &info::SysInfo, cfg: &Config, key_color: &str,
+) -> String {
+    let mut terminated = false;
+    format_template_inner(tpl, kind, key, value, icon, si, cfg, key_color, &mut terminated)
+}
+
+fn format_template_inner(
+    tpl: &str, kind: &str, key: &str, value: &str, icon: &str,
+    si: &info::SysInfo, cfg: &Config, key_color: &str, terminated: &mut bool,
 ) -> String {
     let mut out = String::with_capacity(tpl.len() + 32);
     let b = tpl.as_bytes();
     let mut i = 0;
     while i < b.len() {
+        if *terminated { return out; }
         if b[i] != b'{' {
             // Copy whole UTF-8 runs, not byte-by-byte, so non-ASCII text
             // (box drawing, nerd icons) is not re-encoded as Latin-1.
@@ -886,12 +1288,33 @@ fn format_template(
         let token = &tpl[i + 1..end];
         i = end + 1;
 
+        if token == "-" {
+            *terminated = true;
+            return out;
+        }
         if let Some(idx) = token.strip_prefix('$').and_then(|n| n.parse::<usize>().ok()) {
             if let Some(c) = cfg.display.constants.get(idx.saturating_sub(1)) { out.push_str(c); }
             continue;
         }
         if let Some(spec) = token.strip_prefix('#') {
             if let Some(col) = format_color(spec, key_color) { out.push_str(&col); }
+            continue;
+        }
+        // fastfetch `{/field}...{/}`: render the block only when field is unset.
+        if let Some(field) = token.strip_prefix('/') {
+            if field.is_empty() { continue; }
+            let rest = &tpl[i..];
+            if let Some(rel) = rest.find("{/}") {
+                let inner = &rest[..rel];
+                let unset = format_field(field, kind, key, value, icon, si, cfg)
+                    .is_none_or(|v| v.is_empty());
+                if unset {
+                    out.push_str(&format_template_inner(
+                        inner, kind, key, value, icon, si, cfg, key_color, terminated));
+                }
+                i += rel + 3;
+                if *terminated { return out; }
+            }
             continue;
         }
         if let Some(field) = token.strip_prefix('?') {
@@ -902,9 +1325,11 @@ fn format_template(
                 let nonempty = format_field(field, kind, key, value, icon, si, cfg)
                     .is_some_and(|v| !v.is_empty());
                 if nonempty {
-                    out.push_str(&format_template(inner, kind, key, value, icon, si, cfg, key_color));
+                    out.push_str(&format_template_inner(
+                        inner, kind, key, value, icon, si, cfg, key_color, terminated));
                 }
                 i += rel + 3;
+                if *terminated { return out; }
             }
             continue;
         }
@@ -932,14 +1357,38 @@ fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut 
     match kind.as_str() {
         "break" => return vec![String::new()],
         "separator" => {
-            let s = "\u{2500}".repeat(30);
-            return vec![format!("{}{}{}", cfg.display.separator_color.as_deref().unwrap_or(""), s, RESET)];
+            // fastfetch spells the row text `string`; accept it as `format`.
+            let s = m.format.as_deref().filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "\u{2500}".repeat(30));
+            let color = m.output_color.as_deref()
+                .or(cfg.display.separator_color.as_deref())
+                .unwrap_or("");
+            return vec![format!("{color}{s}{RESET}")];
         }
         "custom" => {
-            let Some(f) = &m.format else { return Vec::new() };
-            return f.split('\n')
-                .map(|line| format_template(line, "custom", "", "", "", si, cfg, key_color))
-                .collect();
+            if let Some(f) = &m.format {
+                return f.split('\n')
+                    .map(|line| format_template(line, "custom", "", "", "", si, cfg, key_color))
+                    .collect();
+            }
+            // `[[custom]] label = "..." value = "..."` (or command) is the
+            // shorthand for a plain labelled row.
+            let value = if let Some(cmd) = &m.command {
+                modules::run_timeout("sh", &["-c", cmd], cfg.command_timeout_ms)
+                    .unwrap_or_default().trim().to_string()
+            } else {
+                m.value.clone().unwrap_or_default()
+            };
+            let key = m.key.clone().unwrap_or_default();
+            if key.is_empty() && value.is_empty() { return Vec::new(); }
+            let value = if m.value_format {
+                format_template(&value, "custom", &key, &value, "", si, cfg, key_color)
+            } else {
+                value
+            };
+            let val_color = m.output_color.as_deref().unwrap_or(&cfg.colors.values);
+            return vec![row_cfg(&key, &value, key_color, val_color, m, cfg)];
         }
         "title" => {
             let lines = match &m.format {
@@ -981,6 +1430,12 @@ fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut 
     }
 
     let Some((default_key, mut value)) = module_value(&kind, si, cfg) else { return Vec::new() };
+    if (kind == "pkgs" || kind == "packages") && !m.disabled.is_empty() {
+        value = crate::pkgs::filter(&value, &m.disabled);
+    }
+    if (kind == "pkgs" || kind == "packages") && m.combined {
+        value = crate::pkgs::combine(&value);
+    }
     if let Some(cmd) = &m.command {
         value = modules::run_timeout("sh", &["-c", cmd], cfg.command_timeout_ms)
             .unwrap_or_default().trim().to_string();
@@ -992,7 +1447,20 @@ fn render_module(m: &config::Module, si: &info::SysInfo, cfg: &Config, li: &mut 
     let key = format!("{icon}{key}");
     let key = format_template(&key, &kind, &key, &value, icon, si, cfg, key_color);
     let value = match &m.format {
-        Some(f) => format_template(f, &kind, &key, &value, icon, si, cfg, key_color),
+        Some(f) => {
+            // arcfetch's own `{}` shorthand keeps the old label-stripping
+            // behaviour; fastfetch configs use named fields that need the
+            // labelled list (`{all}`, `{pacman}`, …).
+            let v = if !cfg.fastfetch && (kind == "pkgs" || kind == "packages") {
+                value.split(',')
+                    .map(|part| part.trim().split_whitespace().next().unwrap_or(part.trim()).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                value
+            };
+            format_template(f, &kind, &key, &v, icon, si, cfg, key_color)
+        }
         None => value,
     };
     let row = row_cfg(&key, &value, key_color,
@@ -1035,8 +1503,17 @@ fn render_modules(si: &info::SysInfo, cfg: &Config) -> Vec<String> {
     let Some(mods) = cfg.modules.as_deref() else { return Vec::new() };
     let mut out = Vec::with_capacity(mods.len() + 4);
     let mut li = 0usize;
+    let mut prev_ok = true;
     for m in mods {
-        out.extend(render_module(m, si, cfg, &mut li));
+        // fastfetch `condition.succeeded` chains to the preceding module.
+        if let Some(want) = m.condition_succeeded {
+            if want != prev_ok { continue; }
+        }
+        let rows = render_module(m, si, cfg, &mut li);
+        if !matches!(norm(&m.kind).as_str(), "break" | "separator" | "title" | "colors") {
+            prev_ok = !rows.is_empty();
+        }
+        out.extend(rows);
     }
     out
 }
@@ -1131,6 +1608,14 @@ fn bh_cell(col: usize, row: usize, cx: f64, cy: f64, rot: f64, frame: u64)
         }
     }
     ((0, 0, 0), ' ')
+}
+
+/// Play duration for the non-pinned modes: `--t` wins, then `play_seconds`.
+fn play_duration(duration: Option<u64>, cfg: &Config) -> Option<u64> {
+    duration.or_else(|| {
+        (cfg.animation.play_seconds > 0.0)
+            .then(|| cfg.animation.play_seconds.round().max(1.0) as u64)
+    })
 }
 
 fn run_blackhole(info: &[String], duration: Option<u64>) {
@@ -1438,6 +1923,7 @@ struct Args {
     preset:       Option<String>,
     config_file:  Option<String>,
     no_color:     bool,
+    palette:      bool,
     blackhole:    bool,
     mandelbrot:   bool,
     mandel_iter:  u32,
@@ -1455,12 +1941,13 @@ struct Args {
     box_style:    Option<String>,
     animate:      Option<String>,
     animation:    Option<String>,
+    fps:          Option<f32>,
     list_logos:   bool,
     list_schemes: bool,
     list_presets: bool,
     list_animations: bool,
     no_intro:     bool,
-    foreground:   bool,
+    pin:          bool,
     stop:         bool,
 }
 
@@ -1476,6 +1963,7 @@ fn parse_args() -> Args {
         preset: None,
         config_file: None,
         no_color: false,
+        palette: false,
         blackhole: false,
         mandelbrot: false,
         mandel_iter: 64,
@@ -1493,14 +1981,25 @@ fn parse_args() -> Args {
         box_style: None,
         animate: None,
         animation: None,
+        fps: None,
         list_logos: false,
         list_schemes: false,
         list_presets: false,
         list_animations: false,
         no_intro: false,
-        foreground: false,
+        pin: false,
         stop: false,
     };
+
+    // Accept `-preset`/`-config` as aliases for the long forms.
+    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    for arg in &mut argv {
+        if let Some(s) = arg.to_str() {
+            if s.len() > 2 && s.starts_with('-') && !s.starts_with("--") {
+                *arg = format!("-{s}").into();
+            }
+        }
+    }
 
     // lexopt cannot peek, so pre-scan for the space-separated `--mandelbrot <n>` form.
     let mut mandel_space: Option<u32> = None;
@@ -1508,7 +2007,6 @@ fn parse_args() -> Args {
     let mut box_space: Option<String> = None;
     let mut config_space: Option<String> = None;
     {
-        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
         for w in argv.windows(2) {
             if w[0] == "--mandelbrot" {
                 if let Some(s) = w[1].to_str() {
@@ -1530,13 +2028,14 @@ fn parse_args() -> Args {
         }
     }
 
-    let mut parser = lexopt::Parser::from_env();
+    let mut parser = lexopt::Parser::from_args(argv);
     while let Some(arg) = parser.next().ok().flatten() {
         match arg {
             Short('h') | Long("help")    => a.help = true,
             Short('V') | Long("version") => a.version = true,
             Long("blackhole")            => a.blackhole = true,
             Long("no-color")             => a.no_color = true,
+            Long("palette")              => a.palette = true,
             Long("config") => {
                 if let Some(v) = parser.optional_value() {
                     a.config_file = Some(v.to_string_lossy().into_owned());
@@ -1574,8 +2073,9 @@ fn parse_args() -> Args {
             Long("list-presets") | Long("presets") => a.list_presets = true,
             Long("list-animations") | Long("animations") => a.list_animations = true,
             Long("no-animate") | Long("no-intro") => a.no_intro = true,
-            Long("foreground") | Long("fg") => a.foreground = true,
-            Long("stop") => a.stop = true,
+            Long("foreground") | Long("fg") => {}
+            Long("pin") => a.pin = true,
+            Long("stop") | Long("unpin") => a.stop = true,
             Long("logo-file") => {
                 if let Ok(v) = parser.value() {
                     a.logo_file = Some(v.to_string_lossy().into_owned());
@@ -1626,6 +2126,11 @@ fn parse_args() -> Args {
                     a.animation = Some(v.to_string_lossy().into_owned());
                 }
             }
+            Long("fps") => {
+                if let Ok(v) = parser.value() {
+                    a.fps = v.to_string_lossy().parse().ok();
+                }
+            }
             Short('s') | Long("structure") => {
                 if let Ok(v) = parser.value() {
                     a.structure = Some(v.to_string_lossy().into_owned());
@@ -1636,6 +2141,9 @@ fn parse_args() -> Args {
     }
     if a.animation.is_some() && a.animate.is_none() {
         a.animate = Some("frames".into());
+    }
+    if a.pin && a.animate.is_none() && !a.blackhole {
+        a.animate = Some("shimmer".into());
     }
     a
 }
@@ -1775,8 +2283,20 @@ fn print_config_help(cfg_path: &str) {
     println!();
     println!("  {b}{PEACH}config file{r}  {s}{cfg_path}{r}", b=b, PEACH=PEACH, r=r, s=s, cfg_path=cfg_path);
     println!("  {s}TOML subset: [section] headers, key = value, # comments. Every key is optional.{r}", s=s, r=r);
+    println!("  {s}Arrays may span lines; ~ is expanded in logo and palette paths.{r}", s=s, r=r);
     println!("  {s}Unknown keys/sections are ignored. Booleans: true/yes/1/on enable; anything else disables.{r}", s=s, r=r);
-    println!("  {s}Relative paths are used from the current directory; ~ is expanded for logo files.{r}", s=s, r=r);
+    println!();
+
+    println!("  {b}{BLUE}[palette]{r}  {s}wallpaper-derived colours (matugen, pywal, wallust){r}", b=b, BLUE=BLUE, r=r, s=s);
+    field("color_source", "config", "config | palette");
+    println!("  {g}palette_files{r} = [ … ]  {s}# first usable JSON file wins; ~ expanded{r}", g=g, r=r, s=s);
+    println!("  {s}              default: quickshell/matugen, pywal, wallust paths{r}", s=s, r=r);
+    field("palette_accent", "primary", "name for hostname, rule, logo and bar");
+    field("palette_value", "on_surface", "name for values");
+    println!("  {g}palette_gradient{r} = [ … ] {s}# names for logo + animated-art stops; [] leaves it alone{r}", g=g, r=r, s=s);
+    println!("  {s}              pywal/wallust fall back to color4, color7 and [color4, color5, color6]{r}", s=s, r=r);
+    println!("  {s}              nested names work: {{\"colors\":{{\"color4\":\"#...\"}}}} and special.background{r}", s=s, r=r);
+    println!("  {s}              same keys under [palette] as files/accent/value/gradient; --palette forces it{r}", s=s, r=r);
     println!();
 
     println!("  {b}{BLUE}[colors]{r}  {s}keys apply in file order — put scheme first if you use it{r}", b=b, BLUE=BLUE, r=r, s=s);
@@ -1911,44 +2431,40 @@ fn print_config_help(cfg_path: &str) {
 
     println!("  {b}{BLUE}[logo]{r}  {s}pick a built-in logo or a custom file{r}", b=b, BLUE=BLUE, r=r, s=s);
     field("name", "arch", "built-in name; default arch (minimal preset uses mini; science picks random)");
-    println!("  {s}              names: arch, mini, ascii, tux, nix, gentoo, auto, atom, dna, arcreactor,{r}", s=s, r=r);
+    println!("  {s}              names: arch, mini, ascii, tux, nix, gentoo, bsd, android, termux, auto,{r}", s=s, r=r);
+    println!("  {s}                      atom, dna, arcreactor,{r}", s=s, r=r);
     println!("  {s}                      aurora, bedrock, guix, ubuntu, debian, fedora, …{r}", s=s, r=r);
     println!("  {s}              _small suffixes are compact variants; --list-logos prints every name{r}", s=s, r=r);
     println!("  {s}              auto detects /etc/os-release ID/ID_LIKE; unknown IDs fall back to arch{r}", s=s, r=r);
     field("file", "<path>", "custom ASCII or png/jpg/gif (kitty protocol); overrides name");
-    println!("  {s}              text files support $1..$9 = logo1..logo9, $R = reset, $$ = literal ${r}", s=s, r=r);    println!();
+    println!("  {s}              text files support $1..$9 = logo1..logo9, $R = reset, $$ = literal ${r}", s=s, r=r);
+    field("position", "left", "image logos: left|right = info beside, top = info below");
+    field("width", "31", "image logo width in terminal columns");
+    field("height", "auto", "image logo height in rows; omit to keep the aspect ratio");
+    println!();
 
-    println!("  {b}{BLUE}[animation]{r}  {s}short intro on a real terminal (normal mode only){r}", b=b, BLUE=BLUE, r=r, s=s);
-    field("enabled", "true", "false = always static; --no-animate also skips the intro");
+    println!("  {b}{BLUE}[animation]{r}  {s}intro, play and pin behaviour{r}", b=b, BLUE=BLUE, r=r, s=s);
     field("effect", "none", "none|shimmer|scanline|boot");
     println!("  {s}              aliases: off/frames/keyframes/wave/rainbow = none, scan/crt = scanline,{r}", s=s, r=r);
     println!("  {s}                      bootreveal/reveal = boot, else shimmer{r}", s=s, r=r);
-    field("intro_ms", "700", "intro length; 0 disables; capped at 24 frames (~0.8 s)");
-    field("wave", "true", "colour-wave animated logos (atom, dna, arcreactor, aurora)");
+    field("intro_ms", "700", "normal-mode intro length; 0 disables it; capped at 24 frames");
+    field("play_seconds", "3", "how long --animate/--blackhole play before the shell returns");
+    field("fps", "30", "animation frame rate (1–120)");
     field("gradient", "animfetch ramp", "vertical #RGB/#RRGGBB stops; [] = scheme palette wave");
-    field("gradient_scroll", "false", "let the gradient crawl through the art");
+    field("gradient_speed", "0", "gradient rows per frame when scrolling; 0 keeps it still");
     field("art_color", "own", "own = keep frame ANSI; theme = force the gradient");
     println!("  {s}              authored ANSI in a frame keeps its own colours{r}", s=s, r=r);
     println!("  {s}              the intro is skipped for custom/image logos, piped output and --no-animate{r}", s=s, r=r);
-    println!("  {s}              animated logos play their frames whenever the intro is enabled{r}", s=s, r=r);
+    println!("  {s}              animated logos play their frames while intro_ms > 0{r}", s=s, r=r);
+    println!("  {s}              bundled frames: arcfetch --list-animations; play: --animation <name>{r}", s=s, r=r);
     println!("  {s}              custom frames: ~/.config/arcfetch/animations/<name>/01.txt, 02.txt, …{r}", s=s, r=r);
-    println!("  {s}              play them with: arcfetch --animation <name>   (list: --list-animations){r}", s=s, r=r);
-    println!();
-
-    println!("  {b}{BLUE}[template]{r}  {s}preset overrides [show] entirely; explicit header is kept{r}", b=b, BLUE=BLUE, r=r, s=s);
-    field("preset", "<unset>", "full|minimal|hacker|science; unset keeps [show]; unknown = full");
-    println!("  {s}  full     os kernel uptime res pkgs shell de_wm term cpu gpu battery memory disk load locale{r}", s=s, r=r);
-    println!("  {s}           swatches init cpu_temp processes session swap sound gpu_driver disk_type theme{r}", s=s, r=r);
-    println!("  {s}           init_ver local_ip cursor term_size term_theme camera mouse keyboard tpm physical_disk monitor{r}", s=s, r=r);
-    println!("  {s}  minimal  os kernel uptime memory battery swatches; logo becomes mini unless --logo is explicit{r}", s=s, r=r);
-    println!("  {s}  hacker   kernel uptime cpu gpu gpu_temp memory disk load ip ssh ports swatches{r}", s=s, r=r);
-    println!("  {s}  science  os kernel uptime cpu memory disk; random science logo + physicist quote{r}", s=s, r=r);
     println!();
 
     println!("  {b}{TEAL}precedence{r}", b=b, TEAL=TEAL, r=r);
-    println!("  {s}[colors] keys apply in file order; --scheme replaces the palette; --accent/ARCFETCH_ACCENT{r}", s=s, r=r);
-    println!("  {s}then overrides accent + hostname; --color overrides the logo accent. A file accent does not set hostname.{r}", s=s, r=r);
-    println!("  {s}CLI --preset/--full overrides [template]; --all runs next, then -s/--structure wins.{r}", s=s, r=r);
+    println!("  {s}[colors] keys apply in file order; a palette overrides accent/value/gradient after them;{r}", s=s, r=r);
+    println!("  {s}--scheme replaces the palette; --accent/ARCFETCH_ACCENT then overrides accent + hostname;{r}", s=s, r=r);
+    println!("  {s}--color overrides the logo accent. A file accent does not set hostname.{r}", s=s, r=r);
+    println!("  {s}CLI --preset replaces the config file; --full/--all run after it, then -s/--structure wins.{r}", s=s, r=r);
     println!();
 
     println!("  {b}{TEAL}color names{r}  {s}or #RRGGBB hex{r}", b=b, TEAL=TEAL, r=r, s=s);
@@ -2020,9 +2536,20 @@ fn write_sample_config(cfg_path: &str) {
 # keyColor = "blue"
 # outputColor = "text"
 
+# Package rows: hide managers you do not want, and compact the rest.
+# [[modules]]
+# type = "packages"
+# disabled = ["appimage", "nix"]
+# combined = true
+
 # A line of your own:
 # [[custom]]
 # format = "{#accent}── {user-name} ──{#}"
+
+# Or a labelled row:
+# [[custom]]
+# label = "Owner"
+# value = "POKKITA"
 
 # A command row (for example a public IP):
 # [[modules]]
@@ -2040,6 +2567,48 @@ fn write_sample_config(cfg_path: &str) {
 
 # seconds a command row may take (0.1-10)
 # command_timeout = 1.0
+
+# ── palette ──────────────────────────────────────────────
+# Follow the colours of your wallpaper/desktop theme. With
+# color_source = "palette", the first usable file is read and its
+# accent/value/gradient names replace the matching colours below. Anything it
+# does not define keeps its value, so this can only add colour.
+#
+# The tool only reads the file; it does not generate a palette. Matugen,
+# pywal and wallust all write one of these JSON files.
+#
+# color_source = "palette"
+# palette_files = [
+#   "~/.local/state/quickshell/user/generated/colors.json",  # matugen
+#   "~/.cache/wal/colors.json",                              # pywal
+#   "~/.cache/wallust/colors.json",                          # wallust
+# ]
+#
+# Names are looked up at the top level and inside nested objects, so all of
+# these work:
+#   matugen:  {"primary": {"color": "#..."}}
+#   pywal:    {"colors": {"color4": "#..."}}
+#   dotted:   "special.background"
+#
+# Defaults are Material You role names (matugen). If a name is missing, the
+# pywal/wallust equivalent is tried automatically (color4, color7, and the
+# color4..color6 gradient), so those files work without changing these names.
+# You can still set them explicitly:
+#   palette_accent   = "color4"
+#   palette_value    = "color7"
+#   palette_gradient = ["color4", "color5", "color6"]
+#
+# palette_accent   = "primary"       # hostname, rule, logo and bar
+# palette_value    = "on_surface"    # values
+# palette_gradient = ["primary", "secondary", "tertiary"]  # logo + animated art
+#
+# The same keys also work under [palette] (files/accent/value/gradient) and
+# [colors] (source/palette_files/...). Palette colours are applied after the
+# [colors] block, so they win there; --scheme, --accent and --color still win.
+# Try it for one run without editing this file: arcfetch --palette
+
+# Blank columns between the logo and the info (same as [layout] gap).
+# gap = 2
 
 [colors]
 # keys apply in file order — keep scheme first if you use it
@@ -2194,43 +2763,46 @@ gap       = 2
 #   endeavouros | cachyos | kali | alpine | void | pop | linuxmint | garuda |
 #   artix | rocky | almalinux | centos | steamos | raspbian | wsl | neon |
 #   deepin | mx | blackarch | redhat | zorin | elementary | nobara | bazzite |
-#   bedrock | guix | macos | windows | freebsd | rust
+#   bedrock | guix | macos | windows | freebsd | bsd | android | termux | rust
 # append _small for compact variants where available
 # name = arch
 
 # custom ASCII file path (overrides name if set)
 # file = ~/.config/arcfetch/logo.txt
 
+# image logos: left/right put the info beside the image, top puts it below
+# position = left
+# image cell size; leave height unset to keep the image aspect (2:1 cells)
+# width = 31
+# height = 19
+
 # uniform logo colour; omit to keep each logo's built-in colours
 # color = blue
 
 [animation]
-# short intro played on a real terminal before the static render
-enabled  = true
 # glyph effect: none | shimmer | scanline | boot
 # aliases: off/frames/keyframes/wave/rainbow = none, scan/crt = scanline,
 #          bootreveal/reveal = boot, else shimmer
 effect   = none
-# intro length in milliseconds (0 disables; capped at 24 frames, ~0.8 s)
+# normal-mode intro length in milliseconds (0 disables; capped at 24 frames)
 intro_ms = 700
-# colour-wave animated logos (atom, dna, arcreactor, aurora)
-wave     = true
+# how long --animate / --blackhole play before the shell comes back (seconds)
+play_seconds = 3
+# animation frame rate (1-120; default 30)
+fps      = 30
 
 # vertical gradient for plain art; authored ANSI keeps its own colours.
 # any #RGB/#RRGGBB; [] falls back to the scheme's logo palette wave.
 gradient = ["#f5c95c", "#f17f5b", "#f45c82", "#b07cf4", "#74a4ff"]
-gradient_scroll = false
+# gradient rows per frame; 0 keeps the ramp still
+gradient_speed = 0.0
 # "own" keeps a frame's ANSI colours; "theme" forces the gradient on it
 art_color = "own"
 
-# custom frame animations: ~/.config/arcfetch/animations/<name>/01.txt, 02.txt, …
-# play with: arcfetch --animation <name>     list with: arcfetch --list-animations
-
-[template]
-# preset overrides [show] entirely; an explicit header is kept
-# options: full | minimal | hacker | science (unknown = full)
-# CLI --preset / --full overrides this
-# preset = full
+# bundled frame animations: arcfetch --list-animations
+# play one: arcfetch --animation saturn
+# pin one:  arcfetch --pin --animation saturn
+# custom frames: ~/.config/arcfetch/animations/<name>/01.txt, 02.txt, …
 "##;
     match fs::write(path, sample) {
         Ok(_) => {
@@ -2262,12 +2834,12 @@ fn print_help(cfg_path: &str) {
     println!("  {b}{SAPPHIRE}general{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
     flag("-h, --help", "this screen");
     flag("-V, --version", "version + E=mc² joke");
-    flag("--config [file]", "config reference + create sample; or load a TOML/JSONC file");
+    flag("--config [file]", "config reference + create sample; or load TOML/JSONC/fastfetch JSONC");
     flag("--all", "enable every data field (header, uptime_long, swatches, color_bar unchanged)");
     flag("-s, --structure <list>", "only listed data fields (comma/space); keeps header/swatches/color_bar");
-    flag("--preset <name|file>", "full|minimal|hacker|science or a JSONC preset; overrides [show]");
-    flag("--list-presets", "list JSONC presets shipped with arcfetch");
-    flag("--full", "alias for --preset full");
+    flag("--preset <name|file>", "load a shipped JSONC preset or a .jsonc/.json/fastfetch file");
+    flag("--list-presets", "list JSONC presets shipped with arcfetch (alias: --presets)");
+    flag("--full", "show all data fields (same as --all)");
     flag("--json", "flat JSON object of enabled fields (uptime always included); no colour");
     flag("--watch", "clear and re-run every second; Ctrl+C stops");
     flag("--no-color", "plain text; also NO_COLOR, CLICOLOR=0, or non-TTY unless FORCE_COLOR");
@@ -2276,30 +2848,34 @@ fn print_help(cfg_path: &str) {
     flag("--scheme <name>", "palette preset (default mocha); replaces the whole palette");
     println!("    {s}   auto|mocha|latte|frappe|macchiato|nord|dracula|gruvbox|tokyo-night{r}", s=s, r=r);
     println!("    {s}   solarized-dark|rose-pine|onedark|kanagawa|everforest|ayu{r}", s=s, r=r);
+    println!("    {s}   auto picks latte on a light terminal, mocha on dark/unknown{r}", s=s, r=r);
     flag("--accent <color>", "colour spec (name/hex/rgb/colorN); accent + hostname; wins over scheme/config");
+    flag("--palette", "read the first usable configured palette file for this run (wallpaper colours)");
     flag("--color <spec|random>", "logo/accent colour only; spec or random palette colour each run");
-    flag("--box [style]", "frame output: round (default)|square|double|heavy|dashed|ascii|none");
+    flag("--box [style]", "frame output; bare --box = round, else round|square|double|heavy|dashed|ascii|none");
     flag("--logo <name|?|list>", "built-in logo, auto, or list; default arch");
     flag("--logo-file <path>", "ASCII text or kitty png/jpg/gif; overrides logo name; ~ expanded");
     flag("--list-logos, --logos", "every built-in name with a preview");
     flag("--list-schemes, --schemes", "every palette with role swatches and exact hex");
-    flag("--list-animations, --animations", "built-in and custom animation frame sets");
+    flag("--list-animations", "built-in and custom frame sets (alias: --animations)");
     println!();
     println!("  {b}{SAPPHIRE}display & animation{r}", b=b, SAPPHIRE=SAPPHIRE, r=r);
-    flag("--animate [effect]", "pin a live logo above the shell; shimmer (default)|scanline|boot|frames");
-    flag("--animation <name|path>", "play frames from ~/.config/arcfetch/animations/<name>/");
-    flag("--blackhole", "M87 accretion disk; requires a TTY; pinned unless --foreground");
+    flag("--animate [effect]", "play a live logo, then return to the shell; shimmer (default)|scanline|boot|frames");
+    flag("--pin", "pin the animation above the shell until --stop");
+    flag("--animation <name|path>", "play bundled or ~/.config/arcfetch/animations frames; implies --animate");
+    flag("--fps <n>", "animation frame rate override (1-120; default 30)");
+    flag("--blackhole", "M87 accretion disk; plays for play_seconds, then exits");
     flag("--quantum", "wave-function collapse; fixed 8 frames; --t ignored");
     flag("--cosmic", "full-screen starfield + moon + shooting stars; ~6 s blocking");
     flag("--mandelbrot [iter]", "static fractal logo; default 64 iterations");
-    flag("-t, --t <secs>", "duration for blackhole/cosmic/animate; 0 = until --stop/Ctrl+C");
+    flag("-t, --t <secs>", "play/pin duration; 0 = until Ctrl+C (play) or --stop (pin)");
     flag("--no-animate, --no-intro", "skip the normal-mode intro");
-    flag("--foreground, --fg", "run blackhole/animate blocking on the alternate screen");
-    flag("--stop", "remove the pinned animation and reset the terminal");
-    println!("    {s}--animate pins a compact logo pane; --cosmic is a full-screen scene{r}", s=s, r=r);
-    println!("    {s}one display mode at a time; --t does not affect quantum, mandelbrot or normal mode{r}", s=s, r=r);
-    println!("    {s}background blackhole/animate run until --stop or --t N; --foreground defaults to ~3 s{r}", s=s, r=r);
-    println!("    {s}--blackhole and --animate need a TTY; piped output exits with an error{r}", s=s, r=r);    println!();
+    flag("--stop, --unpin", "remove the pinned animation and reset the terminal");
+    println!("    {s}--animate/--blackhole play in place; add --pin to keep them above the shell{r}", s=s, r=r);
+    println!("    {s}play duration: [animation] play_seconds (default 3 s); --t overrides it{r}", s=s, r=r);
+    println!("    {s}pinned runs last until --stop or --t N; one display mode at a time{r}", s=s, r=r);
+    println!("    {s}--blackhole and --animate need a TTY; piped output exits with an error{r}", s=s, r=r);
+    println!();
     println!("  {b}{TEAL}logos{r}", b=b, TEAL=TEAL, r=r);
 
     println!("    {b}{g}arch{r}         block {s}\u{259f}\u{2588}\u{2588}\u{2588}\u{2599}{r} (default)", b=b, g=g, r=r, s=s);
@@ -2314,16 +2890,13 @@ fn print_help(cfg_path: &str) {
     println!("    {s}{n} built-in names incl. distros, _small variants and mascots — try {g}--logo ubuntu{r}", s=s, n=logos::all_names().len(), g=g, r=r);
     println!();
     println!("  {b}{TEAL}presets{r}", b=b, TEAL=TEAL, r=r);
-    println!("    {g}full{r}      os kernel uptime res pkgs shell de_wm term cpu gpu battery memory disk load locale", g=g, r=r);
-    println!("              swatches init cpu_temp processes session swap sound gpu_driver disk_type theme");
-    println!("              init_ver local_ip cursor term_size term_theme camera mouse keyboard tpm physical_disk monitor");
-    println!("    {g}minimal{r}   os kernel uptime memory battery swatches; logo becomes mini unless --logo is explicit", g=g, r=r);
-    println!("    {g}hacker{r}    kernel uptime cpu gpu gpu_temp memory disk load ip ssh ports swatches", g=g, r=r);
-    println!("    {g}science{r}   os kernel uptime cpu memory disk; random science logo + physicist quote", g=g, r=r);
+    println!("    {g}--list-presets{r}      {s}{} shipped JSONC layouts{r}", config::preset_names().len(), g=g, r=r, s=s);
+    println!("    {g}--preset 2{r}          {s}load one by number/name (or pass a .jsonc path){r}", g=g, r=r, s=s);
+    println!("    {s}presets live in presets/examples; copy one into ~/.config/arcfetch to edit it{r}", s=s, r=r);
     println!();
     println!("  {b}{PEACH}config{r}  {s}{cfg_path}{r}", b=b, PEACH=PEACH, r=r, s=s, cfg_path=cfg_path);
     println!("    run {b}{g}arcfetch --config{r} for the full reference and a sample file", b=b, g=g, r=r);
-    println!("    {s}[colors] | [show] | [logo] | [animation] | [template] — all keys optional{r}", s=s, r=r);
+    println!("    {s}[colors] | [show] | [logo] | [animation] | [display] | [layout] — all keys optional{r}", s=s, r=r);
     println!();
     println!("  {b}{SKY}environment{r}", b=b, SKY=SKY, r=r);
     println!("    {g}ARCFETCH_ACCENT{r}   {s}same as --accent (logo + hostname){r}", g=g, r=r, s=s);
@@ -2336,7 +2909,8 @@ fn print_help(cfg_path: &str) {
     println!("    arcfetch --full               {s}# every preset field{r}", s=s, r=r);
     println!("    arcfetch --scheme auto         {s}# follow the terminal light/dark background{r}", s=s, r=r);
     println!("    arcfetch --mandelbrot          {s}# fractal as logo{r}", s=s, r=r);
-    println!("    arcfetch --blackhole           {s}# pinned M87 disk; stop with arcfetch --stop{r}", s=s, r=r);
+    println!("    arcfetch --blackhole           {s}# play the M87 disk, then return to the shell{r}", s=s, r=r);
+    println!("    arcfetch --pin --blackhole     {s}# keep it pinned above the shell (stop: --unpin){r}", s=s, r=r);
     println!("    arcfetch --logo nix --cosmic   {s}# cosmic + nix logo{r}", s=s, r=r);
     println!("    arcfetch --animation pulse     {s}# your own frame animation{r}", s=s, r=r);
     println!();
@@ -2476,10 +3050,24 @@ fn print_animations() {
     println!();
     println!("  {BOLD}{BLUE}arcfetch animations{R}", BOLD = BOLD, BLUE = BLUE, R = RESET);
     println!();
-    println!("  {BOLD}{MAUVE}built-in{R}  {GREEN}atom{R}, {GREEN}dna{R}, {GREEN}arcreactor{R}, {GREEN}aurora{R}",
+    println!("  {BOLD}{MAUVE}procedural logos{R}  {GREEN}atom{R}, {GREEN}dna{R}, {GREEN}arcreactor{R}, {GREEN}aurora{R}",
         BOLD = BOLD, MAUVE = MAUVE, GREEN = GREEN, R = RESET);
     println!("  {OVERLAY0}play: arcfetch --animate --logo aurora{R}", OVERLAY0 = OVERLAY0, R = RESET);
     println!();
+
+    let bundled = anim::Animation::bundled_list();
+    if !bundled.is_empty() {
+        println!("  {BOLD}{MAUVE}bundled frame sets{R}", BOLD = BOLD, MAUVE = MAUVE, R = RESET);
+        for chunk in bundled.chunks(3) {
+            let mut line = String::from("   ");
+            for (name, frames) in chunk {
+                line.push_str(&format!(" {GREEN}{:<16}{R} {OVERLAY0}{frames:>3} frames{R}",
+                    name, OVERLAY0 = OVERLAY0, GREEN = GREEN, R = RESET, frames = frames));
+            }
+            println!("{line}");
+        }
+        println!();
+    }
 
     let custom = anim::Animation::list();
     if custom.is_empty() {
@@ -2492,8 +3080,9 @@ fn print_animations() {
         }
     }
     println!();
-    println!("  {OVERLAY0}put frames in ~/.config/arcfetch/animations/<name>/{R}", OVERLAY0 = OVERLAY0, R = RESET);
-    println!("  {OVERLAY0}name them 01.txt, 02.txt, …; play with: arcfetch --animation <name>{R}",
+    println!("  {OVERLAY0}play: arcfetch --animation saturn          pin: arcfetch --pin --animation saturn{R}",
+        OVERLAY0 = OVERLAY0, R = RESET);
+    println!("  {OVERLAY0}put your own frames in ~/.config/arcfetch/animations/<name>/01.txt, 02.txt, …{R}",
         OVERLAY0 = OVERLAY0, R = RESET);
     println!();
 }
@@ -2568,7 +3157,11 @@ fn gradient_for_row(
         return None;
     }
     let span = height.max(1);
-    let offset = if anim.gradient_scroll { tick } else { 0 };
+    let offset = if anim.gradient_scroll && anim.gradient_speed > 0.0 {
+        (tick as f32 * anim.gradient_speed) as usize
+    } else {
+        0
+    };
     let t = ((row + offset) % span) as f32 / span as f32;
     let last = anim.gradient.len() - 1;
     let idx = ((t * last as f32).round() as usize).min(last);
@@ -2696,12 +3289,18 @@ fn tty_termios() -> Option<libc::termios> {
     (unsafe { libc::tcgetattr(1, &mut t) } == 0).then_some(t)
 }
 
+/// Line discipline field: Linux/Android expose `c_line`, BSD/macOS do not.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn termios_line(t: &libc::termios) -> libc::cc_t { t.c_line }
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn termios_line(_: &libc::termios) -> libc::cc_t { 0 }
+
 fn termios_eq(a: &libc::termios, b: &libc::termios) -> bool {
     a.c_iflag == b.c_iflag
         && a.c_oflag == b.c_oflag
         && a.c_cflag == b.c_cflag
         && a.c_lflag == b.c_lflag
-        && a.c_line == b.c_line
+        && termios_line(a) == termios_line(b)
         && a.c_cc == b.c_cc
 }
 
@@ -2798,9 +3397,10 @@ fn clear_pane(pane_h: usize) {
     write_tty(seq.as_bytes());
 }
 
-fn stop_background() {
-    let Some(path) = bg_pid_path() else { return };
+fn stop_background() -> bool {
+    let Some(path) = bg_pid_path() else { return false };
     let mut found = false;
+    let mut stopped = false;
 
     // Clean up the pre-pin global pid file too, so an animation started by an
     // older build does not keep drawing over the terminal.
@@ -2813,6 +3413,7 @@ fn stop_background() {
                     if pid_is_ours(pid) {
                         unsafe { libc::kill(pid, libc::SIGTERM); }
                         wait_for_exit(pid);
+                        stopped = true;
                     }
                 }
             }
@@ -2826,6 +3427,7 @@ fn stop_background() {
             if pid_is_ours(pid) {
                 unsafe { libc::kill(pid, libc::SIGTERM); }
                 wait_for_exit(pid);
+                stopped = true;
             }
         }
     }
@@ -2833,6 +3435,7 @@ fn stop_background() {
     if found {
         reset_pin();
     }
+    stopped
 }
 
 /// Clip a line to `max` visible cells, keeping ANSI escapes intact.
@@ -2896,12 +3499,20 @@ fn pane_frame(
     geom: PaneGeom,
     frame: u64,
 ) -> Vec<String> {
+    let info_w = info.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
+    let art_max = geom
+        .cols
+        .saturating_sub(info_w + cfg.layout.gap + cfg.layout.indent)
+        .max(1);
+
     let art: Vec<String> = match mode {
         PanelMode::Blackhole => panel_blackhole(geom.art_cols, geom.art_h.min(geom.pane_h), frame),
         PanelMode::Animate(effect) => {
             let effect = parse_effect(effect);
             if let Some(a) = art.anim {
-                panel_text(a.frame(frame as usize, 1), frame as usize, effect, &cfg.colors.logo, &cfg.animation, true)
+                let frames = a.fitted(art_max, geom.art_h.min(geom.pane_h));
+                let lines = &frames[frame as usize % frames.len()];
+                panel_text(lines, frame as usize, effect, &cfg.colors.logo, &cfg.animation, true)
             } else if let Some(lines) = art.lines {
                 panel_text(lines, frame as usize, effect, &cfg.colors.logo, &cfg.animation, true)
             } else {
@@ -3053,10 +3664,11 @@ fn run_background(
     let mut last_block: Vec<String> = Vec::new();
     let frame_ms = match mode {
         PanelMode::Blackhole => 50,
-        PanelMode::Animate(_) => 33,
+        PanelMode::Animate(_) => cfg.animation.frame_ms(),
     };
 
     loop {
+        let frame_deadline = Instant::now() + Duration::from_millis(frame_ms);
         if !RUNNING.load(Ordering::Relaxed) {
             break;
         }
@@ -3170,7 +3782,8 @@ fn run_background(
 
             let visible = block.len().min(cur_pane_h);
             // Row-level diff: static info rows and unchanged keyframes cost
-            // nothing, which keeps the pinned pane responsive at 30 fps.
+            // nothing, which keeps the pinned pane responsive at the configured
+            // frame rate.
             for (y, line) in block.iter().take(visible).enumerate() {
                 if last_block.get(y) == Some(line) {
                     continue;
@@ -3208,10 +3821,9 @@ fn run_background(
         held = holds;
         // Sleep in small slices so a command taking the terminal is noticed
         // before it starts drawing, not up to a whole frame later.
-        let mut waited = 0u64;
-        while waited < frame_ms {
-            thread::sleep(Duration::from_millis(5));
-            waited += 5;
+        while Instant::now() < frame_deadline {
+            let left = frame_deadline.saturating_duration_since(Instant::now());
+            thread::sleep(left.min(Duration::from_millis(5)));
             if !RUNNING.load(Ordering::Relaxed) {
                 break;
             }
@@ -3276,7 +3888,17 @@ fn main() {
         return;
     }
     if args.list_animations { print_animations(); return; }
-    if args.stop { stop_background(); return; }
+    if args.stop {
+        let stopped = stop_background();
+        // Also repair a region left behind by a crash that took its pid file.
+        if tty_name().is_some() {
+            reset_pin();
+        }
+        if !stopped {
+            eprintln!("arcfetch: nothing pinned to this terminal");
+        }
+        return;
+    }
 
     // mutual exclusion for display modes
     let mode_count = [args.blackhole, args.cosmic, args.quantum, args.mandelbrot, args.animate.is_some()]
@@ -3286,7 +3908,10 @@ fn main() {
         return;
     }
 
-    let mut cfg = config::load(args.accent.as_deref(), args.preset.as_deref(), args.config_file.as_deref());
+    let mut cfg = config::load(args.accent.as_deref(), args.preset.as_deref(), args.config_file.as_deref(), args.palette);
+    if let Some(fps) = args.fps {
+        cfg.animation.fps = fps.clamp(1.0, 120.0);
+    }
 
     // --all enables every optional field; -s/--structure shows only the listed ones
     if args.all { cfg.show.enable_all(); }
@@ -3378,7 +4003,7 @@ fn main() {
     // collect all sysinfo — only read network for hacker preset
     let need_net = cfg.show.ip || cfg.show.ssh || cfg.show.ports
         || cfg.show.public_ip || cfg.show.weather;
-    let si = info::collect_all(need_net, &cfg.show);
+    let si = info::collect_all(need_net, &cfg.show, cfg.fastfetch);
 
     // --json: emit machine-readable output and exit
     if args.json {
@@ -3404,13 +4029,13 @@ fn main() {
         } else {
             info_lines
         };
-        if args.foreground {
-            stop_background();
-            run_blackhole(&out_lines, args.duration);
-        } else {
+        if args.pin {
             let no_custom: Option<Vec<String>> = None;
             let art = CustomArt { lines: &no_custom, anim: None };
             run_background(PanelMode::Blackhole, "arch", art, &cfg, &out_lines, args.duration, args.no_color);
+        } else {
+            stop_background();
+            run_blackhole(&out_lines, play_duration(args.duration, &cfg));
         }
         return;
     }
@@ -3439,13 +4064,14 @@ fn main() {
     };
 
     // figure out which logo to use
-    let image_escape: Option<String> = if args.no_color {
+    let image_escape: Option<(String, usize, usize)> = if args.no_color {
         None
     } else if let Some(ref path) = args.logo_file {
         let ext = path.rsplit('.').next().map(|e| e.to_lowercase());
         match ext.as_deref() {
             Some("png" | "jpg" | "jpeg" | "gif") => {
-                let r = kitty_image(path);
+                let hold = cfg.logo.position != "top";
+                let r = kitty_image(path, cfg.logo.width, cfg.logo.height, hold);
                 if r.is_none() {
                     eprintln!("arcfetch: could not load image: {}", path);
                 }
@@ -3468,11 +4094,20 @@ fn main() {
             line.to_string()
         }).collect())
     } else if let Some(ref path) = args.logo_file {
-        // explicit --logo-file path (text file)
-        load_file(path).or_else(|| {
-            eprintln!("arcfetch: could not read logo file: {}", path);
+        let image = matches!(
+            path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref(),
+            Some("png" | "jpg" | "jpeg" | "gif")
+        );
+        if image {
+            // No TTY/colour: fall back to the distro logo instead of trying
+            // to read the image as a text logo.
             None
-        })
+        } else {
+            load_file(path).or_else(|| {
+                eprintln!("arcfetch: could not read logo file: {}", path);
+                None
+            })
+        }
     } else if args.logo == "custom" {
         // --logo custom → try default path
         load_file(&default_custom).or_else(|| {
@@ -3520,15 +4155,15 @@ fn main() {
     // ── animated logo mode ──
     if let Some(ref eff) = args.animate {
         if !is_tty {
-            eprintln!("arcfetch: --animate requires a terminal");
+            eprintln!("arcfetch: --animate/--pin requires a terminal");
             return;
         }
         let art = CustomArt { lines: &custom_lines, anim: custom_anim.as_ref() };
-        if args.foreground {
-            stop_background();
-            run_animate(&out_lines, &logo_name, art, &cfg, &args, eff, args.duration);
-        } else {
+        if args.pin {
             run_background(PanelMode::Animate(eff), &logo_name, art, &cfg, &out_lines, args.duration, args.no_color);
+        } else {
+            stop_background();
+            run_animate(&out_lines, &logo_name, art, &cfg, &args, eff, play_duration(args.duration, &cfg));
         }
         return;
     }
@@ -3560,13 +4195,49 @@ fn main() {
     out.push('\n');
 
     // emit kitty image escape first (the image IS the logo)
-    if let Some(ref img) = image_escape {
-        out.push_str(img);
-        out.push('\n');
-        // render info lines below the image, no logo needed
-        let indent = " ".repeat(cfg.layout.indent);
-        for line in &out_lines {
-            let _ = writeln!(out, "{indent}{}", line);
+    if let Some((ref img, cols, rows)) = image_escape {
+        match cfg.logo.position.as_str() {
+            "top" => {
+                out.push_str(img);
+                out.push('\n');
+                let indent = " ".repeat(cfg.layout.indent);
+                for line in &out_lines {
+                    let _ = writeln!(out, "{indent}{}", line);
+                }
+            }
+            "right" => {
+                // Info on the left, image on the right: place the image at the
+                // top of the block, return to column 0, then print the rows.
+                let info_w = out_lines.iter().map(|l| visible_chars(l)).max().unwrap_or(0);
+                let pad = cfg.layout.indent + info_w + cfg.layout.gap;
+                out.push_str(&" ".repeat(pad));
+                out.push_str(img);
+                out.push('\r');
+                let indent = " ".repeat(cfg.layout.indent);
+                for line in &out_lines {
+                    let _ = writeln!(out, "{indent}{}", line);
+                }
+            }
+            _ => {
+                // Default: image on the left, info beside it.
+                let indent = " ".repeat(cfg.layout.indent);
+                out.push_str(&indent);
+                out.push_str(img);
+                for (i, line) in out_lines.iter().enumerate() {
+                    if i == 0 {
+                        out.push_str(&" ".repeat(cols + cfg.layout.gap));
+                    } else if i < rows {
+                        out.push_str(&" ".repeat(cfg.layout.indent + cols + cfg.layout.gap));
+                    } else {
+                        out.push_str(&indent);
+                    }
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        if cfg.logo.position != "top" && out_lines.len() < rows {
+            out.push_str(&format!("\x1b[{}B", rows - out_lines.len()));
         }
         out.push('\n');
         unsafe { libc::write(1, out.as_ptr().cast::<core::ffi::c_void>(), out.len()); }
@@ -3673,4 +4344,26 @@ fn main() {
         config::downgrade_str(&out, depth)
     };
     unsafe { libc::write(1, out.as_ptr().cast::<core::ffi::c_void>(), out.len()); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_headers_and_cell_aspect_are_parsed() {
+        let mut png = [0u8; 24];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[16..20].copy_from_slice(&256u32.to_be_bytes());
+        png[20..24].copy_from_slice(&128u32.to_be_bytes());
+        assert_eq!(image_size(&png), Some((256, 128)));
+        assert_eq!(image_cells(&png, None, None), (31, 8));
+        assert_eq!(image_cells(&png, Some(20), None), (20, 5));
+
+        let mut gif = [0u8; 10];
+        gif[..6].copy_from_slice(b"GIF89a");
+        gif[6..8].copy_from_slice(&100u16.to_le_bytes());
+        gif[8..10].copy_from_slice(&50u16.to_le_bytes());
+        assert_eq!(image_size(&gif), Some((100, 50)));
+    }
 }

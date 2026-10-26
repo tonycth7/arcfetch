@@ -14,7 +14,14 @@ fn moon_phase() -> &'static str {
             use std::time::SystemTime;
             t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs_f64()
         }).unwrap_or(0.0);
-    let now = boot_approx + uptime_secs as f64;
+    let now = if boot_approx > 0.0 {
+        boot_approx + uptime_secs as f64
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+    };
     let jd = now / 86400.0 + 2440587.5;
     let phase_days = (jd - 2451543.75) % 29.53058867;
     let phase = (phase_days / 29.53058867 * 8.0) as usize % 8;

@@ -1,1 +1,4 @@
 /target
+/dist
+.agent
+graphify-out/

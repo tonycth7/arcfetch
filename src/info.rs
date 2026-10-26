@@ -16,6 +16,7 @@ pub struct SysInfo {
     pub gpu:         String,
     pub gpu_temp:    String,
     pub battery:     String,
+    pub battery_key: String,
     pub disk:        String,
     pub load:        String,
     pub locale:      String,
@@ -45,6 +46,7 @@ pub struct SysInfo {
     pub local_ip:    String,
     pub os_id:       String,
     pub os_id_like:  String,
+    pub os_version:  String,
     // opt-in modules
     pub datetime:      String,
     pub editor:        String,
@@ -81,12 +83,314 @@ pub struct SysInfo {
     pub physical_disk: String,
     pub top_processes: String,
     pub monitor:       String,
+    pub display_key:   String,
 }
 
 // ── Low-level helpers ────────────────────────────────────
 
 #[inline]
 fn slurp(p: &str) -> String { fs::read_to_string(p).unwrap_or_default() }
+
+/// Run a command, returning trimmed stdout on success.
+#[allow(dead_code)]
+fn command(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program).args(args).output().ok()?;
+    if !out.status.success() { return None; }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Version hint exported by some shells (ZSH_VERSION is not exported by
+/// default), so the fastfetch `shell` row can skip spawning `--version`.
+fn shell_version_env(name: &str) -> Option<String> {
+    let var = match name {
+        "zsh"  => "ZSH_VERSION",
+        "bash" => "BASH_VERSION",
+        "fish" => "FISH_VERSION",
+        "nu"   => "NU_VERSION",
+        _      => return None,
+    };
+    env::var(var).ok().filter(|v| !v.is_empty())
+}
+
+/// First parseable value from a list of sysctl keys.
+#[allow(dead_code)]
+fn sysctl_u64(keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| sysctl(k)?.trim().parse::<u64>().ok())
+}
+
+/// `uname -r` equivalent, shared by the BSD OS-name fallback.
+#[allow(dead_code)]
+fn uname_release() -> String {
+    let mut uts = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: `uname` fully initializes `uts` when it returns 0.
+    if unsafe { libc::uname(uts.as_mut_ptr()) } == 0 {
+        // SAFETY: initialized by the successful call above.
+        let uts = unsafe { uts.assume_init() };
+        // SAFETY: `release` is a NUL-terminated C string.
+        unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(target_os = "macos")]      const NATIVE_OS_ID: &str = "macos";
+#[cfg(target_os = "freebsd")]    const NATIVE_OS_ID: &str = "freebsd";
+#[cfg(target_os = "openbsd")]    const NATIVE_OS_ID: &str = "openbsd";
+#[cfg(target_os = "netbsd")]     const NATIVE_OS_ID: &str = "netbsd";
+#[cfg(target_os = "dragonfly")]  const NATIVE_OS_ID: &str = "dragonfly";
+#[cfg(target_os = "android")]    const NATIVE_OS_ID: &str = "android";
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd",
+              target_os = "netbsd", target_os = "dragonfly", target_os = "android")))]
+const NATIVE_OS_ID: &str = "linux";
+
+#[cfg(target_os = "macos")]      const NATIVE_INIT: &str = "launchd";
+#[cfg(target_os = "android")]    const NATIVE_INIT: &str = "init";
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd",
+          target_os = "dragonfly"))]
+const NATIVE_INIT: &str = "init";
+#[cfg(not(any(target_os = "macos", target_os = "android", target_os = "freebsd",
+              target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly")))]
+const NATIVE_INIT: &str = "unknown";
+
+/// Human-readable OS name when `/etc/os-release` is absent.
+#[cfg(target_os = "macos")]
+fn native_os() -> String {
+    let name = command("sw_vers", &["-productName"]).unwrap_or_else(|| "macOS".into());
+    match command("sw_vers", &["-productVersion"]) {
+        Some(v) if !v.is_empty() => format!("{name} {v}"),
+        _ => name,
+    }
+}
+
+#[cfg(target_os = "android")]
+fn native_os() -> String {
+    let version = command("getprop", &["ro.build.version.release"])
+        .or_else(|| command("/system/bin/getprop", &["ro.build.version.release"]));
+    match version {
+        Some(v) if !v.is_empty() => format!("Android {v}"),
+        _ => "Android".into(),
+    }
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd",
+          target_os = "dragonfly"))]
+fn native_os() -> String {
+    let name = if cfg!(target_os = "freebsd") { "FreeBSD" }
+        else if cfg!(target_os = "openbsd") { "OpenBSD" }
+        else if cfg!(target_os = "netbsd") { "NetBSD" }
+        else { "DragonFly" };
+    let release = uname_release();
+    if release.is_empty() { name.into() } else { format!("{name} {release}") }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "android", target_os = "freebsd",
+              target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly")))]
+fn native_os() -> String { "Linux".into() }
+
+/// Memory + swap in KiB: `(total, available, swap_total, swap_free)`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn memory_info() -> (u64, u64, u64, u64) {
+    let raw = slurp("/proc/meminfo");
+    let (mut total, mut avail) = (0u64, 0u64);
+    let (mut swap_total, mut swap_free) = (0u64, 0u64);
+    for line in raw.lines() {
+        let Some((key, rest)) = line.split_once(':') else { continue };
+        let value = rest.split_ascii_whitespace().next()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        match key {
+            "MemTotal"     => total = value,
+            "MemAvailable" => avail = value,
+            "SwapTotal"    => swap_total = value,
+            "SwapFree"     => swap_free = value,
+            _ => {}
+        }
+    }
+    (total, avail, swap_total, swap_free)
+}
+
+/// macOS/BSD memory via sysctl (`hw.memsize`/`hw.physmem`, VM page counts).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn memory_info() -> (u64, u64, u64, u64) {
+    let total_bytes = sysctl_u64(&[
+        "hw.memsize", "hw.physmem", "hw.physmem64", "hw.realmem",
+        "hw.realmem64", "hw.usermem",
+    ]).unwrap_or(0);
+    let page = sysctl_u64(&["hw.pagesize"]).unwrap_or(4096);
+    let (mut free, mut inactive) = (
+        sysctl_u64(&["vm.page_free_count", "vm.stats.vm.v_free_count", "vm.uvmexp.free"]).unwrap_or(0),
+        sysctl_u64(&[
+            "vm.page_inactive_count", "vm.stats.vm.v_inactive_count",
+            "vm.stats.vm.v_cache_count", "vm.uvmexp.inactive",
+        ]).unwrap_or(0),
+    );
+    if free + inactive == 0 {
+        if let Some((f, i)) = vmstat_pages() { free = f; inactive = i; }
+    }
+    let total = total_bytes / 1024;
+    let avail = ((free + inactive).saturating_mul(page) / 1024).min(total);
+    let (swap_total, swap_used) = swap_usage();
+    (total, avail, swap_total, swap_total.saturating_sub(swap_used))
+}
+
+/// Free/inactive page counts from `vmstat -s` on BSDs whose sysctl names differ.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn vmstat_pages() -> Option<(u64, u64)> {
+    let raw = command("vmstat", &["-s"])?;
+    let (mut free, mut inactive) = (0u64, 0u64);
+    for line in raw.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 3 { continue; }
+        let Ok(n) = f[0].parse::<u64>() else { continue };
+        match (f[1], f[2]) {
+            ("pages", "free") => free = n,
+            ("pages", "inactive") => inactive = n,
+            _ => {}
+        }
+    }
+    (free > 0).then_some((free, inactive))
+}
+
+/// Parse `2048.00M`, `512K`, `2G` into KiB.
+#[allow(dead_code)]
+fn parse_kib(s: &str) -> u64 {
+    let s = s.trim().trim_end_matches(|c: char| c == 'B' || c == 'b');
+    let (num, unit) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&s[..s.len() - 1], c.to_ascii_uppercase()),
+        _ => (s, 'B'),
+    };
+    let n: f64 = num.parse().unwrap_or(0.0);
+    let mult = match unit { 'K' => 1.0, 'M' => 1024.0, 'G' => 1_048_576.0, 'T' => 1_073_741_824.0, _ => 1.0 / 1024.0 };
+    (n * mult) as u64
+}
+
+#[cfg(target_os = "macos")]
+fn swap_usage() -> (u64, u64) {
+    let raw = sysctl("vm.swapusage").unwrap_or_default();
+    let toks: Vec<&str> = raw.split_whitespace().collect();
+    let value = |key: &str| toks.iter().position(|t| *t == key)
+        .and_then(|i| toks.get(i + 2))
+        .map(|v| parse_kib(v)).unwrap_or(0);
+    (value("total"), value("used"))
+}
+
+#[cfg(target_os = "freebsd")]
+fn swap_usage() -> (u64, u64) {
+    let raw = command("swapinfo", &["-k"]).unwrap_or_default();
+    let mut total = 0u64;
+    let mut used = 0u64;
+    for line in raw.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 3 && f[0].eq_ignore_ascii_case("total") {
+            total = f[1].parse().unwrap_or(0);
+            used = f[2].parse().unwrap_or(0);
+        }
+    }
+    (total, used)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+#[allow(dead_code)]
+fn swap_usage() -> (u64, u64) { (0, 0) }
+
+/// Load averages from `/proc/loadavg`, else `sysctl vm.loadavg`.
+fn load_average() -> String {
+    let raw = slurp("/proc/loadavg");
+    let raw = if raw.trim().is_empty() {
+        sysctl("vm.loadavg").unwrap_or_default()
+    } else { raw };
+    raw.split_ascii_whitespace()
+        .filter(|v| v.parse::<f64>().is_ok())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// Process count via `ps` when `/proc` is unavailable.
+#[allow(dead_code)]
+fn platform_process_count() -> usize {
+    command("ps", &["-ax", "-o", "pid="]).map(|out| {
+        out.lines().filter(|l| l.trim().parse::<u32>().is_ok()).count()
+    }).unwrap_or(0)
+}
+
+/// GPU name from the platform's own tool (macOS/FreeBSD).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn platform_gpu() -> Option<String> {
+    // Apple Silicon: the GPU is the SoC, no need to run system_profiler.
+    let brand = sysctl("machdep.cpu.brand_string")
+        .or_else(|| sysctl("hw.model"))?;
+    Some(format!("{brand} GPU"))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn platform_gpu() -> Option<String> {
+    let out = crate::modules::run_timeout("system_profiler", &["SPDisplaysDataType"], 5000)?;
+    for line in out.lines() {
+        let l = line.trim();
+        if let Some(v) = l.strip_prefix("Chipset Model:").or_else(|| l.strip_prefix("Model:")) {
+            let v = v.trim();
+            if !v.is_empty() { return Some(v.to_string()); }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "freebsd")]
+fn platform_gpu() -> Option<String> {
+    let out = crate::modules::run_timeout("pciconf", &["-lv"], 1500)?;
+    let mut display = false;
+    let mut vendor = String::new();
+    for line in out.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            display = line.contains("class=0x0300");
+            vendor.clear();
+            continue;
+        }
+        if !display { continue; }
+        let l = line.trim();
+        let value = l.split_once('=')
+            .map(|(_, v)| v.trim().trim_matches('\''))
+            .unwrap_or("");
+        if l.starts_with("vendor") {
+            vendor = value.to_string();
+        } else if l.starts_with("device") {
+            let name = format!("{} {}", vendor, value).trim().to_string();
+            if !name.is_empty() { return Some(name); }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+fn platform_gpu() -> Option<String> { None }
+
+/// Battery percentage from `pmset` (macOS) or `acpiconf` (FreeBSD).
+#[cfg(target_os = "macos")]
+fn platform_battery() -> Option<String> {
+    let out = command("pmset", &["-g", "batt"])?;
+    let cap = out.split_whitespace().find(|w| w.ends_with('%'))?.to_string();
+    let icon = if out.contains("charging") { "↑" }
+        else if out.contains("discharging") { "↓" } else { "" };
+    Some(format!("{cap} {icon}").trim().to_string())
+}
+
+#[cfg(target_os = "freebsd")]
+fn platform_battery() -> Option<String> {
+    let out = command("acpiconf", &["-i", "0"])?;
+    let cap = out.lines()
+        .find(|l| l.trim().starts_with("Remaining capacity:"))
+        .and_then(|l| l.split_whitespace().find(|w| w.ends_with('%')))?
+        .to_string();
+    let low = out.to_ascii_lowercase();
+    let icon = if low.contains("charging") { "↑" }
+        else if low.contains("discharging") { "↓" } else { "" };
+    Some(format!("{cap} {icon}").trim().to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+fn platform_battery() -> Option<String> { None }
 
 /// CPU package temperature in whole °C.
 ///
@@ -135,6 +439,7 @@ fn cpu_temp_c() -> Option<u32> {
 }
 
 /// Seconds since boot via `sysinfo(2)`, or 0 on failure.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn system_uptime_secs() -> u64 {
     let mut info = std::mem::MaybeUninit::<libc::sysinfo>::uninit();
     // SAFETY: `sysinfo` initializes the whole struct when it returns 0.
@@ -146,7 +451,49 @@ pub fn system_uptime_secs() -> u64 {
     }
 }
 
+/// Seconds since boot from `kern.boottime` (macOS/BSD), monotonic fallback.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn system_uptime_secs() -> u64 {
+    let boot = sysctl("kern.boottime").and_then(|raw| {
+        let tail = raw.split("sec").nth(1)?;
+        tail.split(|c: char| !c.is_ascii_digit())
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+    });
+    if let Some(boot) = boot {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now > boot { return now - boot; }
+    }
+    let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes `ts` on success.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) } == 0 {
+        // SAFETY: initialized by the successful call above.
+        unsafe { ts.assume_init() }.tv_sec.max(0) as u64
+    } else {
+        0
+    }
+}
+
+/// Run `sysctl -n <key>`; used by the macOS/BSD fallbacks.
+#[allow(dead_code)]
+fn sysctl(key: &str) -> Option<String> {
+    for program in ["sysctl", "/usr/sbin/sysctl", "/sbin/sysctl"] {
+        let Ok(out) = std::process::Command::new(program)
+            .args(["-n", key])
+            .output()
+        else { continue; };
+        if !out.status.success() { continue; }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() { return Some(s); }
+    }
+    None
+}
+
 /// CPU brand string via CPUID (~1µs) — just the name, no frequency/cores
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn cpu_brand() -> String {
     let max_ext = core::arch::x86_64::__cpuid_count(0x80000000, 0).eax;
@@ -174,6 +521,59 @@ fn cpu_brand() -> String {
     } else {
         "Unknown".into()
     }
+}
+
+/// CPU brand on non-x86_64: `/proc/cpuinfo`, then sysctl, then uname.
+#[cfg(not(target_arch = "x86_64"))]
+fn cpu_brand() -> String {
+    if let Ok(raw) = fs::read_to_string("/proc/cpuinfo") {
+        for line in raw.lines() {
+            let Some((key, value)) = line.split_once(':') else { continue };
+            if matches!(key.trim(), "model name" | "Hardware" | "Processor") {
+                let v = value.trim();
+                if !v.is_empty() { return v.to_string(); }
+            }
+        }
+    }
+    for key in ["machdep.cpu.brand_string", "hw.model"] {
+        if let Some(v) = sysctl(key) {
+            return v;
+        }
+    }
+    let mut uts = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: `uname` fully initializes `uts` when it returns 0.
+    if unsafe { libc::uname(uts.as_mut_ptr()) } == 0 {
+        // SAFETY: initialized by the successful call above.
+        let uts = unsafe { uts.assume_init() };
+        // SAFETY: `machine` is a NUL-terminated C string.
+        let machine = unsafe { std::ffi::CStr::from_ptr(uts.machine.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if !machine.is_empty() { return machine; }
+    }
+    "Unknown".into()
+}
+
+/// Integrated/Discrete marker for fastfetch's GPU row. Sysfs vendor IDs are
+/// stable; a small AMD VRAM pool means an APU (shared GTT memory).
+pub(crate) fn gpu_type() -> Option<&'static str> {
+    for i in 0..4u8 {
+        let base = format!("/sys/class/drm/card{}/device", i);
+        let vendor = slurp(&format!("{base}/vendor")).trim().to_ascii_lowercase();
+        match vendor.as_str() {
+            "0x8086" => return Some("Integrated"),
+            "0x10de" => return Some("Discrete"),
+            "0x1002" => {
+                let vram = slurp(&format!("{base}/mem_info_vram_total"))
+                    .trim().parse::<u64>().unwrap_or(0);
+                if vram > 0 {
+                    return Some(if vram <= 1 << 30 { "Integrated" } else { "Discrete" });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// GPU probe — DRM first (AMD/Intel), then NVIDIA, then PCI fallback.
@@ -217,6 +617,7 @@ fn gpu_probe() -> String {
             return crate::cache::get_or_compute_ttl(&key, 86_400, || gpu_pci_name(&vid, &did));
         }
     }
+    if let Some(name) = platform_gpu() { return name; }
     "Unknown".into()
 }
 
@@ -360,29 +761,12 @@ fn local_ipv4() -> Option<(String, String)> {
 /// Collect all system info.
 /// Only reads fields whose show-flag is true. Pass need_network=true for hacker preset.
 #[inline]
-pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
+pub fn collect_all(need_network: bool, show: &crate::config::Show, fastfetch: bool) -> SysInfo {
     // ── fast sequential: all reads on main thread ──────────
 
-    // /proc/meminfo — single pass shared by memory + swap (was read twice)
+    // memory + swap — one shared read (`/proc/meminfo` or sysctl)
     let (mem_used, mem_total, swap) = if show.memory || show.swap {
-        let raw = slurp("/proc/meminfo");
-        let (mut mem_total_kib, mut mem_avail_kib) = (0u64, 0u64);
-        let (mut swap_total_kib, mut swap_free_kib) = (0u64, 0u64);
-        for line in raw.lines() {
-            let Some((key, rest)) = line.split_once(':') else { continue };
-            let value = rest
-                .split_ascii_whitespace()
-                .next()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(0);
-            match key {
-                "MemTotal"     => mem_total_kib = value,
-                "MemAvailable" => mem_avail_kib = value,
-                "SwapTotal"    => swap_total_kib = value,
-                "SwapFree"     => swap_free_kib = value,
-                _ => {}
-            }
-        }
+        let (mem_total_kib, mem_avail_kib, swap_total_kib, swap_free_kib) = memory_info();
 
         let (used, total) = if show.memory {
             (
@@ -417,11 +801,16 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     let cpu = if show.cpu {
         let brand = cpu_brand();
         let cores = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize };
-        let freq = crate::cache::get_or_compute("cpu_freq", 86400, || {
-            slurp("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
-        });
+        // Fastfetch shows the CPU's maximum clock. One sysfs read is cheap
+        // enough to do live, and avoids a stale 24 h cache after a boost change.
+        let freq = slurp("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq");
         let ghz = freq.trim().parse::<f64>().ok().map(|khz| khz / 1_000_000.0);
-        if let Some(ghz) = ghz {
+        if fastfetch {
+            match ghz {
+                Some(ghz) if ghz > 0.1 => format!("{} ({}) @ {:.2} GHz", brand, cores, ghz),
+                _ => format!("{} ({})", brand, cores),
+            }
+        } else if let Some(ghz) = ghz {
             if ghz > 0.1 {
                 format!("{} ({}x) @ {:.2} GHz", brand, cores, ghz)
             } else {
@@ -433,13 +822,22 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     } else { String::new() };
 
     // /etc/os-release — read once (pretty name + IDs for logo detection)
-    let os_raw = if show.os { Some(slurp("/etc/os-release")) } else { None };
+    let os_raw = Some(slurp("/etc/os-release"));
     let os_id = os_raw.as_deref()
         .and_then(|r| r.lines().find(|l| l.starts_with("ID=")))
-        .map(|l| l[3..].trim().trim_matches('"').to_string()).unwrap_or_default();
+        .map(|l| l[3..].trim().trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| NATIVE_OS_ID.to_string());
     let os_id_like = os_raw.as_deref()
         .and_then(|r| r.lines().find(|l| l.starts_with("ID_LIKE=")))
-        .map(|l| l[8..].trim().trim_matches('"').to_string()).unwrap_or_default();
+        .map(|l| l[8..].trim().trim_matches('"').to_string())
+        .unwrap_or_default();
+    let os_version = os_raw.as_deref()
+        .and_then(|r| r.lines().find(|l| l.starts_with("VERSION_ID="))
+            .or_else(|| r.lines().find(|l| l.starts_with("VERSION="))))
+        .and_then(|l| l.split_once('='))
+        .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        .unwrap_or_default();
 
     let os = if show.os {
         crate::cache::get_or_compute("os", 86400, || {
@@ -449,8 +847,8 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
                 .or_else(|| os_raw.as_deref()
                     .and_then(|r| r.lines().find(|l| l.starts_with("NAME=")))
                     .map(|l| l[5..].trim_matches('"').to_string()))
-                .or_else(|| (!os_id.is_empty()).then(|| os_id.clone()))
-                .unwrap_or_else(|| "Linux".into())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(native_os)
         })
     } else { String::new() };
 
@@ -503,32 +901,41 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         if temp.is_empty() { "N/A".into() } else { temp }
     } else { String::new() };
 
-    // battery — /sys/class/power_supply/BAT0 (or BAT1)
-    let battery = if show.battery {
-        let mut b = String::new();
-        for bat in &["BAT0", "BAT1", "BAT"] {
-            let base = format!("/sys/class/power_supply/{}", bat);
-            if let Ok(cap) = fs::read_to_string(format!("{}/capacity", base)) {
-                let cap = cap.trim();
-                let status = fs::read_to_string(format!("{}/status", base))
-                    .unwrap_or_default();
-                let status = status.trim();
-                let icon = match status {
-                    "Charging"    => "↑",
-                    "Discharging" => "↓",
-                    "Full"        => "✓",
-                    _             => "",
-                };
-                b = format!("{}% {}", cap, icon).trim().to_string();
-                break;
+    // battery — /sys/class/power_supply (Android uses `battery`)
+    let (battery_key, battery) = if show.battery {
+        if fastfetch {
+            if let Some((key, value)) = modules::battery_fastfetch() {
+                (key, value)
+            } else {
+                (String::new(), platform_battery().unwrap_or_else(|| "N/A".into()))
             }
+        } else {
+            let mut b = String::new();
+            for bat in &["BAT0", "BAT1", "BAT", "battery"] {
+                let base = format!("/sys/class/power_supply/{}", bat);
+                if let Ok(cap) = fs::read_to_string(format!("{}/capacity", base)) {
+                    let cap = cap.trim();
+                    let status = fs::read_to_string(format!("{}/status", base))
+                        .unwrap_or_default();
+                    let status = status.trim();
+                    let icon = match status {
+                        "Charging"    => "↑",
+                        "Discharging" => "↓",
+                        "Full"        => "✓",
+                        _             => "",
+                    };
+                    b = format!("{}% {}", cap, icon).trim().to_string();
+                    break;
+                }
+            }
+            if b.is_empty() {
+                (String::new(), platform_battery().unwrap_or_else(|| "N/A".into()))
+            } else { (String::new(), b) }
         }
-        if b.is_empty() { "N/A".into() } else { b }
-    } else { String::new() };
+    } else { (String::new(), String::new()) };
 
     let load = if show.load {
-        slurp("/proc/loadavg")
-            .split_ascii_whitespace().take(3).collect::<Vec<_>>().join("  ")
+        load_average()
     } else { String::new() };
 
     // disk — one statvfs syscall
@@ -538,12 +945,14 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         if unsafe { libc::statvfs(c"/".as_ptr(), st.as_mut_ptr()) } == 0 {
             // SAFETY: initialized by the successful call above.
             let st = unsafe { st.assume_init() };
-            let blk   = st.f_frsize;
-            let total = st.f_blocks * blk;
-            let avail = st.f_bavail * blk;
+            let blk   = st.f_frsize as u64;
+            let total = st.f_blocks as u64 * blk;
+            // Fastfetch counts reserved blocks as used; the compact arcfetch
+            // default keeps showing what a normal user can actually use.
+            let free  = (if fastfetch { st.f_bfree } else { st.f_bavail }) as u64 * blk;
             let gb    = 1_073_741_824.0f64;
             format!("{:.1}G / {:.1}G",
-                total.saturating_sub(avail) as f64 / gb, total as f64 / gb)
+                total.saturating_sub(free) as f64 / gb, total as f64 / gb)
         } else { "unknown".into() }
     } else { String::new() };
 
@@ -565,12 +974,37 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
 
     // env vars — pure memory, zero I/O — gated on show flags
     let shell  = if show.shell  {
-        env::var("SHELL").ok()
+        let name = env::var("SHELL").ok()
             .and_then(|s| s.rsplit('/').next().map(str::to_string))
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "sh".into())
+            .unwrap_or_else(|| "sh".into());
+        if fastfetch {
+            // Fastfetch prints `name version`. Spawning a shell for `--version`
+            // costs milliseconds on every prompt, so cache the answer and use
+            // an exported version first (ZSH_VERSION is not exported by default).
+            let ver = crate::cache::get_or_compute(&format!("shell_version_{name}"), 86400, || {
+                shell_version_env(&name)
+                    .or_else(|| command(&name, &["--version"]))
+                    .and_then(|out| {
+                        out.lines().next()?.split_whitespace()
+                            .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+                            .map(|t| t.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect::<String>())
+                    })
+                    .unwrap_or_default()
+            });
+            if ver.is_empty() { name } else { format!("{name} {ver}") }
+        } else {
+            name
+        }
     } else { String::new() };
-    let term   = if show.term   { env::var("TERM_PROGRAM").or_else(|_| env::var("TERM")).unwrap_or_else(|_| "unknown".into()) } else { String::new() };
+    let term   = if show.term   {
+        // Fastfetch walks the process tree; herdr exposes itself in the env.
+        if fastfetch && env::var_os("HERDR_ENV").is_some() {
+            "herdr".into()
+        } else {
+            env::var("TERM_PROGRAM").or_else(|_| env::var("TERM")).unwrap_or_else(|_| "unknown".into())
+        }
+    } else { String::new() };
     let locale = if show.locale { env::var("LANG").unwrap_or_else(|_| "C".into()) } else { String::new() };
     let de_wm  = if show.de_wm {
              if let Ok(v) = env::var("XDG_CURRENT_DESKTOP")         { v }
@@ -579,6 +1013,8 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         else if env::var("SWAYSOCK").is_ok()                        { "Sway".into() }
         else if env::var("WAYLAND_DISPLAY").is_ok()                 { "Wayland".into() }
         else if env::var("DISPLAY").is_ok()                         { "X11".into() }
+        else if cfg!(target_os = "macos")                           { "Aqua".into() }
+        else if cfg!(target_os = "android")                         { "Android".into() }
         else                                                        { "TTY".into() }
     } else { String::new() };
 
@@ -590,7 +1026,7 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
             "openrc-init" | "openrc" => "OpenRC",
             "runit" => "runit",
             "s6-svscan" => "s6",
-            _ if comm.is_empty() => "unknown",
+            _ if comm.is_empty() => NATIVE_INIT,
             _ => &comm,
         }.to_string()
     } else { String::new() };
@@ -606,7 +1042,7 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
             .map(|d| d.flatten().filter(|e|
                 e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit())
             ).count()).unwrap_or(0);
-        n.to_string()
+        if n == 0 { platform_process_count() } else { n }.to_string()
     } else { String::new() };
 
     // container — check for known container markers
@@ -655,12 +1091,22 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
 
     // ── GPU — cached 24h, DRM-first probe ────────────────
     let gpu = if show.gpu || show.gpu_temp {
-        crate::cache::get_or_compute("gpu", 86400, gpu_probe)
+        let mut g = crate::cache::get_or_compute("gpu", 86400, gpu_probe);
+        if fastfetch && show.gpu && !g.is_empty() {
+            if let Some(t) = gpu_type() {
+                g.push_str(&format!(" [{t}]"));
+            }
+        }
+        g
     } else { String::new() };
 
     // ── sequential pkgs ─────────────────────────────────
     let pkgs = if show.pkgs {
-        crate::cache::get_or_compute("pkgs", 3600, crate::pkgs::count)
+        let fastfetch = fastfetch;
+        let key = if fastfetch { "pkgs-all" } else { "pkgs" };
+        crate::cache::get_or_compute(key, 3600, move || {
+            if fastfetch { crate::pkgs::count_all() } else { crate::pkgs::count() }
+        })
     } else { String::new() };
 
     // ── new fastfetch-inspired fields ───────────────────
@@ -674,6 +1120,8 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         else if fs::metadata("/run/pipewire-0").is_ok()                { "PipeWire".into() }
         else if fs::metadata("/run/pulse/native").is_ok()              { "PulseAudio".into() }
         else if fs::metadata("/run/pipewire").is_ok()                  { "PipeWire".into() }
+        else if cfg!(target_os = "macos")                                { "CoreAudio".into() }
+        else if cfg!(target_os = "android")                              { "AudioFlinger".into() }
         else { "ALSA".into() }
     } else { String::new() };
 
@@ -862,7 +1310,15 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     let mouse         = if show.mouse         { modules::mouse() } else { String::new() };
     let keyboard      = if show.keyboard      { modules::keyboard() } else { String::new() };
     let tpm           = if show.tpm           { modules::tpm() } else { String::new() };
-    let monitor       = if show.monitor       { modules::monitor() } else { String::new() };
+    let (display_key, monitor) = if show.monitor {
+        if fastfetch {
+            modules::display_fastfetch()
+        } else {
+            (String::new(), modules::monitor())
+        }
+    } else {
+        (String::new(), String::new())
+    };
 
     // The slow collectors — subprocess spawns (`glxinfo`, `playerctl`, `vainfo`,
     // `hciconfig`, …), network fetches and `/proc` walks — run concurrently, so
@@ -940,9 +1396,9 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
         None => String::new(),
         Some(None) => "N/A".into(),
         Some(Some((idle0, total0))) => {
-            // 60 ms ≈ 6 USER_HZ ticks (HZ=100), enough for a stable reading
-            // while keeping the warm `--all` path well under 100 ms.
-            const MIN_MS: u64 = 60;
+            // 15 ms ≈ 1–2 USER_HZ ticks (HZ=100); rough but usable, and keeps
+            // `--all` well under 30 ms instead of forcing a 60 ms stall.
+            const MIN_MS: u64 = 15;
             if let Some(rest) = std::time::Duration::from_millis(MIN_MS)
                 .checked_sub(cpu_start.elapsed())
             {
@@ -956,17 +1412,30 @@ pub fn collect_all(need_network: bool, show: &crate::config::Show) -> SysInfo {
     };
 
     SysInfo { os, kernel, uptime_secs, uptime, res, pkgs, shell, de_wm, term,
-              cpu, gpu, gpu_temp, battery, disk, load, locale, mem_used, mem_total,
+              cpu, gpu, gpu_temp, battery, battery_key, disk, load, locale, mem_used, mem_total,
               ip, ssh, ports,
               init, cpu_temp, processes, container, session,
               swap, sound, gpu_driver, bios, board, disk_type,
               pkg_updates, theme, icons, term_font, de_wm_ver, init_ver, local_ip,
-              os_id, os_id_like,
+              os_id, os_id_like, os_version,
               datetime, editor, dns, host, chassis, bootmgr, cpu_cache, login_manager,
               brightness, cpu_usage, diskio, netio, physmem, gpu_mem, btrfs, wifi,
               users, wallpaper, media, public_ip, weather, opengl, vulkan,
               cursor, term_size, term_theme, codec, bluetooth, camera, mouse,
-              keyboard, tpm, physical_disk, top_processes, monitor }
+              keyboard, tpm, physical_disk, top_processes, monitor, display_key }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::parse_kib;
+
+    #[test]
+    fn sysctl_sizes_convert_to_kib() {
+        assert_eq!(parse_kib("512K"), 512);
+        assert_eq!(parse_kib("2M"), 2048);
+        assert_eq!(parse_kib("1.5G"), 1_572_864);
+        assert_eq!(parse_kib("1024"), 1); // bare bytes
+    }
 }
 
 

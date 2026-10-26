@@ -1046,6 +1046,63 @@ pub const LOGO_FREEBSD: [&str; 15] = [
     "           · FreeBSD ·          ",
 ];
 
+// ── BSD (Beastie, 34x15) ─────────────────────────────────
+pub const LOGO_BSD: [&str; 15] = [
+    "      ▄▄▄                ▄▄▄      ",
+    "     █████              █████     ",
+    "      ▀███▄            ▄███▀      ",
+    "        ▀████████████████▀        ",
+    "      ▄████████████████████▄      ",
+    "    ▄████████████████████████▄    ",
+    "   ████████████████████████████   ",
+    "   ████████  ████████  ████████   ",
+    "   ████████  ████████  ████████   ",
+    "   ████████████████████████████   ",
+    "    █████████▀▀▀▀▀▀██████████     ",
+    "     ▀██████████████████████▀     ",
+    "       ▀██████████████████▀       ",
+    "          ▀▀██████████▀▀          ",
+    "              · BSD ·             ",
+];
+
+// ── Android (Robot, 34x15) ───────────────────────────────
+pub const LOGO_ANDROID: [&str; 15] = [
+    "        ▄▄▄          ▄▄▄          ",
+    "       █████        █████         ",
+    "        ▀███▄      ▄███▀          ",
+    "      ▄▄██████████████████▄▄      ",
+    "    ▄████████████████████████▄    ",
+    "   ████████████████████████████   ",
+    "  ████████  ████████  ████████    ",
+    "  ████████  ████████  ████████    ",
+    "  ████████████████████████████    ",
+    "   ▀████████████████████████▀     ",
+    "      ████          ████          ",
+    "      ████          ████          ",
+    "      ████          ████          ",
+    "     ██████        ██████         ",
+    "          · Android ·             ",
+];
+
+// ── Termux (Terminal, 34x15) ─────────────────────────────
+pub const LOGO_TERMUX: [&str; 15] = [
+    "  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄  ",
+    "  ██████████████████████████████  ",
+    "  ██▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀██  ",
+    "  ██   ●    ●    ●              ██",
+    "  ██                            ██",
+    "  ██    ▀█▄                     ██",
+    "  ██      ▀█▄                   ██",
+    "  ██    ▄█▀                     ██",
+    "  ██   ▀                        ██",
+    "  ██                   ▄▄▄▄     ██",
+    "  ██                   ▀▀▀▀     ██",
+    "  ██                            ██",
+    "  ██▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄██  ",
+    "   ▀██████████████████████████▀   ",
+    "           · Termux ·             ",
+];
+
 // ── Rust (Ferris the Crab, 24x11) ────────────────────────
 pub const LOGO_RUST: [&str; 11] = [
     "        _~^~^~_         ",
@@ -1214,7 +1271,10 @@ pub fn from_name(name: &str) -> &'static [&'static str] {
         "bazzite"                             => &LOGO_BAZZITE,
         "macos" | "darwin" | "apple"          => &LOGO_MACOS,
         "windows" | "win11" | "win"           => &LOGO_WINDOWS,
-        "freebsd" | "bsd"                     => &LOGO_FREEBSD,
+        "freebsd"                             => &LOGO_FREEBSD,
+        "bsd" | "openbsd" | "netbsd" | "dragonfly" => &LOGO_BSD,
+        "android"                             => &LOGO_ANDROID,
+        "termux"                              => &LOGO_TERMUX,
         "rust" | "ferris"                     => &LOGO_RUST,
         _                                     => &LOGO_ARCH,
     }
@@ -1435,6 +1495,9 @@ pub fn all_names() -> &'static [&'static str] {
         "macos",
         "windows",
         "freebsd",
+        "bsd",
+        "android",
+        "termux",
         "rust",
     ]
 }
@@ -1481,8 +1544,12 @@ pub fn detect(id: &str, id_like: &str) -> &'static str {
         "redhat" | "rhel" | "ol" => Some("redhat"),
         "zorin" => Some("zorin"),
         "macos" | "darwin" => Some("macos"),
+        "termux" => Some("termux"),
+        "android" => Some("android"),
+        "linux" | "tux" => Some("tux"),
         "windows" | "msys2" => Some("windows"),
-        "freebsd" | "openbsd" | "netbsd" | "dragonfly" => Some("freebsd"),
+        "freebsd" => Some("freebsd"),
+        "bsd" | "openbsd" | "netbsd" | "dragonfly" => Some("bsd"),
         _ => None,
     };
     if let Some(name) = specific {
@@ -1504,6 +1571,7 @@ pub fn detect(id: &str, id_like: &str) -> &'static str {
             "alpine" => Some("alpine"),
             "void" => Some("void"),
             "freebsd" => Some("freebsd"),
+            "bsd" | "openbsd" | "netbsd" | "dragonfly" => Some("bsd"),
             _ => None,
         };
         if let Some(name) = mapped {
@@ -1620,6 +1688,19 @@ mod tests {
         assert_eq!(frame("arch", 0, 6), expected);
         assert!(!is_animated("arch"));
         assert!(is_animated("arc_reactor"));
+    }
+
+    #[test]
+    fn bsd_android_termux_are_selectable_and_rectangular() {
+        for name in ["bsd", "android", "termux"] {
+            let lines = from_name(name);
+            assert_eq!(lines.len(), 15, "{name}");
+            assert!(lines.iter().all(|line| line.chars().count() == 34), "{name}");
+        }
+        assert_eq!(detect("android", ""), "android");
+        assert_eq!(detect("termux", ""), "termux");
+        assert_eq!(detect("openbsd", ""), "bsd");
+        assert_eq!(detect("freebsd", ""), "freebsd");
     }
 
 }

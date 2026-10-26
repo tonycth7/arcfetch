@@ -17,6 +17,13 @@
 //   sep    = overlay0
 //   bar    = blue
 //
+//   # optional: follow the wallpaper palette (first usable file wins)
+//   color_source = "palette"
+//   palette_files = ["~/.cache/wal/colors.json", ...]
+//   palette_accent = "primary"       # pywal/wallust fallback: color4
+//   palette_value = "on_surface"     # pywal/wallust fallback: color7
+//   palette_gradient = ["primary", "secondary", "tertiary"]
+//
 //   [show]
 //   os=true  kernel=true  uptime=true  res=false  pkgs=true
 //   shell=true  de_wm=true  term=true  cpu=true  gpu=true
@@ -893,6 +900,8 @@ pub struct Logo {
     pub position: String,      // left | right | top
     pub padding_top: usize,
     pub padding_right: usize,
+    pub width: Option<usize>,  // image logo columns (kitty protocol)
+    pub height: Option<usize>, // image logo rows
 }
 
 impl Default for Logo {
@@ -900,6 +909,7 @@ impl Default for Logo {
         Self {
             name: None, file: None, color: None, data: None,
             position: "left".into(), padding_top: 0, padding_right: 2,
+            width: None, height: None,
         }
     }
 }
@@ -949,6 +959,15 @@ pub struct Module {
     pub symbol: Option<String>,  // colors module
     pub value: Option<String>,   // static value override
     pub command: Option<String>, // value from a command
+    /// The value is a fastfetch-style format string, rendered after the key.
+    pub value_format: bool,
+    /// Fastfetch `condition.succeeded`: show only if the previous module did (or
+    /// did not) produce output. `None` means no such condition.
+    pub condition_succeeded: Option<bool>,
+    /// Fastfetch `packages.combined`: merge package-manager families.
+    pub combined: bool,
+    /// Fastfetch `packages.disabled`: managers to hide, family names included.
+    pub disabled: Vec<String>,
 }
 
 impl Default for Module {
@@ -957,7 +976,8 @@ impl Default for Module {
             kind: String::new(), key: None, format: None,
             key_color: None, output_color: None, key_icon: None,
             padding_left: 0, key_width: None, text: None, symbol: None,
-            value: None, command: None,
+            value: None, command: None, value_format: false,
+            condition_succeeded: None, combined: false, disabled: Vec::new(),
         }
     }
 }
@@ -1009,20 +1029,34 @@ impl Layout {
 // ── Animation ────────────────────────────────────────────
 
 pub struct Animation {
-    /// Play a short intro before the static render (TTY only).
+    /// Legacy alias: `enabled = false` disables the intro. New configs use
+    /// `intro_ms = 0`; kept so old files keep behaving the same.
     pub enabled:  bool,
     /// Glyph effect: none | shimmer | scanline | boot.
     pub effect:   String,
-    /// Intro length in milliseconds.
+    /// Intro length in milliseconds. 0 disables the intro.
     pub intro_ms: u64,
-    /// Colour-wave the logo while animating.
-    pub wave:     bool,
+    /// Seconds `--animate`/`--blackhole` play before returning to the shell.
+    pub play_seconds: f32,
     /// Vertical gradient for plain art. Empty falls back to the logo palette.
     pub gradient: Vec<String>,
-    /// Let the gradient crawl through the art as it animates.
+    /// Legacy alias: `gradient_scroll = false` kept the ramp still. New
+    /// configs use `gradient_speed = 0`; kept so old files keep behaving.
     pub gradient_scroll: bool,
+    /// Gradient rows moved per frame. 0 keeps the ramp still.
+    pub gradient_speed: f32,
+    /// Frames per second for the intro, pinned pane and custom animations.
+    pub fps: f32,
     /// Keep a frame's own ANSI colours; `false` forces the gradient on it.
     pub art_color: bool,
+}
+
+impl Animation {
+    /// Frame duration from `fps`, clamped to a sane 1–120 range.
+    pub fn frame_ms(&self) -> u64 {
+        let fps = self.fps.clamp(1.0, 120.0);
+        (1000.0 / fps).round().max(1.0) as u64
+    }
 }
 
 impl Default for Animation {
@@ -1031,7 +1065,7 @@ impl Default for Animation {
             enabled:  true,
             effect:   "none".into(),
             intro_ms: 700,
-            wave:     true,
+            play_seconds: 3.0,
             // animfetch's default ramp. Authored ANSI still wins.
             gradient: Gradient::new(vec![
                 (0xf5, 0xc9, 0x5c),
@@ -1041,8 +1075,38 @@ impl Default for Animation {
                 (0x74, 0xa4, 0xff),
             ])
             .ansi(32),
-            gradient_scroll: false,
+            gradient_scroll: true,
+            gradient_speed: 0.0,
+            fps: 30.0,
             art_color: true,
+        }
+    }
+}
+
+// ── Palette files ────────────────────────────────────────
+
+/// Wallpaper-derived colours. `source = "palette"` reads the first usable file
+/// and keeps any colour the file does not define.
+pub struct Palette {
+    pub source:   String,
+    pub files:    Vec<String>,
+    pub accent:   String,
+    pub value:    String,
+    pub gradient: Vec<String>,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            source: "config".into(),
+            files: vec![
+                "~/.local/state/quickshell/user/generated/colors.json".into(),
+                "~/.cache/wal/colors.json".into(),
+                "~/.cache/wallust/colors.json".into(),
+            ],
+            accent: "primary".into(),
+            value: "on_surface".into(),
+            gradient: vec!["primary".into(), "secondary".into(), "tertiary".into()],
         }
     }
 }
@@ -1056,9 +1120,13 @@ pub struct Config {
     pub layout:    Layout,
     pub animation: Animation,
     pub display:   Display,
+    pub palette:   Palette,
     pub modules:   Option<Vec<Module>>,
     pub command_timeout_ms: u64,
     pub source:    String,
+    /// The config came from fastfetch. Affects package aggregation and the
+    /// default formats/tokens used by the adapter.
+    pub fastfetch: bool,
 }
 
 impl Default for Config {
@@ -1070,9 +1138,11 @@ impl Default for Config {
             layout: Layout::default(),
             animation: Animation::default(),
             display: Display::default(),
+            palette: Palette::default(),
             modules: None,
             command_timeout_ms: 1000,
             source: String::new(),
+            fastfetch: false,
         }
     }
 }
@@ -1141,8 +1211,9 @@ pub fn preset_names() -> Vec<String> {
 }
 
 // ── Simple TOML-subset parser ────────────────────────────
-// Handles [section], [[table array]], key = value, single-line string arrays,
-// and # comments — enough for config.toml with zero deps. No multiline values.
+// Handles [section], [[table array]], key = value, string arrays (including
+// multiline), and # comments — enough for config.toml with zero deps. No
+// multiline strings.
 
 /// Strip a trailing `# comment` without eating `#RRGGBB` values. Quotes,
 /// arrays and paths are respected, so both `path = /a#b` and
@@ -1179,7 +1250,7 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-pub fn load(cli_accent: Option<&str>, preset: Option<&str>, config_file: Option<&str>) -> Config {
+pub fn load(cli_accent: Option<&str>, preset: Option<&str>, config_file: Option<&str>, force_palette: bool) -> Config {
     let mut cfg = Config::default();
 
     // CLI --config wins over --preset; otherwise TOML wins over JSONC.
@@ -1216,6 +1287,13 @@ pub fn load(cli_accent: Option<&str>, preset: Option<&str>, config_file: Option<
         }
     }
 
+    // Palette files are read after the rest of the file, then the explicit
+    // CLI/env accent still wins.
+    if force_palette {
+        cfg.palette.source = "palette".into();
+    }
+    apply_palette(&mut cfg);
+
     // CLI / env accent wins over file
     let accent_override = cli_accent.map(String::from).or_else(|| env::var("ARCFETCH_ACCENT").ok());
     if let Some(a) = accent_override {
@@ -1227,7 +1305,116 @@ pub fn load(cli_accent: Option<&str>, preset: Option<&str>, config_file: Option<
     cfg
 }
 
-/// Split a single-line TOML string array (`["os", "cpu"]`).
+fn expand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => env::var("HOME").map(|h| format!("{h}/{rest}")).unwrap_or_else(|_| path.into()),
+        None if path == "~" => env::var("HOME").unwrap_or_else(|_| path.into()),
+        None => path.into(),
+    }
+}
+
+/// Find a colour name in a palette file. Dotted names ("special.background")
+/// walk a path; bare names are also searched in nested objects, which covers
+/// pywal's `colors.color4` and matugen's nested role objects alike.
+fn palette_lookup<'a>(root: &'a jsonc::Value, name: &str) -> Option<&'a jsonc::Value> {
+    if let Some((head, rest)) = name.split_once('.') {
+        if let Some(v) = root.get(head) {
+            if let Some(found) = palette_lookup(v, rest) {
+                return Some(found);
+            }
+        }
+    }
+    if let Some(v) = root.get(name) {
+        return Some(v);
+    }
+    match root {
+        jsonc::Value::Obj(fields) => fields.iter().find_map(|(_, v)| palette_lookup(v, name)),
+        jsonc::Value::Arr(items) => items.iter().find_map(|v| palette_lookup(v, name)),
+        _ => None,
+    }
+}
+
+fn palette_color_value(v: &jsonc::Value) -> Option<String> {
+    match v {
+        jsonc::Value::Str(s) => Some(s.clone()),
+        jsonc::Value::Obj(_) => ["color", "hex", "value", "foreground"]
+            .iter()
+            .find_map(|k| v.get(k).and_then(palette_color_value)),
+        _ => None,
+    }
+}
+
+fn palette_color(root: &jsonc::Value, name: &str) -> Option<String> {
+    palette_lookup(root, name).and_then(palette_color_value)
+}
+
+/// Apply the first existing palette file, leaving any colour its names do not
+/// define untouched.
+fn apply_palette(cfg: &mut Config) {
+    if !cfg.palette.source.eq_ignore_ascii_case("palette") {
+        return;
+    }
+    let mut chosen: Option<jsonc::Value> = None;
+    let mut last_error: Option<String> = None;
+    for raw in &cfg.palette.files {
+        let path = expand_home(raw);
+        if !Path::new(&path).is_file() {
+            continue;
+        }
+        match fs::read_to_string(&path) {
+            Ok(text) => match jsonc::parse(&text) {
+                Ok(root) => {
+                    chosen = Some(root);
+                    break;
+                }
+                Err(e) => last_error = Some(format!("{path}: {e}")),
+            },
+            Err(e) => last_error = Some(format!("{path}: {e}")),
+        }
+    }
+    let Some(root) = chosen else {
+        match last_error {
+            Some(e) => eprintln!("arcfetch: warning: no usable palette file ({e})"),
+            None => eprintln!("arcfetch: warning: color_source = palette, but no palette file exists"),
+        }
+        return;
+    };
+    if let Some(c) = palette_color(&root, &cfg.palette.accent)
+        .or_else(|| palette_color(&root, "color4"))
+        .or_else(|| palette_color(&root, "accent"))
+    {
+        let ansi = resolve_config_color(&c);
+        cfg.colors.accent = ansi.clone();
+        cfg.colors.hostname = ansi.clone();
+        cfg.colors.bar = ansi;
+    }
+    if let Some(c) = palette_color(&root, &cfg.palette.value)
+        .or_else(|| palette_color(&root, "color7"))
+        .or_else(|| palette_color(&root, "special.foreground"))
+        .or_else(|| palette_color(&root, "foreground"))
+    {
+        cfg.colors.values = resolve_config_color(&c);
+    }
+    let mut stops: Vec<(u8, u8, u8)> = cfg.palette.gradient.iter()
+        .filter_map(|name| palette_color(&root, name))
+        .filter_map(|c| parse_hex_rgb(&c))
+        .collect();
+    if stops.is_empty() {
+        stops = ["color4", "color5", "color6"].iter()
+            .filter_map(|name| palette_color(&root, name))
+            .filter_map(|c| parse_hex_rgb(&c))
+            .collect();
+    }
+    if !stops.is_empty() {
+        let g = Gradient::new(stops);
+        cfg.animation.gradient = g.ansi(32);
+        let logo = g.ansi(9);
+        cfg.colors.logo = std::array::from_fn(|i| logo[i].clone());
+    }
+}
+
+/// Split a TOML string array (`["os", "cpu"]`); multiline arrays are folded
+/// into this form before parsing.
 fn toml_array(val: &str) -> Option<Vec<String>> {
     let inner = val.trim().strip_prefix('[')?.strip_suffix(']')?;
     let mut out = Vec::new();
@@ -1246,17 +1433,19 @@ fn module_field(m: &mut Module, key: &str, val: &str) {
     let k = key.trim().to_ascii_lowercase().replace(['-', '_'], "");
     match k.as_str() {
         "type" | "kind" => m.kind = val.trim().to_ascii_lowercase(),
-        "key" => m.key = Some(val.to_string()),
+        "key" | "label" => m.key = Some(val.to_string()),
         "format" => m.format = Some(val.to_string()),
         "keycolor" => m.key_color = Some(resolve_config_color(val)),
         "outputcolor" => m.output_color = Some(resolve_config_color(val)),
-        "keyicon" => m.key_icon = Some(val.to_string()),
+        "keyicon" | "icon" => m.key_icon = Some(val.to_string()),
         "paddingleft" => m.padding_left = val.parse().unwrap_or(0),
         "keywidth" => m.key_width = val.parse().ok(),
         "text" => m.text = Some(val.to_string()),
         "symbol" => m.symbol = Some(val.to_string()),
         "value" => m.value = Some(val.to_string()),
         "command" => m.command = Some(val.to_string()),
+        "combined" => m.combined = matches!(val.trim().to_ascii_lowercase().as_str(), "true" | "on" | "yes" | "1"),
+        "disabled" => m.disabled = toml_array(val).unwrap_or_default(),
         _ => {}
     }
 }
@@ -1277,7 +1466,7 @@ fn push_module(parsed: &mut Vec<Module>, m: Module) {
     }
 }
 
-fn install_modules(cfg: &mut Config, mods: Vec<Module>) {
+pub(crate) fn install_modules(cfg: &mut Config, mods: Vec<Module>) {
     // The module list is the source of truth: don't collect rows that are not
     // rendered (this is what keeps custom layouts on the fast path).
     cfg.show.clear_fields();
@@ -1393,7 +1582,49 @@ fn toml_info_style(content: &str) -> Option<String> {
     None
 }
 
+/// Join arrays that span lines into one line so the line-based parser sees
+/// `key = ["a", "b"]`. Comments are removed from the folded lines.
+fn fold_multiline_arrays(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut pending: Option<String> = None;
+    for raw in content.lines() {
+        let line = strip_comment(raw).trim();
+        if let Some(buf) = pending.as_mut() {
+            if !line.is_empty() {
+                buf.push(' ');
+                buf.push_str(line);
+            }
+            if line.contains(']') {
+                out.push_str(buf);
+                out.push('\n');
+                pending = None;
+            }
+            continue;
+        }
+        if let Some((_, val)) = line.split_once('=') {
+            let val = val.trim();
+            if val.starts_with('[') && !val.contains(']') {
+                pending = Some(line.to_string());
+                continue;
+            }
+        }
+        out.push_str(raw);
+        out.push('\n');
+    }
+    if let Some(buf) = pending {
+        out.push_str(&buf);
+        out.push('\n');
+    }
+    out
+}
+
+fn unquote(val: &str) -> &str {
+    val.trim().trim_matches('"').trim_matches('\'')
+}
+
 fn apply_toml(cfg: &mut Config, content: &str) {
+    let content = fold_multiline_arrays(content);
+    let content = content.as_str();
     let mut section = "";
     let mut current: Option<Module> = None;
     let mut parsed: Vec<Module> = Vec::new();
@@ -1490,8 +1721,50 @@ fn apply_toml(cfg: &mut Config, content: &str) {
                     let secs = val.parse::<f64>().unwrap_or(1.0);
                     cfg.command_timeout_ms = (secs * 1000.0).clamp(100.0, 10_000.0) as u64;
                 }
+                "color_source" | "palette_source" => {
+                    cfg.palette.source = unquote(val).to_ascii_lowercase();
+                }
+                "palette_files" => {
+                    if let Some(items) = toml_array(val) {
+                        cfg.palette.files = items;
+                    } else {
+                        eprintln!("arcfetch: warning: palette_files must be an array of paths");
+                    }
+                }
+                "palette_accent" => cfg.palette.accent = unquote(val).to_string(),
+                "palette_value" => cfg.palette.value = unquote(val).to_string(),
+                "palette_gradient" => {
+                    if let Some(items) = toml_array(val) {
+                        cfg.palette.gradient = items;
+                    } else {
+                        eprintln!("arcfetch: warning: palette_gradient must be an array of names");
+                    }
+                }
+                "gap" => cfg.layout.gap = val.parse::<usize>().unwrap_or(2).min(32),
                 // handled before this pass
                 "info_style" => {}
+                _ => {}
+            },
+            "palette" => match key {
+                "source" | "color_source" => {
+                    cfg.palette.source = unquote(val).to_ascii_lowercase();
+                }
+                "files" | "palette_files" => {
+                    if let Some(items) = toml_array(val) {
+                        cfg.palette.files = items;
+                    } else {
+                        eprintln!("arcfetch: warning: palette.files must be an array of paths");
+                    }
+                }
+                "accent" => cfg.palette.accent = unquote(val).to_string(),
+                "value" => cfg.palette.value = unquote(val).to_string(),
+                "gradient" => {
+                    if let Some(items) = toml_array(val) {
+                        cfg.palette.gradient = items;
+                    } else {
+                        eprintln!("arcfetch: warning: palette.gradient must be an array of names");
+                    }
+                }
                 _ => {}
             },
             "display" => match key {
@@ -1509,6 +1782,21 @@ fn apply_toml(cfg: &mut Config, content: &str) {
             "colors" => {
                 let ansi = resolve(val);
                 match key {
+                    "source" | "palette_source" | "color_source" => {
+                        cfg.palette.source = unquote(val).to_ascii_lowercase();
+                    }
+                    "palette_files" => {
+                        if let Some(items) = toml_array(val) {
+                            cfg.palette.files = items;
+                        }
+                    }
+                    "palette_accent" => cfg.palette.accent = unquote(val).to_string(),
+                    "palette_value" => cfg.palette.value = unquote(val).to_string(),
+                    "palette_gradient" => {
+                        if let Some(items) = toml_array(val) {
+                            cfg.palette.gradient = items;
+                        }
+                    }
                     "scheme" => match scheme(val) {
                         Some(c) => cfg.colors = c,
                         None => eprintln!(
@@ -1562,6 +1850,8 @@ fn apply_toml(cfg: &mut Config, content: &str) {
                     "accent" | "default" | "auto" | "none" => None,
                     _ => Some(resolve(val)),
                 },
+                "width" => cfg.logo.width = val.parse().ok(),
+                "height" => cfg.logo.height = val.parse().ok(),
                 _ => {}
             },
             "layout" => cfg.layout.set(key, val),
@@ -1571,13 +1861,24 @@ fn apply_toml(cfg: &mut Config, content: &str) {
                     "enabled" => cfg.animation.enabled = on,
                     "effect" => cfg.animation.effect = val.to_string(),
                     "intro_ms" => cfg.animation.intro_ms = val.parse().unwrap_or(700),
-                    "wave" => cfg.animation.wave = on,
+                    "play_seconds" => {
+                        cfg.animation.play_seconds =
+                            val.parse::<f32>().unwrap_or(3.0).clamp(0.5, 600.0)
+                    }
                     "gradient" => {
                         if let Some(g) = parse_gradient(val) {
                             cfg.animation.gradient = g.ansi(32);
                         }
                     }
                     "gradient_scroll" => cfg.animation.gradient_scroll = on,
+                    "gradient_speed" => {
+                        cfg.animation.gradient_speed =
+                            val.parse::<f32>().unwrap_or(0.0).clamp(0.0, 10.0)
+                    }
+                    "fps" => {
+                        cfg.animation.fps =
+                            val.parse::<f32>().unwrap_or(30.0).clamp(1.0, 120.0)
+                    }
                     "art_color" => cfg.animation.art_color = !art_color_is_theme(val),
                     _ => {}
                 }
@@ -1611,6 +1912,12 @@ fn apply_toml(cfg: &mut Config, content: &str) {
 fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
     let root = jsonc::parse(text)?;
 
+    // Fastfetch configs are a different schema. Hand them to the adapter
+    // before any arcfetch-specific key is interpreted.
+    if crate::fastfetch::is_fastfetch(&root) {
+        return crate::fastfetch::apply(cfg, &root);
+    }
+
     if let Some(style) = root.get("info_style").and_then(jsonc::Value::as_str) {
         apply_style(cfg, style);
     }
@@ -1625,6 +1932,10 @@ fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
                         "small" => cfg.logo.name = Some("mini".into()),
                         "data" | "data-raw" | "raw" => cfg.logo.name = None,
                         "file" => cfg.logo.file = logo.get("source").and_then(jsonc::Value::as_str).map(String::from),
+                        // image protocols render from `source`; keep the distro logo as a fallback
+                        "kitty-icat" | "kitty" | "iterm" | "iterm2" | "sixel" | "chafa" | "builtin" => {
+                            cfg.logo.name = Some("auto".into())
+                        }
                         other => cfg.logo.name = Some(other.to_string()),
                     }
                 }
@@ -1649,6 +1960,8 @@ fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
                     cfg.logo.padding_top = pad.get("top").and_then(jsonc::Value::as_usize).unwrap_or(0);
                     cfg.logo.padding_right = pad.get("right").and_then(jsonc::Value::as_usize).unwrap_or(2);
                 }
+                cfg.logo.width = logo.get("width").and_then(jsonc::Value::as_usize);
+                cfg.logo.height = logo.get("height").and_then(jsonc::Value::as_usize);
             }
             _ => {}
         }
@@ -1695,7 +2008,7 @@ fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
                     let Some(kind) = item.get("type").and_then(jsonc::Value::as_str) else { continue };
                     m.kind = kind.trim().to_ascii_lowercase();
                     m.key = item.get("key").and_then(jsonc::Value::as_str).map(String::from);
-                    m.format = item.get("format").and_then(jsonc::Value::as_str).map(String::from);
+                    m.format = item.get("format").or_else(|| item.get("string")).and_then(jsonc::Value::as_str).map(String::from);
                     m.key_color = item.get("keyColor").and_then(jsonc::Value::as_str).map(resolve_config_color);
                     m.output_color = item.get("outputColor").and_then(jsonc::Value::as_str).map(resolve_config_color);
                     m.key_icon = item.get("keyIcon").and_then(jsonc::Value::as_str).map(String::from);
@@ -1705,6 +2018,10 @@ fn apply_jsonc(cfg: &mut Config, text: &str) -> Result<(), String> {
                     m.symbol = item.get("symbol").and_then(jsonc::Value::as_str).map(String::from);
                     m.value = item.get("value").and_then(jsonc::Value::as_str).map(String::from);
                     m.command = item.get("command").and_then(jsonc::Value::as_str).map(String::from);
+                    m.combined = item.get("combined").and_then(jsonc::Value::as_bool).unwrap_or(false);
+                    if let Some(arr) = item.get("disabled").and_then(jsonc::Value::as_array) {
+                        m.disabled = arr.iter().filter_map(jsonc::Value::as_str).map(String::from).collect();
+                    }
                 }
                 _ => continue,
             }
@@ -1779,6 +2096,17 @@ label = "Distro"
         assert!(!cfg.display.labels);
         assert!(cfg.modules.as_ref().is_some_and(|m| !m.is_empty()));
     }
+
+    #[test]
+    fn custom_label_and_value_parse() {
+        let mut m = Module::default();
+        module_field(&mut m, "label", "Owner");
+        module_field(&mut m, "value", "POKKITA");
+        module_field(&mut m, "icon", "*");
+        assert_eq!(m.key.as_deref(), Some("Owner"));
+        assert_eq!(m.value.as_deref(), Some("POKKITA"));
+        assert_eq!(m.key_icon.as_deref(), Some("*"));
+    }
 }
 
     #[test]
@@ -1842,6 +2170,31 @@ label = "Distro"
     }
 
     #[test]
+    fn animation_rate_and_gradient_speed_are_clamped() {
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, "[animation]\nfps = 12.5\ngradient_speed = 2.5\n");
+        assert_eq!(cfg.animation.frame_ms(), 80);
+        assert_eq!(cfg.animation.gradient_speed, 2.5);
+
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, "[animation]\nfps = 0\ngradient_speed = 99\n");
+        assert_eq!(cfg.animation.frame_ms(), 1000);
+        assert_eq!(cfg.animation.gradient_speed, 10.0);
+    }
+
+    #[test]
+    fn play_seconds_and_legacy_keys_still_parse() {
+        let mut cfg = Config::default();
+        apply_toml(
+            &mut cfg,
+            "[animation]\nplay_seconds = 5.5\nenabled = false\ngradient_scroll = false\n",
+        );
+        assert_eq!(cfg.animation.play_seconds, 5.5);
+        assert!(!cfg.animation.enabled);
+        assert!(!cfg.animation.gradient_scroll);
+    }
+
+    #[test]
     fn art_color_theme_accepts_quotes() {
         assert!(art_color_is_theme("\"theme\""));
         assert!(!art_color_is_theme("\"own\""));
@@ -1851,4 +2204,90 @@ label = "Distro"
     fn unquoted_hex_survives_comment_stripping() {
         assert_eq!(strip_comment("accent = #89b4fa # blue"), "accent = #89b4fa ");
         assert_eq!(strip_comment("# whole-line comment"), "");
+    }
+
+    #[test]
+    fn multiline_arrays_fold_and_parse() {
+        let src = "palette_files = [\n  \"~/.a\",  # first\n  \"~/.b\",\n]\n";
+        let folded = fold_multiline_arrays(src);
+        let val = folded.split_once('=').unwrap().1.trim();
+        assert_eq!(toml_array(val).unwrap(), ["~/.a", "~/.b"]);
+
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, "color_source = \"palette\"\npalette_files = [\n \"~/.a\",\n \"~/.b\",\n]\npalette_accent = \"color4\"\npalette_gradient = [\n \"color4\",\n \"color5\",\n]\n");
+        assert_eq!(cfg.palette.source, "palette");
+        assert_eq!(cfg.palette.files, ["~/.a", "~/.b"]);
+        assert_eq!(cfg.palette.accent, "color4");
+        assert_eq!(cfg.palette.gradient, ["color4", "color5"]);
+
+        let mut cfg = Config::default();
+        apply_toml(&mut cfg, "[palette]\nsource = \"palette\"\nfiles = [\"~/.a\"]\naccent = \"color4\"\nvalue = \"color7\"\ngradient = [\"color4\"]\n");
+        assert_eq!(cfg.palette.source, "palette");
+        assert_eq!(cfg.palette.files, ["~/.a"]);
+        assert_eq!(cfg.palette.accent, "color4");
+        assert_eq!(cfg.palette.value, "color7");
+        assert_eq!(cfg.palette.gradient, ["color4"]);
+    }
+
+    #[test]
+    fn palette_names_read_matugen_pywal_and_dotted_keys() {
+        let pywal = jsonc::parse(r##"{
+            "special": {"background": "#abcdef"},
+            "colors": {"color4": "#778786", "color5": "#7dbbc6"}
+        }"##).unwrap();
+        assert_eq!(palette_color(&pywal, "color4").as_deref(), Some("#778786"));
+        assert_eq!(palette_color(&pywal, "special.background").as_deref(), Some("#abcdef"));
+
+        let matugen = jsonc::parse(r##"{
+            "primary": {"color": "#112233"},
+            "on_surface": "#445566"
+        }"##).unwrap();
+        assert_eq!(palette_color(&matugen, "primary").as_deref(), Some("#112233"));
+        assert_eq!(palette_color(&matugen, "on_surface").as_deref(), Some("#445566"));
+        assert!(palette_color(&matugen, "tertiary").is_none());
+    }
+
+    #[test]
+    fn palette_uses_first_existing_file_and_keeps_missing_names() {
+        let dir = env::temp_dir().join(format!("arcfetch-palette-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("colors.json");
+        fs::write(&file, r##"{
+            "colors": {"color4": "#112233", "color5": "#445566", "color6": "#778899", "color7": "#c2c5c6"},
+            "special": {"background": "#abcdef", "foreground": "#c2c5c6"}
+        }"##).unwrap();
+        let empty = dir.join("empty.json");
+        fs::write(&empty, "").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.palette.source = "palette".into();
+        cfg.palette.files = vec![
+            dir.join("missing.json").to_string_lossy().into_owned(),
+            empty.to_string_lossy().into_owned(),
+            file.to_string_lossy().into_owned(),
+        ];
+        cfg.palette.accent = "color4".into();
+        cfg.palette.value = "special.background".into();
+        cfg.palette.gradient = vec!["color4".into(), "color5".into(), "color6".into()];
+        apply_palette(&mut cfg);
+
+        assert!(cfg.colors.accent.contains("38;2;17;34;51"));
+        assert!(cfg.colors.hostname.contains("38;2;17;34;51"));
+        assert!(cfg.colors.bar.contains("38;2;17;34;51"));
+        assert!(cfg.colors.values.contains("38;2;171;205;239"));
+        assert_eq!(cfg.animation.gradient.len(), 32);
+        assert!(cfg.colors.logo[0].contains("38;2;17;34;51"));
+
+        // With Material You defaults, a pywal/wallust file still themes via
+        // color4/color7 and the color4..6 gradient fallback.
+        cfg.colors = Colors::default();
+        cfg.palette.accent = "primary".into();
+        cfg.palette.value = "on_surface".into();
+        cfg.palette.gradient = vec!["primary".into(), "secondary".into(), "tertiary".into()];
+        apply_palette(&mut cfg);
+        assert!(cfg.colors.accent.contains("38;2;17;34;51"));
+        assert!(cfg.colors.values.contains("38;2;194;197;198"));
+        assert_eq!(cfg.animation.gradient.len(), 32);
+
+        let _ = fs::remove_dir_all(&dir);
     }

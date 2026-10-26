@@ -1,5 +1,5 @@
 {
-  description = "arcfetch — blazing-fast Arch Linux sysinfo";
+  description = "arcfetch — blazing-fast Unix sysinfo";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -27,12 +27,21 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
+          # .cargo/config.toml asks for a static-pie Linux build, which nixpkgs'
+          # dynamic glibc cannot link. NixOS always has glibc, so build dynamic.
+          RUSTFLAGS = "-C target-feature=-crt-static";
+
+          postInstall = ''
+            mkdir -p $out/share/arcfetch
+            cp -R presets $out/share/arcfetch/
+          '';
+
           meta = {
             description = manifest.package.description;
             homepage = "https://github.com/tonycth7/arcfetch";
             license = pkgs.lib.licenses.mit;
             mainProgram = "arcfetch";
-            platforms = pkgs.lib.platforms.linux;
+            platforms = pkgs.lib.platforms.unix;
           };
         };
 

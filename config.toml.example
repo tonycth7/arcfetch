@@ -1,0 +1,288 @@
+# arcfetch config — ~/.config/arcfetch/config.toml
+# all values are optional — delete lines to use defaults
+
+# ── rows ─────────────────────────────────────────────────
+# Start from a built-in layout. Every row can still be overridden below.
+# classic | minimal | boxed | sections | tree | iconic | card | chips
+# card and chips currently use the boxed layout.
+# info_style = "classic"
+
+# Rows in order. Leave this out to use the style's defaults.
+# modules = ["os", "host", "kernel", "uptime", "packages", "shell", "de", "term", "cpu", "gpu", "memory", "disk", "colors"]
+
+# One table per row; the same keys JSONC presets use.
+# [[modules]]
+# type = "os"
+# key = "distro"
+# keyIcon = ""
+# format = "{key} {value}"
+# keyColor = "blue"
+# outputColor = "text"
+
+# Package rows: hide managers you do not want, and compact the rest.
+# [[modules]]
+# type = "packages"
+# disabled = ["appimage", "nix"]
+# combined = true
+
+# A line of your own:
+# [[custom]]
+# format = "{#accent}── {user-name} ──{#}"
+
+# Or a labelled row:
+# [[custom]]
+# label = "Owner"
+# value = "POKKITA"
+
+# A command row (for example a public IP):
+# [[modules]]
+# type = "command"
+# key = "Public IP"
+# text = "curl -s --max-time 1 ifconfig.me"
+
+# Change a built-in row. value and command are alternatives.
+# [overrides.os]
+# label = "Distro"
+# [overrides.uptime]
+# command = "uptime -p"
+# [overrides.kernel]
+# value = "my-kernel 1.0"
+
+# seconds a command row may take (0.1-10)
+# command_timeout = 1.0
+
+# ── palette ──────────────────────────────────────────────
+# Follow the colours of your wallpaper/desktop theme. With
+# color_source = "palette", the first usable file is read and its
+# accent/value/gradient names replace the matching colours below. Anything it
+# does not define keeps its value, so this can only add colour.
+#
+# The tool only reads the file; it does not generate a palette. Matugen,
+# pywal and wallust all write one of these JSON files.
+#
+# color_source = "palette"
+# palette_files = [
+#   "~/.local/state/quickshell/user/generated/colors.json",  # matugen
+#   "~/.cache/wal/colors.json",                              # pywal
+#   "~/.cache/wallust/colors.json",                          # wallust
+# ]
+#
+# Names are looked up at the top level and inside nested objects, so all of
+# these work:
+#   matugen:  {"primary": {"color": "#..."}}
+#   pywal:    {"colors": {"color4": "#..."}}
+#   dotted:   "special.background"
+#
+# Defaults are Material You role names (matugen). If a name is missing, the
+# pywal/wallust equivalent is tried automatically (color4, color7, and the
+# color4..color6 gradient), so those files work without changing these names.
+# You can still set them explicitly:
+#   palette_accent   = "color4"
+#   palette_value    = "color7"
+#   palette_gradient = ["color4", "color5", "color6"]
+#
+# palette_accent   = "primary"       # hostname, rule, logo and bar
+# palette_value    = "on_surface"    # values
+# palette_gradient = ["primary", "secondary", "tertiary"]  # logo + animated art
+#
+# The same keys also work under [palette] (files/accent/value/gradient) and
+# [colors] (source/palette_files/...). Palette colours are applied after the
+# [colors] block, so they win there; --scheme, --accent and --color still win.
+# Try it for one run without editing this file: arcfetch --palette
+
+# Blank columns between the logo and the info (same as [layout] gap).
+# gap = 2
+
+[colors]
+# keys apply in file order — keep scheme first if you use it
+# palette preset (mocha is the default; uncomment to switch):
+#   auto | mocha | latte | frappe | macchiato | nord | dracula | gruvbox |
+#   tokyo-night | solarized-dark | rose-pine | onedark | kanagawa |
+#   everforest | ayu   (auto = light/dark from the terminal)
+# scheme = auto
+
+# every colour accepts: catppuccin names, black/white/gray/orange/purple/cyan,
+# ansi_red / ansi_bright_blue / …, #RGB, #RRGGBB, rgb(r,g,b), color0..color255
+accent   = blue
+username = mauve
+hostname = blue
+c1 = blue
+c2 = sapphire
+c3 = sky
+c4 = teal
+c5 = green
+c6 = yellow
+c7 = peach
+values = subtext1
+sep    = overlay0
+bar    = blue
+
+# logo inline colors for custom logo files ($1..$9)
+# defaults: c1..c7 + blue + text
+logo1 = blue
+logo2 = sapphire
+logo3 = sky
+logo4 = teal
+logo5 = green
+logo6 = yellow
+logo7 = peach
+logo8 = blue
+logo9 = text
+
+[show]
+# header: both | user/username | host/hostname | none/false
+header      = both
+
+os          = true
+kernel      = true
+uptime      = true
+uptime_long = false   # true = "1 day, 2 hours, 30 mins"
+res         = false
+pkgs        = true
+shell       = true
+de_wm       = true
+term        = true
+cpu         = true
+gpu         = true
+gpu_temp    = false   # GPU temperature — reads /sys/class/drm hwmon
+battery     = false   # battery % + status — N/A on desktop
+memory      = true
+disk        = false
+load        = false
+locale      = false
+
+# hacker fields (hidden by default)
+ip          = false
+ssh         = false
+ports       = false
+
+swatches    = false   # color palette swatches row
+color_bar   = false   # neofetch-style 8-color bar (■■■■■■■■)
+
+# system fields (hidden by default)
+init        = false   # PID 1 init name (systemd/OpenRC/runit/s6/…)
+cpu_temp    = false   # CPU package temperature (hwmon or ACPI)
+processes   = false   # process count from /proc
+container   = false   # Docker / Podman / Kubernetes / LXC / none
+session     = false   # XDG session type (x11/wayland/tty)
+
+# fastfetch-inspired fields (all hidden by default)
+swap        = false   # swap usage
+sound       = false   # audio server (PipeWire/PulseAudio/ALSA)
+gpu_driver  = false   # GPU driver name + version
+bios        = false   # BIOS version + date
+board       = false   # motherboard vendor + model
+disk_type   = false   # SSD / NVMe / HDD
+pkg_updates = false   # pacman sync repos found (not a full update count)
+theme       = false   # GTK theme name
+icons       = false   # icon theme name
+term_font   = false   # terminal font name
+de_wm_ver   = false   # desktop environment version
+init_ver    = false   # init version (systemd uses distro VERSION_ID)
+local_ip    = false   # interface + local IP
+
+# opt-in modules (all off by default; or just pass --all)
+datetime      = false  # local date + time
+editor        = false  # $VISUAL / $EDITOR
+dns           = false  # nameservers from /etc/resolv.conf
+host          = false  # DMI system vendor + product
+chassis       = false  # DMI chassis type (Laptop/Desktop/…)
+bootmgr       = false  # UEFI or BIOS
+cpu_cache     = false  # L1/L2/L3 cache sizes
+login_manager = false  # display-manager.service
+brightness    = false  # backlight %
+cpu_usage     = false  # /proc/stat sample (at least 60 ms)
+diskio        = false  # /proc/diskstats totals
+netio         = false  # /proc/net/dev totals
+physmem       = false  # DIMM info (needs root for DMI)
+gpu_mem       = false  # VRAM used / total
+btrfs         = false  # btrfs volumes
+wifi          = false  # wireless iface + signal + SSID
+users         = false  # logged-in users
+wallpaper     = false  # current wallpaper (hyprland/sway/gnome)
+media         = false  # now playing (playerctl)
+public_ip     = false  # public IP (network)
+weather       = false  # weather (network, wttr.in)
+opengl        = false  # OpenGL renderer
+vulkan        = false  # Vulkan drivers
+cursor        = false  # cursor theme + size
+term_size     = false  # terminal columns x rows
+term_theme    = false  # terminal FG/BG ($COLORFGBG)
+codec         = false  # VA-API encoders / decoders (vainfo)
+bluetooth     = false  # Bluetooth radio + HCI version
+camera        = false  # connected cameras
+mouse         = false  # pointing devices
+keyboard      = false  # keyboards
+tpm           = false  # TPM version
+physical_disk = false  # disks: model, size, type, temp
+top_processes = false  # top 5 processes by CPU
+monitor       = false  # EDID: name, resolution, Hz, size, PPI
+
+[display]
+# space between a row's key and its value
+# separator = " "
+# set false to print values only (used by minimal/iconic)
+# labels = true
+# key column width; 0 removes the gap
+# key_width = 9
+# key_padding_left = 0
+# bar_width = 14
+
+[layout]
+# box around the normal one-shot output:
+#   none | round | square | double | heavy | dashed | ascii
+box       = none
+# border colour (any colour spec above); none = uncoloured; default = accent
+box_color = accent
+# left margin in columns
+indent    = 2
+# spaces between the logo and the info column
+gap       = 2
+
+[logo]
+# any built-in name from `arcfetch --list-logos`
+# logo name: arch (default) | mini | ascii | tux | nix | gentoo | auto |
+#   atom | dna | arcreactor | aurora | ubuntu | debian | fedora | opensuse | manjaro |
+#   endeavouros | cachyos | kali | alpine | void | pop | linuxmint | garuda |
+#   artix | rocky | almalinux | centos | steamos | raspbian | wsl | neon |
+#   deepin | mx | blackarch | redhat | zorin | elementary | nobara | bazzite |
+#   bedrock | guix | macos | windows | freebsd | bsd | android | termux | rust
+# append _small for compact variants where available
+# name = arch
+
+# custom ASCII file path (overrides name if set)
+# file = ~/.config/arcfetch/logo.txt
+
+# image logos: left/right put the info beside the image, top puts it below
+# position = left
+# image cell size; leave height unset to keep the image aspect (2:1 cells)
+# width = 31
+# height = 19
+
+# uniform logo colour; omit to keep each logo's built-in colours
+# color = blue
+
+[animation]
+# glyph effect: none | shimmer | scanline | boot
+# aliases: off/frames/keyframes/wave/rainbow = none, scan/crt = scanline,
+#          bootreveal/reveal = boot, else shimmer
+effect   = none
+# normal-mode intro length in milliseconds (0 disables; capped at 24 frames)
+intro_ms = 700
+# how long --animate / --blackhole play before the shell comes back (seconds)
+play_seconds = 3
+# animation frame rate (1-120; default 30)
+fps      = 30
+
+# vertical gradient for plain art; authored ANSI keeps its own colours.
+# any #RGB/#RRGGBB; [] falls back to the scheme's logo palette wave.
+gradient = ["#f5c95c", "#f17f5b", "#f45c82", "#b07cf4", "#74a4ff"]
+# gradient rows per frame; 0 keeps the ramp still
+gradient_speed = 0.0
+# "own" keeps a frame's ANSI colours; "theme" forces the gradient on it
+art_color = "own"
+
+# bundled frame animations: arcfetch --list-animations
+# play one: arcfetch --animation saturn
+# pin one:  arcfetch --pin --animation saturn
+# custom frames: ~/.config/arcfetch/animations/<name>/01.txt, 02.txt, …

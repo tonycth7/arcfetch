@@ -1,5 +1,187 @@
 use std::{collections::HashMap, fs, path::Path, process::Command};
 
+/// Fastfetch-style aggregate: every detected manager, not just the first one.
+/// Mirrors `packages_linux.c` closely enough that the common counts match.
+pub fn count_all() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut parts = Vec::new();
+
+    let appimage = appimage_count(Path::new(&home));
+    if appimage > 0 { parts.push(format!("{appimage} (appimage)")); }
+
+    let flatpak_system = flatpak_count(Path::new("/var/lib"));
+    if flatpak_system > 0 { parts.push(format!("{flatpak_system} (flatpak-system)")); }
+
+    let flatpak_user = flatpak_count(Path::new(&format!("{home}/.local/share")));
+    if flatpak_user > 0 { parts.push(format!("{flatpak_user} (flatpak-user)")); }
+
+    let nix_default = nix_count(Path::new("/nix/var/nix/profiles/default"));
+    if nix_default > 0 { parts.push(format!("{nix_default} (nix-default)")); }
+
+    let nix_system = nix_count(Path::new("/run/current-system"));
+    if nix_system > 0 { parts.push(format!("{nix_system} (nix-system)")); }
+
+    let state = std::env::var("XDG_STATE_HOME")
+        .unwrap_or_else(|_| format!("{home}/.local/state"));
+    let user = std::env::var("USER").unwrap_or_default();
+    let nix_user = nix_count(Path::new(&format!("{home}/.nix-profile")))
+        + nix_count(Path::new(&format!("{state}/nix/profile")))
+        + nix_count(Path::new(&format!("/etc/profiles/per-user/{user}")));
+    if nix_user > 0 { parts.push(format!("{nix_user} (nix-user)")); }
+
+    let pacman = pacman_count();
+    if pacman > 0 { parts.push(format!("{pacman} (pacman)")); }
+
+    if let Ok(c) = fs::read_to_string("/var/lib/dpkg/status") {
+        let n = dpkg_installed(&c);
+        if n > 0 { parts.push(format!("{n} (dpkg)")); }
+    }
+    if Path::new("/var/lib/rpm/rpmdb.sqlite").exists() {
+        let n = count_sqlite("/var/lib/rpm/rpmdb.sqlite", "Sigmd5")
+            .or_else(|| count_sqlite("/var/lib/rpm/rpmdb.sqlite", "Packages"));
+        if let Some(n) = n.filter(|n| *n > 0) { parts.push(format!("{n} (rpm)")); }
+    }
+    if let Ok(c) = fs::read_to_string("/lib/apk/db/installed") {
+        let n = c.lines().filter(|l| l.starts_with("P:")).count();
+        if n > 0 { parts.push(format!("{n} (apk)")); }
+    }
+    if let Some(n) = count_gentoo() { parts.push(format!("{n} (portage)")); }
+    if let Some(n) = count_xbps() { parts.push(format!("{n} (xbps)")); }
+    if let Some(n) = count_bedrock() { parts.push(format!("{n} (bedrock)")); }
+    if let Some((n, manager)) = platform_count() { parts.push(format!("{n} ({manager})")); }
+
+    if parts.is_empty() { "unknown".into() } else { parts.join(", ") }
+}
+
+/// Package count from the native manager on macOS/BSD/Android.
+#[cfg(not(target_os = "linux"))]
+fn platform_count() -> Option<(usize, &'static str)> {
+    #[allow(unused_variables)]
+    let dirs = |base: &str, label: &'static str| -> Option<(usize, &'static str)> {
+        let rd = fs::read_dir(base).ok()?;
+        let n = rd.flatten().filter(|e| e.path().is_dir()).count();
+        (n > 0).then_some((n, label))
+    };
+
+    #[cfg(target_os = "macos")]
+    for (base, label) in [
+        ("/opt/homebrew/Cellar", "brew"),
+        ("/usr/local/Cellar", "brew"),
+        ("/opt/local/var/macports/software", "macports"),
+    ] {
+        if let Some(found) = dirs(base, label) { return Some(found); }
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "openbsd",
+              target_os = "netbsd", target_os = "dragonfly"))]
+    if let Some(found) = dirs("/var/db/pkg", "pkg") { return Some(found); }
+
+    let count = |program: &str, args: &[&str], label: &'static str,
+                 keep: fn(&str) -> bool| -> Option<(usize, &'static str)> {
+        let out = Command::new(program).args(args).output().ok()?;
+        if !out.status.success() { return None; }
+        let n = String::from_utf8_lossy(&out.stdout).lines().filter(|l| keep(l)).count();
+        (n > 0).then_some((n, label))
+    };
+    count("brew", &["list", "--formula"], "brew", |l| !l.trim().is_empty())
+        .or_else(|| count("pkg", &["info"], "pkg", |l| !l.trim().is_empty()))
+        .or_else(|| count("pkg_info", &[], "pkg_info", |l| !l.trim().is_empty()))
+        .or_else(|| count("pm", &["list", "packages"], "pm", |l| l.starts_with("package:")))
+        .or_else(|| count("/system/bin/pm", &["list", "packages"], "pm", |l| l.starts_with("package:")))
+        .or_else(|| count("port", &["installed"], "macports", |l| l.contains('@')))
+}
+
+/// Linux keeps its existing count paths; no extra manager probes.
+#[cfg(target_os = "linux")]
+fn platform_count() -> Option<(usize, &'static str)> { None }
+
+fn appimage_count(home: &Path) -> usize {
+    let mut n = 0;
+    for dir in ["AppImages", "Applications"] {
+        if let Ok(rd) = fs::read_dir(home.join(dir)) {
+            n += rd.flatten().filter(|e| {
+                let name = e.file_name().to_string_lossy().to_ascii_lowercase();
+                !name.starts_with('.') && name.ends_with(".appimage")
+            }).count();
+        }
+    }
+    n
+}
+
+fn flatpak_count(base: &Path) -> usize {
+    let root = base.join("flatpak");
+    let mut n = 0;
+
+    if let Ok(rd) = fs::read_dir(root.join("app")) {
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with('.') { continue; }
+            if e.path().join("current").exists() { n += 1; }
+        }
+    }
+
+    if let Ok(rd) = fs::read_dir(root.join("runtime")) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') { continue; }
+            let Some(dot) = name.rfind('.') else { continue; };
+            let kind = &name[dot + 1..];
+            if kind == "Locale" || kind == "Debug" { continue; }
+            let Ok(archs) = fs::read_dir(e.path()) else { continue };
+            for arch in archs.flatten() {
+                if !arch.path().is_dir() || arch.file_name().to_string_lossy().starts_with('.') { continue; }
+                if let Ok(entries) = fs::read_dir(arch.path()) {
+                    n += entries.flatten().filter(|x| {
+                        x.path().is_dir() && !x.file_name().to_string_lossy().starts_with('.')
+                    }).count();
+                }
+            }
+        }
+    }
+    n
+}
+
+fn nix_count(path: &Path) -> usize {
+    if !path.is_dir() { return 0; }
+    let Ok(out) = Command::new("nix-store")
+        .args(["--query", "--requisites"])
+        .arg(path)
+        .output() else { return 0 };
+    if !out.status.success() { return 0; }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| is_valid_nix_pkg(line))
+        .count()
+}
+
+fn is_valid_nix_pkg(path: &str) -> bool {
+    let p = Path::new(path);
+    if !p.is_dir() { return false; }
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else { return false; };
+    if name.starts_with("nixos-system-nixos-")
+        || ["-doc", "-man", "-info", "-dev", "-bin"].iter().any(|s| name.ends_with(s))
+    {
+        return false;
+    }
+    // Version marker: a digit run followed by a dot and another digit.
+    let b = name.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() { j += 1; }
+            if j + 1 < b.len() && b[j] == b'.' && b[j + 1].is_ascii_digit() { return true; }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn pacman_count() -> usize {
+    fs::read_dir("/var/lib/pacman/local")
+        .map(|d| d.flatten().filter(|e| e.path().is_dir()).count())
+        .unwrap_or(0)
+}
+
 pub fn count() -> String {
     // 1. Arch — first, fastest, always prioritized
     if let Ok(d) = fs::read_dir("/var/lib/pacman/local") {
@@ -50,6 +232,11 @@ pub fn count() -> String {
         if let Some(n) = count_bedrock() {
             if n > 0 { return format!("{n} (bedrock)"); }
         }
+    }
+
+    // 9. macOS / BSD / Android
+    if let Some((n, manager)) = platform_count() {
+        return format!("{n} ({manager})");
     }
 
     "unknown".into()
@@ -325,6 +512,7 @@ fn dpkg_installed(status: &str) -> usize {
     }).count()
 }
 
+#[cfg(target_os = "linux")]
 fn count_gentoo() -> Option<usize> {
     let mut total = 0usize;
     if let Ok(cats) = fs::read_dir("/var/db/pkg") {
@@ -338,6 +526,10 @@ fn count_gentoo() -> Option<usize> {
     }
     if total > 0 { Some(total) } else { None }
 }
+
+/// `/var/db/pkg` is the BSD package database, not Gentoo's category tree.
+#[cfg(not(target_os = "linux"))]
+fn count_gentoo() -> Option<usize> { None }
 
 fn count_xbps() -> Option<usize> {
     let out = Command::new("xbps-query").args(["-l"]).output().ok()?;
@@ -380,4 +572,76 @@ fn count_bedrock() -> Option<usize> {
         }
     }
     if total > 0 { Some(total) } else { None }
+}
+
+/// Keep only managers not listed in fastfetch's `packages.disabled`.
+/// A plain family name (`flatpak`, `nix`) also drops its sub-managers.
+pub fn filter(list: &str, disabled: &[String]) -> String {
+    if disabled.is_empty() { return list.to_string(); }
+    let keep = |mgr: &str| {
+        let mgr = mgr.replace('_', "-");
+        !disabled.iter().any(|d| {
+            let d = d.trim().to_ascii_lowercase().replace('_', "-");
+            // fastfetch names the portage counter `emerge`
+            let d = if d == "emerge" { "portage".to_string() } else { d };
+            mgr == d || mgr.starts_with(&format!("{d}-"))
+        })
+    };
+    let out: Vec<&str> = list.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            let open = part.find('(')?;
+            let mgr = part[open + 1..].trim_end_matches(')').trim();
+            keep(mgr).then_some(part)
+        })
+        .collect();
+    out.join(", ")
+}
+
+/// Merge package-manager families for fastfetch's `packages.combined`:
+/// `flatpak-system`/`flatpak-user` → `flatpak`, `nix-*` → `nix`.
+pub fn combine(list: &str) -> String {
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for part in list.split(',') {
+        let Some(open) = part.find('(') else { continue };
+        let Some(count) = part[..open].trim().parse::<u64>().ok() else { continue };
+        let mgr = part[open + 1..].trim_end_matches(')').trim();
+        let family = if mgr.starts_with("flatpak") {
+            "flatpak"
+        } else if mgr.starts_with("nix") {
+            "nix"
+        } else {
+            mgr
+        };
+        match out.iter_mut().find(|(n, _)| n == family) {
+            Some((_, c)) => *c += count,
+            None => out.push((family.to_string(), count)),
+        }
+    }
+    out.iter().map(|(n, c)| format!("{c} ({n})")).collect::<Vec<_>>().join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::combine;
+
+    #[test]
+    fn combine_merges_flatpak_and_nix_families() {
+        assert_eq!(
+            combine("6 (appimage), 12 (flatpak-system), 19 (flatpak-user), 61 (nix-default), 2309 (pacman)"),
+            "6 (appimage), 31 (flatpak), 61 (nix), 2309 (pacman)"
+        );
+    }
+
+    #[test]
+    fn disabled_hides_managers_and_families() {
+        use super::filter;
+        let all = "6 (appimage), 12 (flatpak-system), 19 (flatpak-user), 61 (nix-default), 2 (portage), 2309 (pacman)";
+        assert_eq!(filter(all, &["appimage".into(), "nix".into()]),
+                   "12 (flatpak-system), 19 (flatpak-user), 2 (portage), 2309 (pacman)");
+        assert_eq!(filter(all, &["flatpak".into(), "emerge".into()]),
+                   "6 (appimage), 61 (nix-default), 2309 (pacman)");
+        assert_eq!(filter(all, &["pacman".into()]), "6 (appimage), 12 (flatpak-system), 19 (flatpak-user), 61 (nix-default), 2 (portage)");
+        assert_eq!(filter(all, &[]), all);
+    }
 }
