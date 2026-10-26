@@ -83,4 +83,4 @@ GitHub release tarballs (binary, README, LICENSE and `presets/`):
 - FreeBSD x86_64
 - NetBSD x86_64
 
-OpenBSD is source-supported but has no prebuilt Rust target, so it is not in the release matrix.
+OpenBSD has no prebuilt Rust target here and is not covered by `scripts/build-all.sh`, so it is not in the release matrix.

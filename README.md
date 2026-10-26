@@ -9,31 +9,42 @@ arch linux sysinfo that's so fast it's almost rude — ~1.2 ms default. one `lib
 ## what it looks like
 
 ```
+                    ▄                    tony@arch
+                   ▟█▙                   ─────────
+                  ▟███▙                  os        Arch Linux
+                 ▟█████▙                 kernel    7.2.11-arch1-1
+                ▟███████▙                uptime    2h 17m
+               ▂▔▀▜██████▙               pkgs      2309 (pacman)
+              ▟██▅▂▝▜█████▙              shell     zsh
+             ▟█████████████▙             de/wm     niri
+            ▟███████████████▙            term      rio
+           ▟█████████████████▙           cpu       AMD Ryzen 5 5625U (12x) @ 2.30 GHz
+          ▟███████████████████▙          gpu       AMD Barcelo
+         ▟█████████▛▀▀▜████████▙         memory   ██████░░░░░░░░  7.0G / 15.0G
+        ▟████████▛      ▜███████▙
+       ▟█████████        ████████▙
+      ▟██████████        █████▆▅▄▃▂
+     ▟██████████▛        ▜█████████▙
+    ▟██████▀▀▀              ▀▀██████▙
+   ▟███▀▘                       ▝▀███▙
+  ▟▛▀                               ▀▜▙
+```
+
+or compact (`--logo mini`):
+
+```
         /\        tony@arch
        /  \       ─────────
       /    \      os        Arch Linux
-     /      \     uptime    1h 46m
-    /   ,,   \    pkgs      1288 (pacman)
-   /   |  |   \   shell     zsh
-  /_-''    ''-_\  term      alacritty
-                  battery   26% ↓
-                  memory   ███░░░░░░░░░░░  4.2G / 15.0G
-                  disk      112.4G / 455.9G
-```
-
-or with block arch (default):
-
-```
-         ▟████▙               tony@arch
-        ▟██████▙              ─────────
-       ▟████████▙             os        Arch Linux
-      ▟██████████▙            uptime    1h 46m
-     ▂▔▀▜██████████▙          pkgs      1288 (pacman)
-    ▟██▅▂▝▜█████████▙        shell     zsh
-   ▟█████████████████▙       term      alacritty
-  ▟███████████████████▙      battery   26% ↓
- ▟█████████▛▀▀▜██████████    memory   ███░░░░░░░░░░░  4.2G / 15.0G
-▟████████▛      ▜█████████▙  disk      112.4G / 455.9G
+     /      \     kernel    7.2.11-arch1-1
+    /   ,,   \    uptime    2h 17m
+   /   |  |   \   pkgs      2309 (pacman)
+  /_-''    ''-_\  shell     zsh
+                  de/wm     niri
+                  term      rio
+                  cpu       AMD Ryzen 5 5625U (12x) @ 2.30 GHz
+                  gpu       AMD Barcelo
+                  memory   ██████░░░░░░░░  7.0G / 15.0G
 ```
 
 ---
@@ -49,9 +60,9 @@ arcfetch --blackhole --t 0    # play until Ctrl+C
 arcfetch --blackhole --t 10   # play for 10 seconds
 ```
 
-it pulls your system info alongside the disk, so it's still functional — you get the flex *and* the data. and because it's pure rust with zero dependencies (libc doesn't count), there's no ffmpeg, no opengl, no bullet hell of missing libraries. the terminal is the gpu.
+it pulls your system info alongside the disk, so it's still functional — you get the flex *and* the data. and because it's pure rust with nothing to link beyond libc, there's no ffmpeg, no opengl, no bullet hell of missing libraries. the terminal is the gpu.
 
-the disk renders as a rotating ring of block characters (`░` `▒` `▓` `█`) around a dark center — approaching side is brighter from doppler beaming, photon ring glows blue, outer halo fades to purple. background stars twinkle, shooting stars streak. all deterministic, all zero-dependency.
+the disk renders as a rotating ring of block characters (`░` `▒` `▓` `█`) around a dark center — approaching side is brighter from doppler beaming, photon ring glows blue, outer halo fades to purple. background stars twinkle, shooting stars streak. all deterministic, all in-tree.
 
 ---
 
@@ -63,7 +74,7 @@ the disk renders as a rotating ring of block characters (`░` `▒` `▓` `█`
 | fastfetch    | ~44 ms   |
 | neofetch     | ~300 ms  |
 
-no threads, no subprocesses, no waiting. cpuid for the cpu (zero i/o). `libc::sysinfo` + `libc::uname` for uptime and kernel — one syscall each. two-tier cache (`/dev/shm` + `~/.cache`) means the second run is even faster than the first. the release build is statically linked, so the dynamic loader is out of the hot path.
+the default path starts no threads, spawns nothing and never waits. cpuid for the cpu (zero i/o). `libc::sysinfo` + `libc::uname` for uptime and kernel — one syscall each. two-tier cache (`/dev/shm` + `~/.cache`) means the second run is even faster than the first. the release build is statically linked, so the dynamic loader is out of the hot path.
 
 default fields: os, kernel, uptime, pkgs, shell, de/wm, term, cpu, gpu, memory, plus battery and disk when present. configurable via `[show]` in config or `--full` / `--preset`.
 
@@ -419,7 +430,7 @@ the parts worth knowing:
 - linux gets every collector; other platforms get the core fields (os, kernel, uptime, packages, shell, desktop/wm, terminal, cpu, gpu, memory) via `sysctl`/`sw_vers`/`pmset`/`pciconf`/`acpiconf`
 - linux-only extras (sysfs temps, `/proc` process/network counters, btrfs, monitors) degrade to `N/A`
 - cross builds: `./scripts/build-all.sh` (Linux x86_64, Android arm64/armv7/x86/x86_64, macOS both arches, FreeBSD, NetBSD; cargo + zig + Android NDK). Without an NDK, `cargo check --target ...` still works.
-- true-color terminal (anything from 2015 onwards)
+- a colour terminal (output is down-sampled to the depth it reports)
 - curiosity about what a terminal can do
 
 ---

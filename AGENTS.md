@@ -10,7 +10,7 @@ cargo run -- --logo nix      # test with specific args
 ./target/release/arcfetch     # binary
 ```
 
-No CI or linter/formatter config. `cargo test` runs the config comment/colour/layout/subprocess-timeout tests and the colour-scheme unit tests (upstream hex values, aliases, role resolution, depth fallback).
+No linter/formatter config. CI lives in `.github/workflows/release.yml` and runs on tags: tests, cross-build, tarballs, GitHub release. `cargo test` covers config parsing/colours/layout, schemes, fastfetch JSONC translation, animations, logos, packages and subprocess timeouts.
 
 `build.rs` embeds `assets/animations/<name>/*.txt` into the binary; add a directory and rebuild to add a bundled animation.
 
@@ -29,7 +29,7 @@ Cross-build all release targets with `./scripts/build-all.sh` (Cargo + Zig + And
 - `src/scheme.rs` — canonical upstream palettes for all 14 schemes, semantic role mappings, aliases and `auto` selection; single source of truth for `--scheme` and `--list-schemes`
 - `src/pkgs.rs` — pacman/dpkg/rpm/nix/apk/portage/xbps/bedrock plus brew/pkg/pkg_info/pm counts; contains hand-rolled read-only SQLite B-tree reader
 - `src/cache.rs` — two-tier: `/dev/shm/arcfetch-<uid>/` (same-boot, private) + `$XDG_CACHE_HOME/arcfetch/` or `~/.cache/arcfetch/` (persistent, TTL-gated); writes are temp+rename; a fresh persistent hit is promoted into tmpfs for the rest of the boot
-- `src/logos.rs` — 40+ distro logo constants, keyframe logos and the procedural `aurora`; `frame`, `animate_line`, `color_wave_phase`, `all_names`, `detect(id, id_like)`
+- `src/logos.rs` — 60+ logo constants, keyframe logos and the procedural `aurora`; `frame`, `animate_line`, `color_wave_phase`, `all_names`, `detect(id, id_like)`
 - `src/anim.rs` — bundled frame animations (`assets/animations/<name>/`, embedded by `build.rs`) and user frames from `~/.config/arcfetch/animations/<name>/` (sorted `*.txt`/`*.ansi`, used verbatim so animfetch `$` art survives); `fitted()` scales large art to the terminal with aspect kept
 - `src/mandelbrot.rs`, `src/cosmic.rs` — display modes
 

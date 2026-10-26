@@ -2549,7 +2549,7 @@ fn write_sample_config(cfg_path: &str) {
 # Or a labelled row:
 # [[custom]]
 # label = "Owner"
-# value = "POKKITA"
+# value = "Ada"
 
 # A command row (for example a public IP):
 # [[modules]]
@@ -2906,7 +2906,7 @@ fn print_help(cfg_path: &str) {
     println!();
     println!("  {b}{OVERLAY0}shell startup (e.g. ~/.zshrc){r}", b=b, OVERLAY0=OVERLAY0, r=r);
     println!("    arcfetch                       {s}# minimal default (fast){r}", s=s, r=r);
-    println!("    arcfetch --full               {s}# every preset field{r}", s=s, r=r);
+    println!("    arcfetch --full               {s}# every data field{r}", s=s, r=r);
     println!("    arcfetch --scheme auto         {s}# follow the terminal light/dark background{r}", s=s, r=r);
     println!("    arcfetch --mandelbrot          {s}# fractal as logo{r}", s=s, r=r);
     println!("    arcfetch --blackhole           {s}# play the M87 disk, then return to the shell{r}", s=s, r=r);
@@ -3884,7 +3884,10 @@ fn main() {
     if args.list_logos { print_logos(); return; }
     if args.list_schemes { print_schemes(args.no_color); return; }
     if args.list_presets {
-        for name in config::preset_names() { println!("{}", name); }
+        let mut names = config::preset_names();
+        // numeric names sort naturally, named ones after them
+        names.sort_by_key(|n| (n.parse::<u32>().unwrap_or(u32::MAX), n.clone()));
+        println!("{} presets: {}", names.len(), names.join(", "));
         return;
     }
     if args.list_animations { print_animations(); return; }

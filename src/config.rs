@@ -2101,10 +2101,10 @@ label = "Distro"
     fn custom_label_and_value_parse() {
         let mut m = Module::default();
         module_field(&mut m, "label", "Owner");
-        module_field(&mut m, "value", "POKKITA");
+        module_field(&mut m, "value", "Ada");
         module_field(&mut m, "icon", "*");
         assert_eq!(m.key.as_deref(), Some("Owner"));
-        assert_eq!(m.value.as_deref(), Some("POKKITA"));
+        assert_eq!(m.value.as_deref(), Some("Ada"));
         assert_eq!(m.key_icon.as_deref(), Some("*"));
     }
 }

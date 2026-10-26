@@ -87,7 +87,7 @@ format = "{key}: {value}"
 
 [[custom]]
 label = "Owner"
-value = "POKKITA"
+value = "Ada"
 
 [overrides.uptime]
 label = "Up"
